@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ordak diagnostics</title>
+    <link rel="stylesheet" href="/static/style.css?v=20260704e" />
+  </head>
+  <body data-provider-theme="gemini">
+    <main class="chat-shell" style="grid-template-columns: 1fr; max-width: 1120px;">
+      <section class="chat-stage">
+        <header class="chat-header">
+          <div>
+            <p class="eyebrow">Diagnostics</p>
+            <h2>ordak <span class="brand-inline">اردک 🦆</span></h2>
+            <p class="muted">Operational visibility for Chrome state, provider sessions, queue health, and storage cleanup.</p>
+          </div>
+          <div class="header-meta">
+            <a class="secondary link-button" href="/">Back to chat</a>
+            <button id="refresh-btn" type="button" class="secondary">Refresh</button>
+          </div>
+        </header>
+
+        <section class="chat-thread" id="diagnostics-root">
+          <article class="message assistant">
+            <div class="bubble assistant">
+              <div class="bubble-text">Loading diagnostics…</div>
+            </div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script type="module">
+      const root = document.getElementById("diagnostics-root");
+      const refreshButton = document.getElementById("refresh-btn");
+
+      function renderCard(title, content) {
+        const article = document.createElement("article");
+        article.className = "message assistant";
+        article.innerHTML = `
+          <div class="message-meta">
+            <span class="message-role">${title}</span>
+          </div>
+          <div class="bubble assistant">
+            <div class="bubble-text">${content}</div>
+          </div>
+        `;
+        return article;
+      }
+
+      function renderProviderCards(providerSessions) {
+        const article = document.createElement("article");
+        article.className = "message assistant";
+        const meta = document.createElement("div");
+        meta.className = "message-meta";
+        meta.innerHTML = `<span class="message-role">Provider sessions</span>`;
+        const bubble = document.createElement("div");
+        bubble.className = "bubble assistant";
+        const grid = document.createElement("div");
+        grid.className = "bubble-actions";
+        Object.entries(providerSessions).forEach(([provider, state]) => {
+          const card = document.createElement("div");
+          card.className = "compare-card";
+          card.style.minWidth = "280px";
+          card.innerHTML = `
+            <div class="compare-head">
+              <strong>${provider}</strong>
+              <span>${state.open_tabs.length} open tabs</span>
+            </div>
+            <div class="bubble-text">
+              Login state: ${state.login_state}<br />
+              Logged in: ${state.logged_in}<br />
+              Busy: ${state.busy}
+            </div>
+          `;
+          grid.appendChild(card);
+        });
+        bubble.appendChild(grid);
+        article.append(meta, bubble);
+        return article;
+      }
+
+      function renderJson(title, payload) {
+        const article = document.createElement("article");
+        article.className = "message assistant";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble assistant";
+        const meta = document.createElement("div");
+        meta.className = "message-meta";
+        meta.innerHTML = `<span class="message-role">${title}</span>`;
+        const pre = document.createElement("pre");
+        pre.className = "bubble-text";
+        pre.style.whiteSpace = "pre-wrap";
+        pre.textContent = JSON.stringify(payload, null, 2);
+        bubble.appendChild(pre);
+        article.append(meta, bubble);
+        return article;
+      }
+
+      async function loadDiagnostics() {
+        refreshButton.disabled = true;
+        const [diagnosticsResponse, storageResponse] = await Promise.all([
+          fetch("/api/diagnostics"),
+          fetch("/api/diagnostics/storage"),
+        ]);
+        const diagnostics = await diagnosticsResponse.json();
+        const storage = await storageResponse.json();
+        root.innerHTML = "";
+
+        root.appendChild(renderCard("Runtime", `
+          Chrome running: <strong>${diagnostics.chrome_running}</strong><br />
+          Apple Events allowed: <strong>${diagnostics.apple_events_allowed}</strong><br />
+          Queue depth: <strong>${diagnostics.queue_depth}</strong>
+        `));
+
+        root.appendChild(renderProviderCards(diagnostics.provider_sessions));
+        root.appendChild(renderJson("Tab binding health", diagnostics.tab_binding_health));
+        root.appendChild(renderJson("Recent provider state", {
+          last_success_by_provider: diagnostics.last_success_by_provider,
+          last_error_by_provider: diagnostics.last_error_by_provider,
+          active_job: diagnostics.active_job,
+          project_url_configured: diagnostics.project_url_configured,
+        }));
+
+        const storageArticle = renderJson("Storage", storage);
+        const actions = document.createElement("div");
+        actions.className = "bubble-actions";
+        const cleanup = document.createElement("button");
+        cleanup.type = "button";
+        cleanup.className = "action-pill secondary";
+        cleanup.textContent = "Run cleanup";
+        cleanup.addEventListener("click", async () => {
+          cleanup.disabled = true;
+          const response = await fetch("/api/diagnostics/cleanup", { method: "POST" });
+          const payload = await response.json();
+          alert(`Cleanup finished. Deleted files: ${payload.deleted_files}, freed bytes: ${payload.freed_bytes}`);
+          await loadDiagnostics();
+        });
+        storageArticle.querySelector(".bubble.assistant").appendChild(actions);
+        actions.appendChild(cleanup);
+        root.appendChild(storageArticle);
+        refreshButton.disabled = false;
+      }
+
+      refreshButton.addEventListener("click", loadDiagnostics);
+      setInterval(loadDiagnostics, 15000);
+      loadDiagnostics();
+    </script>
+  </body>
+</html>

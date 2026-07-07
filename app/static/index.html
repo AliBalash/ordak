@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ordak | اردک 🦆</title>
+    <link rel="stylesheet" href="/static/style.css?v=20260704g" />
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+    <div class="ambient ambient-c"></div>
+
+    <main class="chat-shell">
+      <aside class="sidebar">
+        <section class="sidebar-card brand-card">
+          <div class="brand-mark" aria-hidden="true">
+            <span class="duck-body"></span>
+            <span class="duck-wing"></span>
+            <span class="duck-head"></span>
+          </div>
+          <div>
+            <p class="eyebrow">Chrome-native</p>
+            <h1>ordak <span class="brand-inline">اردک</span></h1>
+            <p class="muted">Gemini + ChatGPT, in your own Chrome.</p>
+          </div>
+        </section>
+
+        <section class="sidebar-card actions-card">
+          <button id="new-chat-btn" class="primary wide"><span class="button-icon">+</span><span>New Chat</span></button>
+          <button id="open-profile-btn" class="secondary wide"><span class="button-icon">◌</span><span>Open Session</span></button>
+          <a id="diagnostics-btn" class="secondary wide link-button" href="/diagnostics"><span class="button-icon">⌁</span><span>Health</span></a>
+          <span id="profile-message" class="support-text"></span>
+        </section>
+
+        <section class="sidebar-card conversation-card">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow small">History</p>
+              <h2>Conversations</h2>
+            </div>
+          </div>
+          <ul id="conversation-list" class="conversation-list"></ul>
+        </section>
+
+        <section class="sidebar-card details-card">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow small">Activity</p>
+              <h2>Live details</h2>
+            </div>
+          </div>
+          <div class="mini-status">
+            <strong id="status-badge" class="badge idle">Idle</strong>
+            <span id="job-id" class="support-text">Ready for a prompt.</span>
+          </div>
+          <ol id="logs" class="mini-log-list"></ol>
+        </section>
+
+        <section class="sidebar-card artifacts-card">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow small">Artifacts</p>
+              <h2>Screenshots</h2>
+            </div>
+          </div>
+          <ul id="screenshots" class="artifact-list"></ul>
+        </section>
+      </aside>
+
+      <section class="chat-stage">
+        <header class="chat-header">
+          <div>
+            <p class="eyebrow">Current conversation</p>
+            <h2 id="conversation-title">ordak</h2>
+            <p id="conversation-subtitle" class="muted">Same tab, same thread.</p>
+          </div>
+          <div class="header-meta">
+            <div class="conversation-actions">
+              <button id="pin-conversation-btn" type="button" class="secondary small">Pin</button>
+              <span id="tab-health-pill" class="mode-pill subtle">No bound tab</span>
+              <a id="provider-link" class="secondary small link-button hidden" href="#" target="_blank" rel="noreferrer"><span class="button-icon">↗</span><span>Open provider tab</span></a>
+            </div>
+            <div class="provider-switch" id="provider-switch">
+              <button type="button" class="provider-chip active" data-provider="gemini">
+                <img class="provider-logo" src="/static/icons/gemini.svg" alt="" />
+                <span>Gemini</span>
+              </button>
+              <button type="button" class="provider-chip" data-provider="chatgpt">
+                <img class="provider-logo" src="/static/icons/chatgpt.svg" alt="" />
+                <span>ChatGPT</span>
+              </button>
+            </div>
+            <span id="conversation-mode" class="mode-pill">
+              <img id="conversation-mode-logo" class="provider-logo" src="/static/icons/gemini.svg" alt="" />
+              <span id="conversation-mode-label">Ask Gemini</span>
+            </span>
+          </div>
+        </header>
+
+        <section id="chat-thread" class="chat-thread">
+          <div id="thread-empty" class="thread-empty">
+            <div class="thread-empty-mark" aria-hidden="true"></div>
+            <h3>ordak is ready</h3>
+            <p>Start here or open a clean chat.</p>
+          </div>
+        </section>
+
+        <section class="composer-dock">
+          <div class="composer-topline">
+            <div class="mode-switch" id="mode-switch">
+              <button type="button" class="mode-chip active" data-mode="chat">Ask</button>
+              <button type="button" class="mode-chip" data-mode="image_analyze">Analyze Image</button>
+              <button type="button" class="mode-chip" data-mode="image_generate">Create Image</button>
+            </div>
+            <span id="composer-hint" class="muted">
+              Next send stays in the current chat.
+            </span>
+          </div>
+
+          <div class="upload-preview hidden" id="upload-preview">
+            <img id="upload-preview-image" alt="Selected upload preview" />
+            <div class="upload-meta">
+              <strong id="upload-name"></strong>
+              <span class="muted" id="upload-size"></span>
+            </div>
+            <button type="button" class="secondary small" id="clear-upload-btn">Remove image</button>
+          </div>
+
+          <div class="composer-row">
+            <label for="question" class="sr-only">Question</label>
+            <textarea
+              id="question"
+              rows="4"
+              placeholder="سلام gemini خوبی؟"
+            ></textarea>
+          </div>
+
+          <div class="composer-actions">
+            <div class="left-actions">
+              <label for="image-input" class="upload-trigger">
+                <span class="upload-glyph">+</span>
+                <span>Add image</span>
+              </label>
+              <input id="image-input" type="file" accept="image/*" />
+              <span id="composer-note" class="muted">Current tab will be reused.</span>
+            </div>
+            <button id="submit-btn" class="primary">Send</button>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260704g" type="module"></script>
+  </body>
+</html>
