@@ -67,6 +67,7 @@ docs/
 - `docs/api-examples.md`
 - `docs/architecture.md`
 - `docs/troubleshooting.md`
+- `CONTRIBUTING.md`
 
 ## Installation
 
