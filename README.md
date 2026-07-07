@@ -64,6 +64,7 @@ docs/
 
 ## Additional docs
 
+- `docs/api-examples.md`
 - `docs/architecture.md`
 - `docs/troubleshooting.md`
 
