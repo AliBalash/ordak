@@ -1,0 +1,11 @@
+aiofiles
+alembic
+fastapi
+jinja2
+playwright
+pydantic
+python-multipart
+python-dotenv
+pytest
+sqlalchemy
+uvicorn[standard]
