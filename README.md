@@ -59,7 +59,12 @@ app/
 scripts/
 tests/
 alembic/
+docs/
 ```
+
+## Additional docs
+
+- `docs/architecture.md`
 
 ## Installation
 
