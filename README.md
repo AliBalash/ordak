@@ -65,6 +65,7 @@ docs/
 ## Additional docs
 
 - `docs/architecture.md`
+- `docs/troubleshooting.md`
 
 ## Installation
 
