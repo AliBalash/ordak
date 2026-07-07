@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+
+from app.config import settings
+from app.database import configure_database, init_db
+from app.job_manager import JobManager
+from app.models import Conversation, Job
+from app.database import SessionLocal
+
+
+def test_job_manager_runs_jobs_sequentially(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+    running = 0
+    max_running = 0
+
+    def fake_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
+        nonlocal running, max_running
+        running += 1
+        max_running = max(max_running, running)
+        runtime.update_status("opening_browser")
+        runtime.append_log(f"working on {job_request.question}")
+        output_path = settings.browser_output_dir / f"{job_id}.png"
+        output_path.write_bytes(b"fake-output")
+        runtime.attach_output_image(output_path)
+        runtime.save_answer(f"answer:{job_request.question}")
+        runtime.update_status("completed")
+        running -= 1
+        return f"answer:{job_request.question}"
+
+    async def scenario() -> None:
+        manager = JobManager(worker=fake_worker)
+        await manager.start()
+        first = await manager.create_job("first", mode="chat", start_new_chat=True)
+        second = await manager.create_job(
+            "second",
+            provider="chatgpt",
+            mode="image_analyze",
+            uploads=["storage/uploads/example.png"],
+            start_new_chat=True,
+        )
+        await asyncio.wait_for(manager.queue.join(), timeout=5)
+        await manager.shutdown()
+        assert manager.get_job_snapshot(first.job_id).status == "completed"
+        assert manager.get_job_snapshot(second.job_id).status == "completed"
+        assert manager.get_job_snapshot(second.job_id).provider == "chatgpt"
+        assert manager.get_job_snapshot(second.job_id).mode == "image_analyze"
+        assert manager.get_job_snapshot(second.job_id).uploads == ["storage/uploads/example.png"]
+        assert manager.get_job_snapshot(second.job_id).output_images == [
+            f"storage/outputs/{second.job_id}.png"
+        ]
+
+    asyncio.run(scenario())
+    assert max_running == 1
+
+
+def test_cancel_queued_job_marks_cancelled(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+
+    async def scenario() -> None:
+        manager = JobManager(worker=lambda *args, **kwargs: "unused")
+        job = await manager.create_job("queued", start_new_chat=True)
+        snapshot = await manager.cancel_job(job.job_id)
+        assert snapshot.status == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_running_job_marks_cancelled(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+
+    def cancellable_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
+        runtime.update_status("waiting_for_response")
+        while not runtime.should_cancel():
+            time.sleep(0.05)
+        raise RuntimeError("worker noticed cancellation")
+
+    async def scenario() -> None:
+        manager = JobManager(worker=cancellable_worker)
+        await manager.start()
+        job = await manager.create_job("running", start_new_chat=True)
+        await asyncio.sleep(0.2)
+        snapshot = await manager.cancel_job(job.job_id)
+        assert snapshot.status in {"cancelling", "cancelled"}
+        await asyncio.wait_for(manager.queue.join(), timeout=5)
+        final = manager.get_job_snapshot(job.job_id)
+        await manager.shutdown()
+        assert final.status in {"cancelled", "failed"}
+
+    asyncio.run(scenario())
+
+
+def test_retry_and_resume_create_new_jobs(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+
+    def fake_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
+        runtime.save_error("boom", "failed", "response_timeout")
+        raise RuntimeError("boom")
+
+    async def scenario() -> None:
+        manager = JobManager(worker=fake_worker)
+        await manager.start()
+        job = await manager.create_job("original", start_new_chat=True)
+        await asyncio.wait_for(manager.queue.join(), timeout=5)
+        failed = manager.get_job_snapshot(job.job_id)
+        assert failed.status == "failed"
+
+        retry_job = await manager.retry_job(job.job_id, "same_tab")
+        resume_job = await manager.resume_job(job.job_id, "same_tab")
+        assert retry_job.job_id != job.job_id
+        assert resume_job.job_id != job.job_id
+        assert manager.get_job_snapshot(retry_job.job_id).retry_of_job_id == job.job_id
+        assert manager.get_job_snapshot(resume_job.job_id).retry_of_job_id == job.job_id
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_list_conversations_refreshes_tab_binding(tmp_path: Path, monkeypatch) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+    manager = JobManager(worker=lambda *args, **kwargs: "unused")
+
+    with SessionLocal() as session:
+        conversation = Conversation(
+            id="conv-1",
+            provider="chatgpt",
+            title="Pinned test",
+            external_url="https://chatgpt.com/c/abc",
+            external_conversation_id="abc",
+            tab_alive=False,
+        )
+        session.add(conversation)
+        session.commit()
+
+    monkeypatch.setattr("app.job_manager.is_google_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        "app.job_manager.list_google_chrome_tabs",
+        lambda: [
+            type(
+                "Tab",
+                (),
+                {
+                    "window_id": 1,
+                    "tab_id": 2,
+                    "url": "https://chatgpt.com/c/abc",
+                    "title": "ChatGPT",
+                    "active": True,
+                },
+            )()
+        ],
+    )
+
+    conversations = manager.list_conversations()
+    assert conversations[0].tab_alive is True
+
+
+def test_pin_conversation_updates_state(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+    manager = JobManager(worker=lambda *args, **kwargs: "unused")
+
+    async def scenario() -> None:
+        created = await manager.create_job("first", start_new_chat=True)
+        response = manager.set_conversation_pinned(created.conversation_id, True)
+        assert response.pinned is True
+        response = manager.set_conversation_pinned(created.conversation_id, False)
+        assert response.pinned is False
+
+    asyncio.run(scenario())
+
+
+def test_tab_lost_error_marks_conversation_tab_dead(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+
+    def tab_lost_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
+        runtime.remember_conversation_state(
+            type(
+                "TabInfo",
+                (),
+                {
+                    "window_id": 7,
+                    "tab_id": 8,
+                    "url": "https://chatgpt.com/c/example",
+                    "title": "ChatGPT",
+                },
+            )()
+        )
+        runtime.save_error("tab missing", "failed", "tab_lost")
+        raise RuntimeError("tab lost")
+
+    async def scenario() -> None:
+        manager = JobManager(worker=tab_lost_worker)
+        await manager.start()
+        job = await manager.create_job("original", provider="chatgpt", start_new_chat=True)
+        await asyncio.wait_for(manager.queue.join(), timeout=5)
+        conversation = manager.get_conversation(job.conversation_id)
+        await manager.shutdown()
+        assert conversation.tab_alive is False
+        assert conversation.external_url == "https://chatgpt.com/c/example"
+
+    asyncio.run(scenario())
+
+
+def test_start_recovers_stale_running_jobs(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+
+    with SessionLocal() as session:
+        conversation = Conversation(
+            id="conv-stale",
+            provider="gemini",
+            title="Stale",
+        )
+        job = Job(
+            id="job-stale",
+            question="hello",
+            status="waiting_for_response",
+            provider="gemini",
+            conversation_id="conv-stale",
+            conversation_title="Stale",
+        )
+        session.add(conversation)
+        session.add(job)
+        session.commit()
+
+    async def scenario() -> None:
+        manager = JobManager(worker=lambda *args, **kwargs: "unused")
+        await manager.start()
+        snapshot = manager.get_job_snapshot("job-stale")
+        await manager.shutdown()
+        assert snapshot.status == "failed"
+        assert snapshot.error_code == "response_timeout"
+        assert snapshot.recoverable is True
+        assert "restarted" in (snapshot.error_message or "")
+
+    asyncio.run(scenario())
