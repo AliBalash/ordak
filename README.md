@@ -1,399 +1,186 @@
-# ordak | اردک 🦆
+# ordak
 
-`ordak` is a local FastAPI application that automates the real Gemini and ChatGPT web UIs through your already-open Google Chrome session on macOS. It does not call any direct LLM API.
+`ordak` is a local FastAPI application that automates the real Gemini and ChatGPT web interfaces through an already signed-in Google Chrome session. It does not call direct LLM APIs. Instead, it drives the provider UIs, waits for real responses, extracts text or generated images, and exposes the results through a local web panel, HTTP API, and WebSocket updates.
 
-`اردک` یک برنامه محلی FastAPI است که رابط واقعی Gemini و ChatGPT را از طریق همان Google Chrome معمولی شما که باز است کنترل می‌کند و از API مستقیم مدل استفاده نمی‌کند.
+The project is designed for personal desktop workflows, local tools, and internal automation where reusing the exact browser session matters more than running in a fully headless cloud environment.
 
-## Status
+## Core capabilities
 
-- Built for local macOS usage.
-- Reuses an existing signed-in Chrome session instead of launching a separate managed browser.
-- Best suited for personal workflows, local tools, and internal integrations.
-- Not designed for headless cloud deployment or high-volume automation.
+- Reuses an existing signed-in Chrome session instead of creating a fully separate browser workflow.
+- Supports both Gemini and ChatGPT through one local orchestration layer.
+- Handles chat, image analysis, and image generation / image editing jobs.
+- Persists conversations, jobs, tab bindings, logs, screenshots, traces, uploads, and output images.
+- Exposes asynchronous job APIs, direct provider response APIs, and live WebSocket job updates.
+- Includes a built-in web panel and a diagnostics page for operational visibility.
+- Supports both macOS and Linux.
+- On Linux, attaches to an existing Chrome DevTools session, typically `http://127.0.0.1:9222`.
 
-## What ordak does
+## How it works
 
-- Reuses the real Chrome window that is already open.
-- Opens or rebinds Gemini / ChatGPT tabs without launching a separate browser.
-- Sends prompts like a human would inside the provider UI.
-- Supports chat, image analysis, and image generation flows.
-- Persists conversations, tab bindings, jobs, logs, screenshots, and extracted outputs.
-- Exposes cancel / retry / resume actions.
-- Lets you pin important conversations so cleanup will not remove their referenced artifacts.
-- Provides a diagnostics page and storage cleanup endpoints.
+1. A user submits a request from the web panel or HTTP API.
+2. `ordak` creates a persisted job and schedules it in the local job queue.
+3. The worker opens or rebinds a Gemini or ChatGPT tab in an existing Chrome session.
+4. The automation layer inserts the prompt, optionally uploads an image, submits the request, waits for the provider UI to stabilize, and extracts the result.
+5. The final answer, generated images, logs, screenshots, and metadata are saved locally and exposed through the API and panel.
 
-## Core architecture
+## Platform model
 
-```mermaid
-flowchart LR
-    U["ordak panel"] --> API["FastAPI + WebSocket"]
-    API --> JM["JobManager"]
-    JM --> DB["SQLite / SQLAlchemy"]
-    JM --> DIAG["Diagnostics / Cleanup"]
-    JM --> ORCH["Worker orchestrator"]
-    ORCH --> AD["Provider adapters"]
-    AD --> CH["Existing Google Chrome"]
-    CH --> GM["Gemini UI"]
-    CH --> CG["ChatGPT UI"]
-```
+### macOS
 
-## Main upgrades in this version
+- Uses the real installed Google Chrome application.
+- Requires Chrome support for JavaScript from Apple Events:
+  `View > Developer > Allow JavaScript from Apple Events`
 
-- Provider adapter architecture for `Gemini` and `ChatGPT`
-- Structured error system with recoverable actions
-- Conversation persistence and tab recovery
-- Cancel / retry / resume endpoints
-- Robust image extraction fail-safe path
-- Dedicated `/diagnostics` page and diagnostics API
-- Storage retention config and cleanup API
-- `ordak / اردک 🦆` branding in the app
+### Linux
 
-## Project structure
+- Uses Chrome DevTools remote debugging as the primary runtime.
+- Recommended mode is attach-only to a Chrome instance that you start yourself with `--remote-debugging-port=9222`.
+- Normal worker flows do not silently launch a second profile when remote debugging is unavailable.
+- An older X11 fallback path exists but is disabled by default and is intended only for advanced debugging.
 
-```text
-app/
-  automation/
-  providers/
-  static/
-  storage/
-scripts/
-tests/
-alembic/
-docs/
-```
+## Quick start
 
-## Additional docs
-
-- `docs/api-examples.md`
-- `docs/architecture.md`
-- `docs/troubleshooting.md`
-- `CONTRIBUTING.md`
-
-## Installation
+### 1. Create the environment
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env
 ```
 
-Or use the helper script:
+### 2. Configure your local browser
+
+Set `BROWSER_PLATFORM` in `.env`:
+
+- `mac` for macOS
+- `linux` for Linux
+
+For Linux, start Chrome with remote debugging enabled:
+
+```bash
+google-chrome \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.config/ordak-chrome"
+```
+
+Then sign in to Gemini and ChatGPT inside that exact Chrome profile.
+
+Important Linux defaults:
+
+- `BROWSER_REMOTE_DEBUGGING_URL=http://127.0.0.1:9222`
+- `BROWSER_REMOTE_DEBUGGING_AUTO_LAUNCH=false`
+- `BROWSER_REMOTE_DEBUGGING_USER_DATA_DIR=/home/<your-user>/.config/ordak-chrome`
+
+### 3. Run the app
+
+```bash
+source .venv/bin/activate
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Open:
+
+- `http://127.0.0.1:8000/`
+- `http://127.0.0.1:8000/diagnostics`
+
+You can also use the helper script:
 
 ```bash
 ./run.sh
 ```
 
-## Required local setup
+## Project structure
 
-1. Keep your normal `Google Chrome` open.
-2. Enable:
-   `View > Developer > Allow JavaScript from Apple Events`
-3. Make sure Gemini or ChatGPT already works in that same Chrome session.
-4. Update `BROWSER_USER_DATA_DIR` inside `.env` for your own macOS account.
-5. For ChatGPT project-scoped runs, set `CHATGPT_PROJECT_URL` in `.env`.
-
-## Run ordak
-
-```bash
-source .venv/bin/activate
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```text
+app/
+  automation/      Browser control, DOM execution, provider interaction
+  providers/       Provider adapter abstraction and concrete Chrome-backed adapters
+  static/          Web panel and diagnostics UI
+  storage/         SQLite DB, uploads, outputs, screenshots, traces, logs, profiles
+alembic/           Database migrations
+docs/              Full project documentation
+scripts/           Utilities for diagnostics, cleanup, profile opening, manual tests
+tests/             Automated test suite
 ```
 
-Open:
+## Main HTTP endpoints
 
-- [http://127.0.0.1:8000](http://127.0.0.1:8000)
-- [http://127.0.0.1:8000/diagnostics](http://127.0.0.1:8000/diagnostics)
+### Health and diagnostics
 
-## Environment notes
+- `GET /api/health`
+- `GET /api/diagnostics`
+- `GET /api/diagnostics/storage`
+- `POST /api/diagnostics/cleanup`
 
-- `.env` is local-only and should never be committed.
-- `.env.example` is the public template for new setups.
-- Runtime artifacts under `app/storage/` are intentionally ignored, except placeholder `.gitkeep` files.
-- The default SQLite database lives at `app/storage/jobs.db`.
-
-## Useful endpoints
+### Jobs
 
 - `POST /api/jobs`
-- `POST /api/providers/{provider}/respond`
-- `POST /api/gemini/respond`
-- `POST /api/chatgpt/respond`
 - `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
 - `POST /api/jobs/{job_id}/cancel`
 - `POST /api/jobs/{job_id}/retry`
 - `POST /api/jobs/{job_id}/resume`
+
+### Direct provider responses
+
+- `POST /api/providers/{provider}/respond`
+- `POST /api/gemini/respond`
+- `POST /api/chatgpt/respond`
+
+### Conversations
+
 - `GET /api/conversations`
 - `GET /api/conversations/{conversation_id}`
 - `POST /api/conversations/{conversation_id}/pin`
 - `POST /api/conversations/{conversation_id}/unpin`
-- `GET /api/diagnostics`
-- `GET /api/diagnostics/storage`
-- `POST /api/diagnostics/cleanup`
+
+### Browser/profile helpers
+
 - `POST /api/profile/open`
+- `GET /api/uploads/{filename}`
+- `GET /`
+- `GET /diagnostics`
+- `WS /ws/jobs/{job_id}`
 
-## Direct provider API
+## Validation status
 
-If you want a single HTTP call that waits for Gemini or ChatGPT and returns a final JSON payload, use these endpoints:
+The project includes automated coverage for:
 
-- `POST /api/gemini/respond`
-- `POST /api/chatgpt/respond`
-- `POST /api/providers/{provider}/respond`
+- Linux remote-debugging behavior
+- Chrome tab rebinding and tab identity handling
+- Upload flow and generated image readiness
+- Worker orchestration, errors, retries, and image extraction
+- Job manager queue behavior and recovery
+- Main route behavior and direct provider endpoints
 
-`{provider}` can be `gemini` or `chatgpt`.
+Manual end-to-end validation is still recommended whenever you change selectors, browser-attachment behavior, or provider-specific extraction logic, because the project depends on third-party web UIs that can change over time.
 
-These endpoints sit on top of the same ordak job engine. They still create a job internally, but instead of returning only `job_id`, they can wait for completion and return:
+## Documentation map
 
-- final `answer`
-- `output_images` with public local URLs
-- `uploads` with public local URLs
-- `screenshots` with public local URLs
-- `error_code`, `error_message`, `suggested_action`
-- `job_api_url` and `conversation_api_url` for later polling
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Setup and configuration](docs/setup-and-configuration.md)
+- [API reference](docs/api-reference.md)
+- [API examples](docs/api-examples.md)
+- [Job lifecycle and errors](docs/job-lifecycle-and-errors.md)
+- [Browser automation](docs/browser-automation.md)
+- [Data model and storage](docs/data-model-and-storage.md)
+- [Repository map](docs/repository-map.md)
+- [Frontend panel](docs/frontend-panel.md)
+- [Development and testing](docs/development-and-testing.md)
+- [Scripts and operations](docs/scripts-and-operations.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
-### Request model
+## Important constraints
 
-JSON request body:
+- This is a local desktop automation project, not a high-scale server product.
+- Reliability depends on the real provider UIs remaining compatible with the current selectors and DOM heuristics.
+- The browser session used by `ordak` must already be authenticated with the target provider.
+- Linux production-like usage should prefer attach-only DevTools mode rather than automatically launching extra Chrome profiles.
 
-```json
-{
-  "question": "سلام Gemini خوبی؟",
-  "mode": "chat",
-  "conversation_id": null,
-  "start_new_chat": true,
-  "wait_for_completion": true,
-  "wait_timeout_seconds": 300
-}
-```
+## License and ownership notes
 
-Fields:
-
-- `question`: required prompt text
-- `mode`: `chat` | `image_analyze` | `image_generate`
-- `conversation_id`: optional existing ordak conversation id
-- `start_new_chat`: when `true`, ordak opens a fresh provider tab/thread
-- `wait_for_completion`: when `true`, HTTP waits and returns final state; when `false`, it returns current job state immediately
-- `wait_timeout_seconds`: 1 to 900 seconds
-
-For image flows, use `multipart/form-data` and send one file field named `image`.
-
-### Response model
-
-Successful response shape:
-
-```json
-{
-  "provider": "gemini",
-  "job_id": "e6f5470e-d3e6-435d-bd2a-53a396d087f7",
-  "job_api_url": "http://127.0.0.1:8000/api/jobs/e6f5470e-d3e6-435d-bd2a-53a396d087f7",
-  "conversation_id": "207a89d2-d9e4-415a-ae09-79a127b175fd",
-  "conversation_api_url": "http://127.0.0.1:8000/api/conversations/207a89d2-d9e4-415a-ae09-79a127b175fd",
-  "conversation_title": "سلام Gemini. فقط در یک جمله کوتاه جواب بده: خوبی؟",
-  "provider_conversation_url": "https://gemini.google.com/app/...",
-  "mode": "chat",
-  "status": "completed",
-  "completed": true,
-  "answer": "سلام! من عالی هستم...",
-  "error_code": null,
-  "error_title": null,
-  "error_message": null,
-  "suggested_action": null,
-  "recoverable": false,
-  "uploads": [],
-  "output_images": [],
-  "screenshots": [],
-  "trace_url": null,
-  "logs": []
-}
-```
-
-Artifact item shape:
-
-```json
-{
-  "path": "storage/outputs/example.png",
-  "url": "http://127.0.0.1:8000/storage/outputs/example.png",
-  "filename": "example.png"
-}
-```
-
-Notes:
-
-- `completed=true` means the job reached a terminal state, including `completed`, `failed`, `manual_verification_required`, or `cancelled`.
-- For image generation, `output_images` is the main field to render.
-- If extraction confidence is low, `output_images` will be empty and the response will carry a recoverable error such as `result_not_extractable`.
-
-## How to call the API
-
-### 1. Gemini text request with JSON
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/gemini/respond \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "سلام Gemini. فقط کوتاه جواب بده: خوبی؟",
-    "mode": "chat",
-    "start_new_chat": true,
-    "wait_for_completion": true,
-    "wait_timeout_seconds": 180
-  }'
-```
-
-### 2. ChatGPT image generate with multipart
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/chatgpt/respond \
-  -F 'question=پس‌زمینه را حذف کن و سفید کن.' \
-  -F 'mode=image_generate' \
-  -F 'start_new_chat=true' \
-  -F 'wait_for_completion=true' \
-  -F 'wait_timeout_seconds=300' \
-  -F 'image=@sample-image-test.png'
-```
-
-### 3. Generic provider endpoint
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/providers/gemini/respond \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "ده جمله آلمانی ساده بده.",
-    "mode": "chat",
-    "start_new_chat": true
-  }'
-```
-
-### 4. JavaScript `fetch` example
-
-```js
-const response = await fetch("http://127.0.0.1:8000/api/gemini/respond", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    question: "سلام Gemini. یک جواب کوتاه بده.",
-    mode: "chat",
-    start_new_chat: true,
-    wait_for_completion: true,
-    wait_timeout_seconds: 180,
-  }),
-});
-
-const payload = await response.json();
-console.log(payload.answer);
-```
-
-### 5. JavaScript image upload example
-
-```js
-const form = new FormData();
-form.append("question", "این عکس را تحلیل کن.");
-form.append("mode", "image_analyze");
-form.append("start_new_chat", "true");
-form.append("wait_for_completion", "true");
-form.append("image", fileInput.files[0]);
-
-const response = await fetch("http://127.0.0.1:8000/api/gemini/respond", {
-  method: "POST",
-  body: form,
-});
-
-const payload = await response.json();
-console.log(payload.answer);
-console.log(payload.output_images);
-```
-
-## When to use which API
-
-- Use `POST /api/jobs` if you want raw asynchronous job creation plus your own polling or WebSocket handling.
-- Use `POST /api/gemini/respond` or `POST /api/chatgpt/respond` if you want one direct JSON response for app-to-app integration.
-- Use `GET /api/jobs/{job_id}` when `wait_for_completion=false` or when you want to re-check a previous run later.
-
-## Example prompt
-
-```text
-سلام Gemini خوبی؟
-```
-
-For image generation:
-
-```text
-پس‌زمینه این تصویر را حذف کن و سفید کن.
-```
-
-## Diagnostics
-
-The diagnostics page shows:
-
-- whether Chrome is running
-- whether Apple Events JavaScript access works
-- provider session status
-- tab binding health
-- last successful run by provider
-- last error by provider
-- active job
-- queue depth
-- storage usage
-
-## Migrations
-
-Alembic scaffolding is included:
-
-```bash
-alembic upgrade head
-```
-
-The app also keeps SQLite bootstrap/backfill logic so older local MVP databases can still open during the migration window.
-
-## Tests
-
-```bash
-pytest -q
-```
-
-Current automated coverage includes:
-
-- worker orchestration through provider adapters
-- upload readiness verification
-- job queue sequencing
-- cancel / retry / resume job manager flows
-- FastAPI route smoke tests
-
-## Helper scripts
-
-```bash
-python scripts/test_gemini_flow.py --provider=gemini --mode=chat "سلام Gemini خوبی؟"
-python scripts/show_diagnostics.py
-python scripts/cleanup_storage.py
-```
-
-## Manual acceptance checklist
-
-1. Open your real Chrome and confirm Gemini or ChatGPT is already logged in.
-2. Open ordak in the browser.
-3. Send a normal Persian chat prompt.
-4. Continue the same conversation in the same provider tab.
-5. Upload `sample-image-test.png` and run image analyze or image generate.
-6. Check that ordak shows only trusted result images.
-7. Trigger a recoverable failure, then use `Retry` or `Resume`.
-8. Open `/diagnostics` and verify session and storage state.
-
-## Known constraints
-
-- Provider DOMs can change over time.
-- Chrome must remain open.
-- This project expects access to your local desktop browser session and is therefore not a typical Docker-first deployment target.
-- CAPTCHA or manual verification is not bypassed.
-- Image extraction is intentionally fail-safe: if confidence is low, ordak does not show an output artifact.
-- `Cancel` is best-effort stop, not a hard browser reset.
-
-## Safety note
-
-This project does **not** implement:
-
-- CAPTCHA bypass
-- anti-bot evasion
-- fingerprint spoofing
-- credential automation
-- proxy rotation
-- mass automation
+No project license file is currently present in the repository root. If you intend to distribute or publish the project outside private/internal use, add an explicit license and contribution policy first.
