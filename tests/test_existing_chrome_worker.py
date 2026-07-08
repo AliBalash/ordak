@@ -54,6 +54,7 @@ class FakeAdapter:
         self.submit_calls = 0
         self.best_effort_stop_calls = 0
         self.last_max_images: int | None = None
+        self.rebind_calls: list[tuple[str | None, ChromeTabRef | None]] = []
         self.result = "سلام! من خوبم."
         self.image_paths: list[Path] = []
         self.rebind_result = RebindResult(
@@ -73,6 +74,7 @@ class FakeAdapter:
         return ChromeTabInfo(window_id=1, tab_id=2, url=target_url or "https://example.com", title="new", active=True)
 
     def rebind_tab(self, *, conversation_url: str | None, tab_ref: ChromeTabRef | None) -> RebindResult:
+        self.rebind_calls.append((conversation_url, tab_ref))
         return self.rebind_result
 
     def detect_login_state(self, tab: ChromeTabRef) -> str:
@@ -275,6 +277,41 @@ def test_image_generate_job_collects_output_images(
     assert adapter.last_max_images == settings.max_output_images_per_job
 
 
+def test_linux_chatgpt_image_generate_refreshes_tab_before_extracting_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    output_path = tmp_path / "generated.png"
+    output_path.write_bytes(b"fake-output")
+    adapter.result = "__GENERATED_IMAGES__:1"
+    adapter.image_paths = [output_path]
+    local_settings = replace(settings, browser_platform="linux")
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.ensure_linux_remote_debugging_session",
+        lambda app_settings, target_url=None: None,
+    )
+
+    answer = run_gemini_job(
+        "job-linux-chatgpt-image-generate",
+        GeminiJobRequest(
+            question="پس زمینه را سفید کن.",
+            provider="chatgpt",
+            mode="image_generate",
+            start_new_chat=True,
+        ),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "ChatGPT generated image output in the current Chrome tab. Saved images: 1."
+    assert adapter.rebind_calls[-1] == (None, None)
+    assert runtime.output_images == [output_path]
+
+
 def test_chatgpt_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
@@ -292,7 +329,7 @@ def test_chatgpt_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch
     assert adapter.opened_url == settings.provider_new_chat_url("chatgpt")
 
 
-def test_chatgpt_job_requires_project_url_for_new_chat(
+def test_chatgpt_job_without_project_url_falls_back_to_default_chat_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = RuntimeSpy()
@@ -301,15 +338,66 @@ def test_chatgpt_job_requires_project_url_for_new_chat(
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
 
-    with pytest.raises(
-        GeminiAutomationError,
-        match="A ChatGPT project URL is required",
-    ):
+    answer = run_gemini_job(
+        "job-chatgpt-project-missing",
+        GeminiJobRequest(question="سلام", provider="chatgpt", start_new_chat=True),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "سلام! من خوبم."
+    assert adapter.opened_url == local_settings.chatgpt_url
+
+
+def test_linux_job_ensures_remote_debugging_before_browser_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    local_settings = replace(settings, browser_platform="linux")
+    ensure_calls: list[str] = []
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.ensure_linux_remote_debugging_session",
+        lambda app_settings, target_url=None: ensure_calls.append(target_url or ""),
+    )
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+
+    answer = run_gemini_job(
+        "job-linux-devtools-ready",
+        GeminiJobRequest(question="سلام", provider="chatgpt", start_new_chat=True),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "سلام! من خوبم."
+    assert ensure_calls == [local_settings.chatgpt_url]
+
+
+def test_linux_job_returns_structured_error_when_remote_debugging_launch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    local_settings = replace(settings, browser_platform="linux")
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.ensure_linux_remote_debugging_session",
+        lambda app_settings, target_url=None: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+
+    with pytest.raises(GeminiAutomationError, match="launch failed"):
         run_gemini_job(
-            "job-chatgpt-project-missing",
-            GeminiJobRequest(question="سلام", provider="chatgpt", start_new_chat=True),
+            "job-linux-launch-failed",
+            GeminiJobRequest(question="سلام", start_new_chat=True),
             runtime=runtime,
             app_settings=local_settings,
         )
 
-    assert runtime.statuses == ["checking_browser"]
+    assert runtime.errors == [
+        (
+            "failed",
+            "launch failed",
+            "chrome_not_open",
+        )
+    ]

@@ -186,9 +186,7 @@ class JobManager:
     ) -> JobCreateResponse:
         uploads = uploads or []
         resolved_job_id = job_id or str(uuid.uuid4())
-        resolved_conversation_id = (
-            str(uuid.uuid4()) if start_new_chat or not conversation_id else conversation_id
-        )
+        resolved_conversation_id = conversation_id or str(uuid.uuid4())
         conversation = self._get_or_create_conversation(
             resolved_conversation_id,
             provider=provider,
@@ -204,13 +202,16 @@ class JobManager:
             conversation.tab_alive = False
             conversation.tab_id = None
             conversation.tab_window_id = None
+            conversation.tab_window_key = None
+            conversation.tab_target_id = None
             conversation.external_url = None
+            conversation.external_conversation_id = None
 
         metadata = {
             "conversation_id": resolved_conversation_id,
             "conversation_title": conversation.title,
             "provider": provider,
-            "start_new_chat": bool(start_new_chat or not conversation_id),
+            "start_new_chat": bool(start_new_chat),
             "mode": mode,
             "uploads": uploads,
             "output_images": [],
@@ -225,7 +226,7 @@ class JobManager:
             conversation_id=resolved_conversation_id,
             conversation_title=conversation.title,
             mode=mode,
-            start_new_chat=bool(start_new_chat or not conversation_id),
+            start_new_chat=bool(start_new_chat),
             retry_of_job_id=retry_of_job_id,
             run_strategy=run_strategy,
             logs=_dumps_list(
@@ -603,12 +604,7 @@ class JobManager:
                 self._set_status(job_id, "running", started_at=utcnow())
                 snapshot = self.get_job_snapshot(job_id)
                 conversation = self._get_conversation_model(snapshot.conversation_id)
-                target_tab = None
-                if conversation and conversation.tab_window_id and conversation.tab_id:
-                    target_tab = ChromeTabRef(
-                        window_id=conversation.tab_window_id,
-                        tab_id=conversation.tab_id,
-                    )
+                target_tab = self._conversation_tab_ref(conversation)
                 if snapshot.run_strategy == "new_tab_same_conversation":
                     target_tab = None
                 elif snapshot.start_new_chat:
@@ -872,6 +868,8 @@ class JobManager:
                 return
             conversation.tab_window_id = tab_info.window_id
             conversation.tab_id = tab_info.tab_id
+            conversation.tab_window_key = getattr(tab_info, "window_key", None)
+            conversation.tab_target_id = getattr(tab_info, "target_id", None)
             conversation.external_url = tab_info.url
             conversation.external_conversation_id = self._extract_external_conversation_id(tab_info.url)
             conversation.tab_alive = True
@@ -919,13 +917,20 @@ class JobManager:
 
         tabs = list_google_chrome_tabs()
         by_ref = {(tab.window_id, tab.tab_id): tab for tab in tabs}
+        by_target_id = {
+            getattr(tab, "target_id"): tab
+            for tab in tabs
+            if getattr(tab, "target_id", None)
+        }
         by_url = {tab.url: tab for tab in tabs if tab.url}
         conversations = session.execute(select(Conversation)).scalars().all()
         changed = False
         for conversation in conversations:
             matched = None
+            if conversation.tab_target_id:
+                matched = by_target_id.get(conversation.tab_target_id)
             if conversation.tab_window_id and conversation.tab_id:
-                matched = by_ref.get((conversation.tab_window_id, conversation.tab_id))
+                matched = matched or by_ref.get((conversation.tab_window_id, conversation.tab_id))
             if matched is None and conversation.external_url:
                 matched = by_url.get(conversation.external_url)
             if matched is None and conversation.external_conversation_id:
@@ -946,10 +951,14 @@ class JobManager:
                 if (
                     conversation.tab_window_id != matched.window_id
                     or conversation.tab_id != matched.tab_id
+                    or conversation.tab_window_key != matched.window_key
+                    or conversation.tab_target_id != matched.target_id
                     or conversation.external_url != matched.url
                 ):
                     conversation.tab_window_id = matched.window_id
                     conversation.tab_id = matched.tab_id
+                    conversation.tab_window_key = getattr(matched, "window_key", None)
+                    conversation.tab_target_id = getattr(matched, "target_id", None)
                     conversation.external_url = matched.url
                     conversation.external_conversation_id = self._extract_external_conversation_id(
                         matched.url
@@ -966,6 +975,24 @@ class JobManager:
                 return None
             session.expunge(conversation)
             return conversation
+
+    def _conversation_tab_ref(self, conversation: Conversation | None) -> ChromeTabRef | None:
+        if conversation is None:
+            return None
+        if conversation.tab_target_id:
+            return ChromeTabRef(
+                window_id=conversation.tab_window_id or 0,
+                tab_id=conversation.tab_id or 0,
+                window_key=conversation.tab_window_key,
+                target_id=conversation.tab_target_id,
+            )
+        if conversation.tab_window_id and conversation.tab_id:
+            return ChromeTabRef(
+                window_id=conversation.tab_window_id,
+                tab_id=conversation.tab_id,
+                window_key=conversation.tab_window_key,
+            )
+        return None
 
     def _make_conversation_title(self, question: str) -> str:
         compact = " ".join(question.strip().split())

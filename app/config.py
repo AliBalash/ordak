@@ -56,10 +56,18 @@ def _default_chrome_user_data_dir() -> str:
     return str(Path.home() / ".config/google-chrome")
 
 
+def _default_remote_debugging_user_data_dir() -> str:
+    system = platform.system().lower()
+    if system == "linux":
+        return str(Path.home() / ".config/ordak-chrome")
+    return str(ROOT_DIR / "app" / "storage" / "profiles" / "gemini-login")
+
+
 @dataclass(slots=True)
 class Settings:
     product_name: str
     product_label: str
+    browser_platform: str
     app_host: str
     app_port: int
     database_url: str
@@ -68,6 +76,11 @@ class Settings:
     browser_timeout_ms: int
     browser_engine: str
     browser_executable_path: Path
+    browser_remote_debugging_url: str
+    browser_remote_debugging_auto_launch: bool
+    browser_remote_debugging_launch_timeout_ms: int
+    browser_remote_debugging_user_data_dir: Path
+    browser_linux_x11_fallback_enabled: bool
     browser_user_data_dir: Path
     browser_profile_name: str
     browser_profile_dir: Path
@@ -105,6 +118,7 @@ class Settings:
         self.static_dir.mkdir(parents=True, exist_ok=True)
         self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
         self.browser_login_profile_dir.mkdir(parents=True, exist_ok=True)
+        self.browser_remote_debugging_user_data_dir.mkdir(parents=True, exist_ok=True)
         self.browser_runtime_root_dir.mkdir(parents=True, exist_ok=True)
         self.browser_screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.browser_trace_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +154,7 @@ def load_settings() -> Settings:
     settings = Settings(
         product_name=os.getenv("PRODUCT_NAME", "ordak"),
         product_label=os.getenv("PRODUCT_LABEL", "اردک 🦆"),
+        browser_platform=_as_optional_str(os.getenv("BROWSER_PLATFORM")) or "auto",
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
         app_port=_as_int(os.getenv("APP_PORT"), 8000),
         database_url=os.getenv("DATABASE_URL", "sqlite:///./app/storage/jobs.db"),
@@ -150,6 +165,26 @@ def load_settings() -> Settings:
         browser_executable_path=_resolve_path(
             os.getenv("BROWSER_EXECUTABLE_PATH", _default_chrome_executable()),
             base_dir=Path("/"),
+        ),
+        browser_remote_debugging_url=os.getenv(
+            "BROWSER_REMOTE_DEBUGGING_URL",
+            "http://127.0.0.1:9222",
+        ).strip(),
+        browser_remote_debugging_auto_launch=_as_bool(
+            os.getenv("BROWSER_REMOTE_DEBUGGING_AUTO_LAUNCH"), False
+        ),
+        browser_remote_debugging_launch_timeout_ms=_as_int(
+            os.getenv("BROWSER_REMOTE_DEBUGGING_LAUNCH_TIMEOUT_MS"), 30_000
+        ),
+        browser_remote_debugging_user_data_dir=_resolve_path(
+            os.getenv(
+                "BROWSER_REMOTE_DEBUGGING_USER_DATA_DIR",
+                _default_remote_debugging_user_data_dir(),
+            ),
+            base_dir=Path("/"),
+        ),
+        browser_linux_x11_fallback_enabled=_as_bool(
+            os.getenv("BROWSER_LINUX_X11_FALLBACK_ENABLED"), False
         ),
         browser_user_data_dir=_resolve_path(
             os.getenv("BROWSER_USER_DATA_DIR", _default_chrome_user_data_dir()),

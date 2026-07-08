@@ -5,6 +5,7 @@ import mimetypes
 from pathlib import Path
 from typing import Callable
 
+from app.automation.browser import ensure_linux_remote_debugging_session
 from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
@@ -87,6 +88,55 @@ GeminiJobRequest = AutomationJobRequest
 
 def _provider_name(provider: Provider) -> str:
     return "ChatGPT" if provider == "chatgpt" else "Gemini"
+
+
+def _browser_platform_label(app_settings: Settings) -> str:
+    platform_name = (app_settings.browser_platform or "").strip().lower()
+    if platform_name in {"darwin", "mac", "macos"}:
+        return "mac"
+    if platform_name in {"linux", "lin"}:
+        return "linux"
+    return platform_name or "auto"
+
+
+def _chrome_not_ready_message(app_settings: Settings, provider: Provider) -> str:
+    if _browser_platform_label(app_settings) == "linux":
+        return (
+            "Google Chrome remote debugging is not reachable. Start your regular Chrome on Linux "
+            "with --remote-debugging-port=9222, keep "
+            f"{_provider_name(provider)} already logged in there, then retry."
+        )
+    return (
+        f"Google Chrome is not open. Open your regular Chrome with {_provider_name(provider)} already "
+        "logged in, then retry."
+    )
+
+
+def _ensure_linux_browser_ready(
+    app_settings: Settings,
+    provider: Provider,
+) -> None:
+    if _browser_platform_label(app_settings) != "linux":
+        return
+    ensure_linux_remote_debugging_session(
+        app_settings,
+        target_url=app_settings.provider_url(provider),
+    )
+
+
+def _refresh_linux_provider_tab_for_images(
+    app_settings: Settings,
+    adapter,
+    tab: ChromeTabRef,
+    provider: Provider,
+) -> ChromeTabRef:
+    if _browser_platform_label(app_settings) != "linux" or provider != "chatgpt":
+        return tab
+    rebound = adapter.rebind_tab(
+        conversation_url=None,
+        tab_ref=None,
+    )
+    return rebound.tab or tab
 
 
 def _provider_new_chat_url(app_settings: Settings, provider: Provider) -> str:
@@ -206,11 +256,20 @@ def _run_gemini_job_in_existing_chrome(
             runtime.update_status("checking_browser")
             runtime.append_log("Checking whether Google Chrome is already open.")
             _runtime_checkpoint(runtime)
+        try:
+            _ensure_linux_browser_ready(resolved, job.provider)
+        except (FileNotFoundError, RuntimeError) as exc:
+            _raise_structured_error(
+                OrdaKError(
+                    code=ErrorCode.CHROME_NOT_OPEN,
+                    message=str(exc) or _chrome_not_ready_message(resolved, job.provider),
+                )
+            )
         if not is_google_chrome_running():
             _raise_structured_error(
                 OrdaKError(
                     code=ErrorCode.CHROME_NOT_OPEN,
-                    message=f"Google Chrome is not open. Open your regular Chrome with {_provider_name(job.provider)} already logged in, then retry.",
+                    message=_chrome_not_ready_message(resolved, job.provider),
                 )
             )
 
@@ -221,10 +280,6 @@ def _run_gemini_job_in_existing_chrome(
             target_url = job.conversation_url
 
         if should_open_new_tab:
-            if job.provider == "chatgpt" and not resolved.chatgpt_project_url and not target_url:
-                _raise_structured_error(
-                    OrdaKError(code=ErrorCode.PROJECT_URL_MISSING)
-                )
             if runtime is not None:
                 runtime.update_status("opening_provider_tab")
                 runtime.append_log(
@@ -339,6 +394,12 @@ def _run_gemini_job_in_existing_chrome(
             runtime.append_log("Extracting the final response from the current Google Chrome tab.")
             _runtime_checkpoint(runtime)
         if answer.startswith("__GENERATED_IMAGES__:"):
+            tab = _refresh_linux_provider_tab_for_images(
+                resolved,
+                adapter,
+                tab,
+                job.provider,
+            )
             extraction = adapter.extract_image_result(
                 tab,
                 output_dir=resolved.browser_output_dir,

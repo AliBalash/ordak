@@ -123,6 +123,14 @@ def test_provider_direct_response_multipart_image_endpoint(tmp_path: Path) -> No
         assert payload["output_images"][0]["url"].endswith(payload["output_images"][0]["path"])
 
 
+def test_profile_open_endpoint(tmp_path: Path, monkeypatch) -> None:
+    with create_test_client(tmp_path) as client:
+        monkeypatch.setattr(client.app.state.job_manager, "launch_profile_browser", lambda: True)
+        response = client.post("/api/profile/open")
+        assert response.status_code == 200
+        assert response.json()["message"] == "Profile browser opened."
+
+
 def test_cancel_retry_resume_endpoints(tmp_path: Path) -> None:
     def slow_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
         runtime.update_status("waiting_for_response")

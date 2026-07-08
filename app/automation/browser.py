@@ -4,16 +4,19 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 import platform
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
 from app.config import Settings, settings
-from app.automation.existing_chrome import open_gemini_tab_in_existing_chrome
 
 
 def slugify_step_name(step_name: str) -> str:
@@ -227,8 +230,106 @@ def take_screenshot(
     return target
 
 
+def linux_remote_debugging_available(app_settings: Settings | None = None) -> bool:
+    resolved = app_settings or settings
+    try:
+        with urlopen(f"{resolved.browser_remote_debugging_url.rstrip('/')}/json/version", timeout=5) as response:
+            return response.status == 200
+    except (URLError, HTTPError, TimeoutError, ValueError):
+        return False
+
+
+def _linux_remote_debugging_port(app_settings: Settings | None = None) -> int:
+    resolved = app_settings or settings
+    parsed = urlparse(resolved.browser_remote_debugging_url)
+    if parsed.scheme not in {"http", "https"} or parsed.port is None:
+        raise RuntimeError(
+            "BROWSER_REMOTE_DEBUGGING_URL must include an explicit host and port, for example http://127.0.0.1:9222."
+        )
+    return parsed.port
+
+
+def _linux_launch_remote_debugging_chrome(
+    *,
+    app_settings: Settings | None = None,
+    target_url: str | None = None,
+) -> None:
+    resolved = app_settings or settings
+    port = _linux_remote_debugging_port(resolved)
+    user_data_dir = resolved.browser_remote_debugging_user_data_dir
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    launch_url = target_url or "about:blank"
+    cmd = [
+        str(resolved.browser_executable_path),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        "--new-window",
+        "--no-first-run",
+        "--no-default-browser-check",
+        launch_url,
+    ]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _wait_for_linux_remote_debugging(app_settings: Settings | None = None) -> None:
+    resolved = app_settings or settings
+    deadline = time.monotonic() + resolved.browser_remote_debugging_launch_timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if linux_remote_debugging_available(resolved):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        "Google Chrome remote debugging did not become reachable after launch. "
+        f"Expected DevTools at {resolved.browser_remote_debugging_url}."
+    )
+
+
+def _linux_remote_debugging_unavailable_message(app_settings: Settings | None = None) -> str:
+    resolved = app_settings or settings
+    return (
+        "Google Chrome remote debugging is not reachable. "
+        f"Start Chrome on Linux with DevTools exposed at {resolved.browser_remote_debugging_url}, "
+        "keep the signed-in Gemini/ChatGPT session there, then retry."
+    )
+
+
+def ensure_linux_remote_debugging_session(
+    app_settings: Settings | None = None,
+    *,
+    target_url: str | None = None,
+) -> None:
+    resolved = app_settings or settings
+    if platform.system().lower() != "linux":
+        return
+    if linux_remote_debugging_available(resolved):
+        return
+    if not resolved.browser_remote_debugging_auto_launch:
+        raise RuntimeError(_linux_remote_debugging_unavailable_message(resolved))
+
+    _linux_launch_remote_debugging_chrome(
+        app_settings=resolved,
+        target_url=target_url,
+    )
+    _wait_for_linux_remote_debugging(resolved)
+
+
 def open_profile_browser_session(app_settings: Settings | None = None) -> None:
     resolved = app_settings or settings
+    from app.automation.existing_chrome import open_gemini_tab_in_existing_chrome
+
+    if platform.system().lower() == "linux":
+        if not linux_remote_debugging_available(resolved):
+            _linux_launch_remote_debugging_chrome(
+                app_settings=resolved,
+                target_url="about:blank",
+            )
+            _wait_for_linux_remote_debugging(resolved)
     open_gemini_tab_in_existing_chrome(resolved.gemini_url)
 
 

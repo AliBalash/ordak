@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.automation.existing_chrome import (
     ChromeTabRef,
+    insert_prompt,
     upload_local_file,
     wait_for_generated_image_ready,
 )
@@ -62,6 +63,61 @@ def test_upload_local_file_waits_until_loading_clears(monkeypatch, tmp_path: Pat
     assert calls["marked_done"] == 1
 
 
+def test_upload_local_file_accepts_awaiting_ack_when_dom_readiness_catches_up(
+    monkeypatch, tmp_path: Path
+) -> None:
+    upload_path = tmp_path / "api-style-upload-name-sample-image-test.png"
+    upload_path.write_bytes(b"fake-image")
+
+    calls = {
+        "status_polls": 0,
+        "readiness_polls": 0,
+        "marked_done": 0,
+    }
+
+    def fake_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+        assert tab == ChromeTabRef(window_id=1, tab_id=2)
+        if 'return "started"' in javascript:
+            return "started"
+        if "window.__codexUploadChunks = []" in javascript:
+            return "ok"
+        if "window.__codexUploadChunks.push" in javascript:
+            return "ok"
+        if 'window.__codexUploadStatus || "pending"' in javascript:
+            calls["status_polls"] += 1
+            return "awaiting-ack"
+        if "attachment:" in javascript and "hasPreview" in javascript:
+            calls["readiness_polls"] += 1
+            ready = calls["readiness_polls"] >= 2
+            return json.dumps(
+                {
+                    "attachment": ready,
+                    "loading": False,
+                    "hasPreview": ready,
+                    "submitReady": ready,
+                }
+            )
+        if 'window.__codexUploadStatus = "done"' in javascript:
+            calls["marked_done"] += 1
+            return "ok"
+        raise AssertionError(f"Unexpected javascript probe: {javascript[:120]}")
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute_javascript)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+
+    upload_local_file(
+        ChromeTabRef(window_id=1, tab_id=2),
+        file_path=upload_path,
+        file_name=upload_path.name,
+        mime_type="image/png",
+        timeout_ms=5_000,
+    )
+
+    assert calls["status_polls"] >= 1
+    assert calls["readiness_polls"] >= 2
+    assert calls["marked_done"] == 1
+
+
 def test_wait_for_generated_image_ready_requires_stable_ready_state(monkeypatch) -> None:
     states = iter(
         [
@@ -81,3 +137,24 @@ def test_wait_for_generated_image_ready_requires_stable_ready_state(monkeypatch)
         ChromeTabRef(window_id=1, tab_id=2),
         timeout_ms=5_000,
     )
+
+
+def test_insert_prompt_fallback_avoids_trusted_html_innerhtml(monkeypatch) -> None:
+    scripts: list[str] = []
+
+    def fake_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+        scripts.append(javascript)
+        assert 'target.innerHTML = ""' not in javascript
+        if "target.replaceChildren();" in javascript:
+            return "ok"
+        return "ok"
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute_javascript)
+
+    insert_prompt(
+        ChromeTabRef(window_id=1, tab_id=2),
+        "hello world",
+        provider="gemini",
+    )
+
+    assert any("target.replaceChildren();" in script for script in scripts)

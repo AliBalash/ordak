@@ -20,6 +20,8 @@ def upgrade() -> None:
         sa.Column("external_conversation_id", sa.Text(), nullable=True),
         sa.Column("tab_window_id", sa.Integer(), nullable=True),
         sa.Column("tab_id", sa.Integer(), nullable=True),
+        sa.Column("tab_window_key", sa.Text(), nullable=True),
+        sa.Column("tab_target_id", sa.Text(), nullable=True),
         sa.Column("tab_alive", sa.Boolean(), nullable=False, server_default=sa.text("0")),
         sa.Column("last_successful_job_id", sa.Text(), nullable=True),
         sa.Column("last_error_code", sa.Text(), nullable=True),

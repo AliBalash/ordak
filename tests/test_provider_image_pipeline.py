@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.automation.existing_chrome import ChromeTabRef
 from app.providers.existing_chrome import ExistingChromeProviderAdapter
+from app.automation.existing_chrome import _read_generated_image_export_payloads
 
 
 def test_extract_image_result_prefers_download_stage(
@@ -224,3 +225,32 @@ def test_wait_for_response_stops_provider_on_cancel(monkeypatch) -> None:
         raise AssertionError("TimeoutError was expected")
 
     assert stop_calls == 1
+
+
+def test_read_generated_image_export_payloads_skips_html_payloads(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    html_data_url = "data:text/html;base64,PGh0bWw+YmFkPC9odG1sPg=="
+
+    def fake_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+        if 'window.__codexGeneratedImageExport?.status || "pending"' in javascript:
+            return "done"
+        if "JSON.stringify(window.__codexGeneratedImageExport?.items || [])" in javascript:
+            return '[{"name":"generated_1.png","mime":"text/html","size":' + str(len(html_data_url)) + '}]'
+        if "window.__codexGeneratedImageExport?.payloads?.[0]?.data" in javascript:
+            return html_data_url
+        if 'window.__codexGeneratedImageExport = { status: "cleared"' in javascript:
+            return "ok"
+        raise AssertionError(javascript[:120])
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute_javascript)
+
+    result = _read_generated_image_export_payloads(
+        ChromeTabRef(window_id=1, tab_id=1),
+        output_dir=tmp_path,
+        job_id="job-html",
+        timeout_ms=5_000,
+    )
+
+    assert result == []

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
+import platform
+import re
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Literal
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
+
+from websockets.sync.client import connect as websocket_connect
 
 from app.artifacts import slugify_filename
+from app.config import settings
 
 
 ProviderName = Literal["gemini", "chatgpt"]
@@ -26,6 +37,19 @@ GENERATED_IMAGE_SELECTORS = [
     ".generated-images-container img",
     ".image-gallery img",
 ]
+
+X11_PROMPT_LABELS: dict[ProviderName, tuple[str, ...]] = {
+    "gemini": ("Enter a prompt for Gemini",),
+    "chatgpt": ("Message ChatGPT", "Send a message", "Ask anything"),
+}
+
+TEXTUAL_ACCESSIBILITY_ROLES = {
+    "static",
+    "paragraph",
+    "heading",
+    "label",
+    "link",
+}
 
 PROMPT_SELECTORS: dict[ProviderName, list[str]] = {
     "gemini": [
@@ -93,6 +117,8 @@ def _image_loading_selectors(provider: ProviderName) -> list[str]:
 class ChromeTabRef:
     window_id: int
     tab_id: int
+    window_key: str | None = None
+    target_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -102,10 +128,624 @@ class ChromeTabInfo:
     url: str
     title: str
     active: bool = False
+    window_key: str | None = None
+    target_id: str | None = None
+    websocket_debugger_url: str | None = None
 
     @property
     def ref(self) -> ChromeTabRef:
-        return ChromeTabRef(window_id=self.window_id, tab_id=self.tab_id)
+        return ChromeTabRef(
+            window_id=self.window_id,
+            tab_id=self.tab_id,
+            window_key=self.window_key,
+            target_id=self.target_id,
+        )
+
+
+def _browser_platform() -> str:
+    configured = settings.browser_platform.strip().lower()
+    if configured in {"mac", "macos", "darwin"}:
+        return "mac"
+    if configured in {"linux", "lin"}:
+        return "linux"
+    system = platform.system().strip().lower()
+    if system == "darwin":
+        return "mac"
+    if system == "linux":
+        return "linux"
+    return configured or system
+
+
+def _is_mac_backend() -> bool:
+    return _browser_platform() == "mac"
+
+
+def _remote_debugging_base_url() -> str:
+    return settings.browser_remote_debugging_url.rstrip("/")
+
+
+def _fetch_json(url: str, *, method: str = "GET") -> Any:
+    request = Request(url, method=method)
+    with urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _linux_error(message: str) -> RuntimeError:
+    return RuntimeError(
+        f"{message} Start Chrome on Linux with remote debugging enabled, for example: "
+        f"{settings.browser_executable_path} --remote-debugging-port=9222"
+    )
+
+
+def _linux_x11_error(message: str) -> RuntimeError:
+    return RuntimeError(
+        f"{message} On Linux without DevTools, ordak needs an interactive X11 session with "
+        "Google Chrome already open and xdotool available."
+    )
+
+
+def _linux_devtools_version() -> dict[str, Any]:
+    try:
+        payload = _fetch_json(f"{_remote_debugging_base_url()}/json/version")
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid DevTools version payload.")
+        return payload
+    except (URLError, HTTPError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        raise _linux_error(
+            f"Could not connect to Chrome DevTools at {settings.browser_remote_debugging_url}."
+        ) from exc
+
+
+def _linux_devtools_available() -> bool:
+    try:
+        payload = _fetch_json(f"{_remote_debugging_base_url()}/json/version")
+        if not isinstance(payload, dict):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _linux_x11_available() -> bool:
+    return bool(os.getenv("DISPLAY")) and shutil.which("xdotool") is not None
+
+
+def _linux_should_use_x11_backend() -> bool:
+    return (
+        _browser_platform() == "linux"
+        and settings.browser_linux_x11_fallback_enabled
+        and not _linux_devtools_available()
+        and _linux_x11_available()
+    )
+
+
+def _linux_atspi():
+    try:
+        dist_paths = (
+            "/usr/lib/python3/dist-packages",
+            "/usr/local/lib/python3/dist-packages",
+        )
+        for candidate in dist_paths:
+            if candidate not in sys.path and Path(candidate).exists():
+                sys.path.append(candidate)
+        import gi
+
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on system packages
+        raise _linux_x11_error("AT-SPI is not available for the current desktop session.") from exc
+    return Atspi
+
+
+def _linux_atspi_text_value(accessible: Any) -> str:
+    text_iface = accessible.get_text_iface()
+    if not text_iface:
+        return ""
+    char_count = text_iface.get_character_count()
+    if char_count <= 0:
+        return ""
+    Atspi = _linux_atspi()
+    return str(Atspi.Text.get_text(text_iface, 0, char_count) or "")
+
+
+def _linux_atspi_walk(accessible: Any, visitor: Callable[[Any, str], bool], path: str = "") -> bool:
+    if visitor(accessible, path):
+        return True
+    for index in range(accessible.get_child_count()):
+        if _linux_atspi_walk(accessible.get_child_at_index(index), visitor, f"{path}/{index}"):
+            return True
+    return False
+
+
+def _linux_atspi_find_nodes(
+    root: Any,
+    predicate: Callable[[Any], bool],
+) -> list[tuple[Any, str]]:
+    matches: list[tuple[Any, str]] = []
+
+    def visitor(accessible: Any, path: str) -> bool:
+        if predicate(accessible):
+            matches.append((accessible, path))
+        return False
+
+    _linux_atspi_walk(root, visitor)
+    return matches
+
+
+def _linux_x11_window_id(window_name: str) -> int:
+    candidates = [window_name.strip()]
+    if " - Google Chrome - " in window_name:
+        candidates.append(window_name.split(" - Google Chrome - ", 1)[0] + " - Google Chrome")
+    if " - Mohammad Hossein" in window_name:
+        candidates.append(window_name.removesuffix(" - Mohammad Hossein"))
+    if " - " in window_name:
+        parts = window_name.split(" - ")
+        for keep in range(len(parts) - 1, 1, -1):
+            candidates.append(" - ".join(parts[:keep]))
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--name", candidate],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.splitlines()[0].strip())
+    class_match = subprocess.run(
+        ["xdotool", "search", "--onlyvisible", "--class", "google-chrome"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if class_match.returncode == 0 and class_match.stdout.strip():
+        return int(class_match.stdout.splitlines()[0].strip())
+    raise _linux_x11_error(f"Could not map the Google Chrome window '{window_name}' to an X11 window id.")
+
+
+def _linux_atspi_chrome_windows() -> list[tuple[Any, int]]:
+    Atspi = _linux_atspi()
+    desktop = Atspi.get_desktop(0)
+    windows: list[tuple[Any, int]] = []
+    for app_index in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(app_index)
+        if (app.get_name() or "").strip() != "Google Chrome":
+            continue
+        for window_index in range(app.get_child_count()):
+            window = app.get_child_at_index(window_index)
+            name = (window.get_name() or "").strip()
+            if not name:
+                continue
+            try:
+                windows.append((window, _linux_x11_window_id(name)))
+            except RuntimeError:
+                continue
+    return windows
+
+
+def _linux_atspi_primary_window() -> tuple[Any, int]:
+    windows = _linux_atspi_chrome_windows()
+    if not windows:
+        raise _linux_x11_error("Google Chrome is not visible in the current X11 desktop session.")
+    return windows[0]
+
+
+def _linux_atspi_selected_page_tab(window: Any) -> tuple[Any | None, int]:
+    Atspi = _linux_atspi()
+    selected_index = 0
+    selected_tab = None
+
+    def predicate(accessible: Any) -> bool:
+        nonlocal selected_index, selected_tab
+        if accessible.get_role_name() != "page tab":
+            return False
+        states = accessible.get_state_set()
+        if states.contains(Atspi.StateType.SELECTED):
+            selected_tab = accessible
+            return True
+        selected_index += 1
+        return False
+
+    _linux_atspi_walk(window, lambda accessible, _: predicate(accessible))
+    return selected_tab, selected_index
+
+
+def _linux_atspi_address_value(window: Any) -> str:
+    nodes = _linux_atspi_find_nodes(
+        window,
+        lambda accessible: accessible.get_role_name() == "entry"
+        and "address and search bar" in (accessible.get_name() or "").lower(),
+    )
+    if not nodes:
+        return ""
+    return _linux_atspi_text_value(nodes[0][0]).strip()
+
+
+def _linux_atspi_document_root(window: Any) -> Any | None:
+    nodes = _linux_atspi_find_nodes(window, lambda accessible: accessible.get_role_name() == "document web")
+    return nodes[0][0] if nodes else None
+
+
+def _linux_atspi_prompt_entry(window: Any, provider: ProviderName) -> Any | None:
+    labels = X11_PROMPT_LABELS[provider]
+    matches = _linux_atspi_find_nodes(
+        window,
+        lambda accessible: accessible.get_role_name() == "entry"
+        and any(label in (accessible.get_name() or "") for label in labels),
+    )
+    return matches[0][0] if matches else None
+
+
+def _linux_atspi_flat_text_items(window: Any) -> list[tuple[str, str]]:
+    document = _linux_atspi_document_root(window)
+    if document is None:
+        return []
+    items: list[tuple[str, str]] = []
+
+    def visitor(accessible: Any, _: str) -> bool:
+        role = accessible.get_role_name()
+        name = (accessible.get_name() or "").strip()
+        if role in TEXTUAL_ACCESSIBILITY_ROLES and name:
+            items.append((role, name))
+        elif role == "entry":
+            label = (accessible.get_name() or "").strip()
+            if label:
+                items.append((role, label))
+        return False
+
+    _linux_atspi_walk(document, visitor)
+    return items
+
+
+def _linux_normalize_accessibility_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("\u200c", " ")).strip()
+
+
+def _linux_x11_ignore_response_text(value: str, excluded_text: str) -> bool:
+    normalized = _linux_normalize_accessibility_text(value)
+    excluded = _linux_normalize_accessibility_text(excluded_text)
+    if not normalized:
+        return True
+    if excluded and normalized == excluded:
+        return True
+    ignored_patterns = (
+        "conversation with gemini",
+        "gemini said",
+        "gemini replied",
+        "your privacy & gemini",
+        "opens in a new window",
+        "gemini is ai and can make mistakes",
+        "ask gemini",
+        "activity",
+        "from your ip address",
+    )
+    return any(pattern in normalized.lower() for pattern in ignored_patterns)
+
+
+def _linux_x11_latest_gemini_answer(items: list[tuple[str, str]], excluded_text: str) -> str:
+    blocks: list[str] = []
+    current: list[str] = []
+    collecting = False
+    saw_gemini_heading = False
+    for role, value in items:
+        normalized = _linux_normalize_accessibility_text(value)
+        if role == "heading" and normalized == "Gemini said":
+            saw_gemini_heading = True
+            if current:
+                blocks.append("\n".join(current).strip())
+            current = []
+            collecting = True
+            continue
+        if role == "heading" and normalized.startswith("You said"):
+            if collecting and current:
+                blocks.append("\n".join(current).strip())
+            current = []
+            collecting = False
+            continue
+        if role == "entry" and "Enter a prompt for Gemini" in value:
+            if collecting and current:
+                blocks.append("\n".join(current).strip())
+            current = []
+            collecting = False
+            continue
+        if collecting and role in TEXTUAL_ACCESSIBILITY_ROLES and not _linux_x11_ignore_response_text(value, excluded_text):
+            current.append(normalized)
+    if current:
+        blocks.append("\n".join(current).strip())
+    for block in reversed(blocks):
+        if block and not _linux_x11_ignore_response_text(block, excluded_text):
+            return block
+    if saw_gemini_heading:
+        return ""
+    for role, value in reversed(items):
+        if role in TEXTUAL_ACCESSIBILITY_ROLES and not _linux_x11_ignore_response_text(value, excluded_text):
+            return _linux_normalize_accessibility_text(value)
+    return ""
+
+
+def _linux_x11_button(window: Any, patterns: tuple[str, ...]) -> Any | None:
+    lowered = tuple(pattern.lower() for pattern in patterns)
+    matches = _linux_atspi_find_nodes(
+        window,
+        lambda accessible: accessible.get_role_name() == "button"
+        and any(pattern in (accessible.get_name() or "").lower() for pattern in lowered),
+    )
+    return matches[0][0] if matches else None
+
+
+def _linux_x11_busy(window: Any) -> bool:
+    return _linux_x11_button(window, ("stop response", "stop generating", "stop answering", "cancel")) is not None
+
+
+def _linux_x11_current_tab_info() -> ChromeTabInfo:
+    window, window_id = _linux_atspi_primary_window()
+    selected_tab, selected_index = _linux_atspi_selected_page_tab(window)
+    title = (selected_tab.get_name() or window.get_name() or "Google Chrome").strip() if selected_tab else (window.get_name() or "Google Chrome").strip()
+    url = _linux_atspi_address_value(window)
+    return ChromeTabInfo(
+        window_id=window_id,
+        tab_id=selected_index,
+        url=f"https://{url}" if url and "://" not in url else url,
+        title=title,
+        active=True,
+        window_key="linux-x11",
+        target_id=f"{window_id}:{selected_index}",
+    )
+
+
+def _linux_x11_activate_window(window_id: int) -> None:
+    result = subprocess.run(
+        ["xdotool", "windowactivate", "--sync", str(window_id)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise _linux_x11_error("Could not bring the current Google Chrome window to the foreground.")
+
+
+def _linux_x11_click(accessible: Any, *, window_id: int) -> None:
+    Atspi = _linux_atspi()
+    component = accessible.get_component()
+    extents = component.get_extents(Atspi.CoordType.SCREEN)
+    x = extents.x + max(extents.width // 2, 1)
+    y = extents.y + max(extents.height // 2, 1)
+    _linux_x11_activate_window(window_id)
+    subprocess.run(
+        ["xdotool", "mousemove", str(x), str(y)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    result = subprocess.run(
+        ["xdotool", "click", "1"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise _linux_x11_error("Could not click the requested control in Google Chrome.")
+
+
+def _linux_x11_key(*keys: str, window_id: int) -> None:
+    for key in keys:
+        result = subprocess.run(
+            ["xdotool", "key", "--window", str(window_id), "--clearmodifiers", key],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise _linux_x11_error(f"Could not send the key {key!r} to Google Chrome.")
+
+
+def _linux_x11_type_text(text: str, *, window_id: int) -> None:
+    for index, line in enumerate(text.splitlines() or [""]):
+        if line:
+            result = subprocess.run(
+                ["xdotool", "type", "--delay", "20", line],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise _linux_x11_error("Could not type the prompt into the current Google Chrome tab.")
+        if index < len(text.splitlines()) - 1:
+            _linux_x11_key("Shift+Return", window_id=window_id)
+
+
+def _linux_x11_open_url_in_current_chrome(target_url: str) -> ChromeTabRef:
+    info = _linux_x11_current_tab_info()
+    _linux_x11_activate_window(info.window_id)
+    _linux_x11_key("ctrl+t", window_id=info.window_id)
+    time.sleep(0.4)
+    _linux_x11_key("ctrl+l", window_id=info.window_id)
+    time.sleep(0.2)
+    result = subprocess.run(
+        ["xdotool", "type", "--delay", "8", target_url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise _linux_x11_error("Could not type the target URL into Google Chrome.")
+    _linux_x11_key("Return", window_id=info.window_id)
+    deadline = time.monotonic() + 15
+    target_host = urlparse(target_url).netloc.lower()
+    while time.monotonic() < deadline:
+        current = _linux_x11_current_tab_info()
+        if current.url:
+            current_host = urlparse(current.url).netloc.lower()
+            if current_host == target_host:
+                return current.ref
+        time.sleep(0.5)
+    return _linux_x11_current_tab_info().ref
+
+
+def _linux_x11_prompt_entry(tab: ChromeTabRef, provider: ProviderName) -> tuple[Any, int]:
+    window, window_id = _linux_atspi_primary_window()
+    prompt = _linux_atspi_prompt_entry(window, provider)
+    if prompt is None:
+        raise RuntimeError(f"Could not find {PROVIDER_LABELS[provider]} input box in the current Chrome tab.")
+    if tab.window_id and tab.window_id != window_id:
+        raise RuntimeError("The active Google Chrome window no longer matches the saved tab.")
+    return prompt, window_id
+
+
+def _linux_x11_login_state(provider: ProviderName) -> str | None:
+    window, _ = _linux_atspi_primary_window()
+    if _linux_atspi_prompt_entry(window, provider) is not None:
+        return None
+    page_text = " ".join(value for _, value in _linux_atspi_flat_text_items(window)).lower()
+    if re.search(r"verify|captcha|unusual traffic|human verification|prove you are human", page_text):
+        return "manual_verification_required"
+    if re.search(r"sign in|log in|choose an account|continue to gemini|continue with google|welcome back|sign up", page_text):
+        return "login_required"
+    return "login_required"
+
+
+def _linux_list_google_chrome_tabs() -> list[ChromeTabInfo]:
+    _linux_devtools_version()
+    payload = _fetch_json(f"{_remote_debugging_base_url()}/json/list")
+    if not isinstance(payload, list):
+        return []
+    tabs: list[ChromeTabInfo] = []
+    for entry in payload:
+        if not isinstance(entry, dict) or entry.get("type") != "page":
+            continue
+        target_id = str(entry.get("id") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        title = str(entry.get("title") or "").strip()
+        if not target_id:
+            continue
+        tabs.append(
+            ChromeTabInfo(
+                window_id=0,
+                tab_id=0,
+                url=url,
+                title=title,
+                active=False,
+                window_key="linux-devtools",
+                target_id=target_id,
+                websocket_debugger_url=str(entry.get("webSocketDebuggerUrl") or "").strip() or None,
+            )
+        )
+    return tabs
+
+
+def _linux_find_tab(tab: ChromeTabRef) -> ChromeTabInfo | None:
+    for candidate in _linux_list_google_chrome_tabs():
+        if tab.target_id and candidate.target_id == tab.target_id:
+            return candidate
+    return None
+
+
+def _linux_open_tab_via_devtools(target_url: str) -> ChromeTabRef | None:
+    encoded = quote(target_url, safe=":/?&=%#")
+    for endpoint in (
+        f"{_remote_debugging_base_url()}/json/new?{encoded}",
+        f"{_remote_debugging_base_url()}/json/new?{quote(target_url, safe='')}",
+    ):
+        try:
+            payload = _fetch_json(endpoint, method="PUT")
+        except Exception:
+            continue
+        if isinstance(payload, dict) and payload.get("id"):
+            info = ChromeTabInfo(
+                window_id=0,
+                tab_id=0,
+                url=str(payload.get("url") or target_url),
+                title=str(payload.get("title") or ""),
+                active=False,
+                window_key="linux-devtools",
+                target_id=str(payload["id"]),
+                websocket_debugger_url=str(payload.get("webSocketDebuggerUrl") or "").strip() or None,
+            )
+            return info.ref
+    return None
+
+
+def _linux_open_url_in_existing_chrome(target_url: str) -> ChromeTabRef:
+    direct = _linux_open_tab_via_devtools(target_url)
+    if direct is not None:
+        return direct
+
+    before_ids = {tab.target_id for tab in _linux_list_google_chrome_tabs() if tab.target_id}
+    result = subprocess.run(
+        [str(settings.browser_executable_path), target_url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "Could not ask Chrome to open a new tab.").strip()
+        raise _linux_error(message)
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        tabs = _linux_list_google_chrome_tabs()
+        matching = [
+            tab for tab in tabs
+            if tab.url == target_url and tab.target_id not in before_ids
+        ]
+        if matching:
+            return matching[-1].ref
+        time.sleep(0.5)
+    raise _linux_error("Chrome did not expose the new tab through DevTools in time.")
+
+
+def _coerce_javascript_result(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _linux_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+    info = _linux_find_tab(tab)
+    if info is None or not info.websocket_debugger_url:
+        raise _linux_error("Could not find the requested Google Chrome tab.")
+
+    with websocket_connect(info.websocket_debugger_url, open_timeout=5, close_timeout=2) as websocket:
+        websocket.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": javascript,
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                        "userGesture": True,
+                    },
+                }
+            )
+        )
+        while True:
+            message = json.loads(websocket.recv())
+            if message.get("id") != 1:
+                continue
+            result = message.get("result", {})
+            if result.get("exceptionDetails"):
+                details = result["exceptionDetails"]
+                description = (
+                    details.get("exception", {}).get("description")
+                    or details.get("text")
+                    or "JavaScript execution failed."
+                )
+                raise RuntimeError(str(description))
+            value = result.get("result", {}).get("value")
+            if value is None and "description" in result.get("result", {}):
+                value = result["result"]["description"]
+            return _coerce_javascript_result(value)
 
 
 def _run_osascript(script: str, *args: str) -> str:
@@ -128,6 +768,16 @@ def _run_osascript(script: str, *args: str) -> str:
 
 
 def is_google_chrome_running() -> bool:
+    if not _is_mac_backend():
+        if _linux_devtools_available():
+            return True
+        if _linux_should_use_x11_backend():
+            try:
+                _linux_atspi_primary_window()
+                return True
+            except RuntimeError:
+                return False
+        return False
     script = """
 on run argv
     tell application "System Events"
@@ -142,6 +792,10 @@ end run
 
 
 def list_google_chrome_tabs() -> list[ChromeTabInfo]:
+    if not _is_mac_backend():
+        if _linux_should_use_x11_backend():
+            return [_linux_x11_current_tab_info()]
+        return _linux_list_google_chrome_tabs()
     script = """
 on run argv
     tell application "Google Chrome"
@@ -194,12 +848,20 @@ end joinLines
 
 def get_tab_info(tab: ChromeTabRef) -> ChromeTabInfo | None:
     for candidate in list_google_chrome_tabs():
+        if tab.target_id and candidate.target_id == tab.target_id:
+            return candidate
+        if tab.window_key == "linux-devtools" or candidate.window_key == "linux-devtools":
+            continue
         if candidate.window_id == tab.window_id and candidate.tab_id == tab.tab_id:
             return candidate
     return None
 
 
 def open_url_in_existing_chrome(target_url: str) -> ChromeTabRef:
+    if not _is_mac_backend():
+        if _linux_should_use_x11_backend():
+            return _linux_x11_open_url_in_current_chrome(target_url)
+        return _linux_open_url_in_existing_chrome(target_url)
     script = """
 on run argv
     set targetUrl to item 1 of argv
@@ -231,6 +893,8 @@ def open_gemini_tab_in_existing_chrome(gemini_url: str) -> ChromeTabRef:
 
 
 def execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+    if not _is_mac_backend():
+        return _linux_execute_javascript(tab, javascript)
     script = """
 on run argv
     set targetWindowId to (item 1 of argv) as integer
@@ -265,6 +929,17 @@ def wait_for_prompt_input(
     *,
     provider: ProviderName = "gemini",
 ) -> None:
+    if _linux_should_use_x11_backend():
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            try:
+                _linux_x11_prompt_entry(tab, provider)
+                return
+            except RuntimeError:
+                time.sleep(0.5)
+        raise TimeoutError(
+            f"Could not find {PROVIDER_LABELS[provider]} input box in the current Chrome tab."
+        )
     deadline = time.monotonic() + timeout_ms / 1000
     probe = """
 (() => {
@@ -298,6 +973,8 @@ def detect_login_or_verification(
     *,
     provider: ProviderName = "gemini",
 ) -> str | None:
+    if _linux_should_use_x11_backend():
+        return _linux_x11_login_state(provider)
     probe = """
 (() => {
   const bodyText = (document.body?.innerText || "").toLowerCase();
@@ -542,10 +1219,7 @@ def upload_local_file(
         if (!dropped) throw new Error("Could not find an upload target in the current Chrome tab.");
       }}
       await wait(1500);
-      if (!uploadLooksAttached()) {{
-        throw new Error("The current chat page did not acknowledge the uploaded image.");
-      }}
-      window.__codexUploadStatus = "attached";
+      window.__codexUploadStatus = uploadLooksAttached() ? "attached" : "awaiting-ack";
       window.__codexUploadChunks = [];
     }} catch (error) {{
       const message = error instanceof Error ? error.message : String(error);
@@ -571,7 +1245,7 @@ def upload_local_file(
         ).strip()
         if state.startswith("error:"):
             raise RuntimeError(state.removeprefix("error:").strip() or "Image upload failed.")
-        if state in {"attached", "done"}:
+        if state in {"attached", "awaiting-ack", "done"}:
             upload_state = inspect_upload_state(tab, provider=provider)
             if (
                 upload_state.get("attachment")
@@ -658,6 +1332,21 @@ def insert_prompt(
     *,
     provider: ProviderName = "gemini",
 ) -> None:
+    if _linux_should_use_x11_backend():
+        entry, window_id = _linux_x11_prompt_entry(tab, provider)
+        _linux_x11_click(entry, window_id=window_id)
+        time.sleep(0.15)
+        _linux_x11_key("ctrl+a", "BackSpace", window_id=window_id)
+        time.sleep(0.15)
+        _linux_x11_type_text(prompt, window_id=window_id)
+        window, _ = _linux_atspi_primary_window()
+        items = _linux_atspi_flat_text_items(window)
+        normalized_prompt = _linux_normalize_accessibility_text(prompt)
+        if not any(normalized_prompt in _linux_normalize_accessibility_text(value) for _, value in items):
+            raise RuntimeError(
+                f"Could not insert prompt into {PROVIDER_LABELS[provider]} in the current Chrome tab."
+            )
+        return
     payload = json.dumps(prompt, ensure_ascii=False)
     script = f"""
 (() => {{
@@ -693,7 +1382,7 @@ def insert_prompt(
     document.execCommand("selectAll", false);
     const inserted = document.execCommand("insertText", false, text);
     if (!inserted || (target.innerText || "").trim() !== text.trim()) {{
-      target.innerHTML = "";
+      target.replaceChildren();
       const lines = text.split("\\n");
       lines.forEach((line) => {{
         const p = document.createElement("p");
@@ -746,6 +1435,21 @@ def submit_prompt(
     *,
     provider: ProviderName = "gemini",
 ) -> None:
+    if _linux_should_use_x11_backend():
+        entry, window_id = _linux_x11_prompt_entry(tab, provider)
+        _linux_x11_click(entry, window_id=window_id)
+        time.sleep(0.15)
+        _linux_x11_key("Return", window_id=window_id)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            window, _ = _linux_atspi_primary_window()
+            if _linux_x11_busy(window):
+                return
+            items = _linux_atspi_flat_text_items(window)
+            if not any("enter a prompt for gemini" in (value or "").lower() and "ask gemini" not in (value or "").lower() for _, value in items):
+                return
+            time.sleep(0.4)
+        return
     provider_selectors = json.dumps(PROMPT_SELECTORS[provider], ensure_ascii=False)
     script = """
 (() => {
@@ -812,6 +1516,9 @@ def detect_busy_state(
     *,
     provider: ProviderName = "gemini",
 ) -> bool:
+    if _linux_should_use_x11_backend():
+        window, _ = _linux_atspi_primary_window()
+        return _linux_x11_busy(window)
     script = """
 (() => {
   const isVisible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -833,6 +1540,13 @@ def best_effort_stop(
     *,
     provider: ProviderName = "gemini",
 ) -> bool:
+    if _linux_should_use_x11_backend():
+        window, window_id = _linux_atspi_primary_window()
+        button = _linux_x11_button(window, ("stop response", "stop generating", "stop answering", "cancel"))
+        if button is None:
+            return False
+        _linux_x11_click(button, window_id=window_id)
+        return True
     script = """
 (() => {
   const isVisible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -1017,7 +1731,11 @@ def _read_generated_image_export_payloads(
             continue
         header, encoded = data_url.split(",", 1)
         mime = item.get("mime") or header.split(";")[0].removeprefix("data:") or "image/png"
+        if not str(mime).lower().startswith("image/"):
+            continue
         payload_bytes = base64.b64decode(encoded)
+        if not _looks_like_image_bytes(payload_bytes):
+            continue
         if payload_bytes in seen_payload_hashes:
             continue
         seen_payload_hashes.add(payload_bytes)
@@ -1037,6 +1755,18 @@ def _read_generated_image_export_payloads(
 """,
     )
     return saved_paths
+
+
+def _looks_like_image_bytes(payload: bytes) -> bool:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if payload.startswith(b"\xff\xd8\xff"):
+        return True
+    if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return True
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    return False
 
 
 def export_generated_images(
@@ -1074,6 +1804,7 @@ def export_generated_images(
       const response = await fetch(source);
       const blob = await response.blob();
       const mime = blob.type || "image/png";
+      if (!mime.toLowerCase().startsWith("image/")) return null;
       const ext = mime.includes("jpeg") ? "jpg" : mime.includes("webp") ? "webp" : "png";
       const data = await readAsDataUrl(blob);
       return {{ name: `${{forcedStem || `generated_${{index + 1}}`}}.${{ext}}`, mime, data }};
@@ -1246,6 +1977,27 @@ def wait_for_response_stable(
     provider: ProviderName = "gemini",
     should_cancel: Callable[[], bool] | None = None,
 ) -> str:
+    if _linux_should_use_x11_backend():
+        if provider != "gemini":
+            raise TimeoutError("Linux X11 fallback currently supports Gemini text responses only.")
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since = time.monotonic()
+        last_text = ""
+        while time.monotonic() < deadline:
+            if should_cancel and should_cancel():
+                raise TimeoutError("__ORD_CANCELLED__")
+            window, _ = _linux_atspi_primary_window()
+            busy = _linux_x11_busy(window)
+            current = _linux_x11_latest_gemini_answer(_linux_atspi_flat_text_items(window), excluded_text)
+            if current and current != last_text:
+                last_text = current
+                stable_since = time.monotonic()
+            elif current and not busy and (time.monotonic() - stable_since) >= stable_seconds:
+                return current
+            time.sleep(1)
+        raise TimeoutError(
+            f"{PROVIDER_LABELS[provider]} did not finish response within the timeout in the current Chrome tab."
+        )
     deadline = time.monotonic() + timeout_ms / 1000
     stable_since = time.monotonic()
     last_text = ""

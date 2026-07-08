@@ -22,6 +22,8 @@ class Conversation(Base):
     external_conversation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     tab_window_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tab_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tab_window_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tab_target_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     tab_alive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_successful_job_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)

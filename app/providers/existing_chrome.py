@@ -81,6 +81,8 @@ class ExistingChromeProviderAdapter:
             url=target,
             title=f"{self.provider.title()}",
             active=True,
+            window_key=tab.window_key,
+            target_id=tab.target_id,
         )
 
     def rebind_tab(
@@ -102,7 +104,12 @@ class ExistingChromeProviderAdapter:
 
         domain_matches = [tab for tab in tabs if self._matches_provider_url(tab.url)]
         if domain_matches:
-            preferred = next((tab for tab in domain_matches if tab.active), domain_matches[-1])
+            if any(tab.active for tab in domain_matches):
+                preferred = next(tab for tab in domain_matches if tab.active)
+            elif any(tab.window_key == "linux-devtools" for tab in domain_matches):
+                preferred = domain_matches[0]
+            else:
+                preferred = domain_matches[-1]
             return RebindResult(tab=preferred.ref, info=preferred)
         return RebindResult(tab=None, info=None, error_code=ErrorCode.TAB_LOST)
 
@@ -247,11 +254,15 @@ class ExistingChromeProviderAdapter:
         return best_effort_stop(tab, provider=self.provider)
 
     def collect_diagnostics(self) -> ProviderDiagnostics:
-        tabs = [tab for tab in list_google_chrome_tabs() if self._matches_provider_url(tab.url)]
+        notes: list[str] = []
+        try:
+            tabs = [tab for tab in list_google_chrome_tabs() if self._matches_provider_url(tab.url)]
+        except Exception as exc:
+            notes.append(str(exc))
+            tabs = []
         active = next((tab for tab in tabs if tab.active), tabs[-1] if tabs else None)
         login_state: LoginState = "ready"
         busy = False
-        notes: list[str] = []
         if active is not None:
             try:
                 login_state = self.detect_login_state(active.ref)
