@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import platform
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import Request, ProxyHandler, build_opener
 
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
@@ -233,7 +233,9 @@ def take_screenshot(
 def linux_remote_debugging_available(app_settings: Settings | None = None) -> bool:
     resolved = app_settings or settings
     try:
-        with urlopen(f"{resolved.browser_remote_debugging_url.rstrip('/')}/json/version", timeout=5) as response:
+        opener = build_opener(ProxyHandler({}))
+        request = Request(f"{resolved.browser_remote_debugging_url.rstrip('/')}/json/version")
+        with opener.open(request, timeout=5) as response:
             return response.status == 200
     except (URLError, HTTPError, TimeoutError, ValueError):
         return False

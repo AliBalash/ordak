@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Protocol
 
-from app.automation.existing_chrome import ChromeTabInfo, ChromeTabRef
+from app.automation.existing_chrome import ChromeTabInfo, ChromeTabRef, ResponseBaseline
 from app.errors import ErrorCode
 
 
@@ -70,6 +70,10 @@ class ProviderAdapter(Protocol):
 
     def submit_prompt(self, tab: ChromeTabRef) -> None: ...
 
+    def read_latest_response_text(self, tab: ChromeTabRef) -> str: ...
+
+    def read_latest_response_baseline(self, tab: ChromeTabRef) -> ResponseBaseline: ...
+
     def wait_for_response(
         self,
         tab: ChromeTabRef,
@@ -78,7 +82,12 @@ class ProviderAdapter(Protocol):
         stable_seconds: int,
         excluded_text: str,
         expect_images: bool,
+        previous_response: str = "",
+        previous_assistant_turn_count: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        stall_refresh_seconds: int = 0,
+        max_stall_refreshes: int = 0,
+        recovery_callback: Callable[[str], None] | None = None,
     ) -> str: ...
 
     def extract_text_result(self, raw_text: str) -> str: ...

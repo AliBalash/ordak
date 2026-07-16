@@ -15,6 +15,7 @@ app/storage/traces/*
 app/storage/logs/*
 app/storage/profiles/*
 app/storage/uploads/*
+app/storage/agent-steps/*
 dist/
 build/
 !app/storage/screenshots/.gitkeep

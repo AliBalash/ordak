@@ -16,6 +16,20 @@ class ErrorCode(StrEnum):
     PROJECT_URL_MISSING = "project_url_missing"
     CHROME_NOT_OPEN = "chrome_not_open"
     APPLE_EVENTS_BLOCKED = "apple_events_blocked"
+    AGENT_DISABLED = "agent_disabled"
+    AGENT_TARGET_NOT_CONFIGURED = "agent_target_not_configured"
+    AGENT_WORKSPACE_REQUIRED = "agent_workspace_required"
+    AGENT_WORKSPACE_NOT_FOUND = "agent_workspace_not_found"
+    AGENT_WORKSPACE_NOT_ALLOWED = "agent_workspace_not_allowed"
+    AGENT_PROTOCOL_ERROR = "agent_protocol_error"
+    AGENT_PROTOCOL_LIMIT_EXCEEDED = "agent_protocol_limit_exceeded"
+    AGENT_DUPLICATE_COMMAND_ID = "agent_duplicate_command_id"
+    AGENT_MAX_STEPS_EXCEEDED = "agent_max_steps_exceeded"
+    AGENT_TOOL_NOT_SUPPORTED = "agent_tool_not_supported"
+    AGENT_TOOL_POLICY_DENIED = "agent_tool_policy_denied"
+    AGENT_COMMAND_TIMEOUT = "agent_command_timeout"
+    AGENT_EXECUTION_BACKEND_UNAVAILABLE = "agent_execution_backend_unavailable"
+    AGENT_RESULT_TOO_LARGE = "agent_result_too_large"
 
 
 @dataclass(slots=True, frozen=True)
@@ -103,6 +117,104 @@ ERROR_DESCRIPTORS: dict[ErrorCode, ErrorDescriptor] = {
         title="Chrome Apple Events blocked",
         message="Google Chrome is blocking JavaScript from Apple Events.",
         suggested_action="Enable View > Developer > Allow JavaScript from Apple Events in Chrome, then retry.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_DISABLED: ErrorDescriptor(
+        code=ErrorCode.AGENT_DISABLED,
+        title="Agent mode disabled",
+        message="Ordex Agent Mode is disabled on this ordak instance.",
+        suggested_action="Enable agent mode in configuration, then retry.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_TARGET_NOT_CONFIGURED: ErrorDescriptor(
+        code=ErrorCode.AGENT_TARGET_NOT_CONFIGURED,
+        title="Agent target missing",
+        message="The ChatGPT Ordex agent URL is not configured.",
+        suggested_action="Set CHATGPT_AGENT_URL and retry.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_WORKSPACE_REQUIRED: ErrorDescriptor(
+        code=ErrorCode.AGENT_WORKSPACE_REQUIRED,
+        title="Agent workspace required",
+        message="Agent mode requires a permitted local workspace path.",
+        suggested_action="Provide a workspace path inside an allowed root, then retry.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_WORKSPACE_NOT_FOUND: ErrorDescriptor(
+        code=ErrorCode.AGENT_WORKSPACE_NOT_FOUND,
+        title="Workspace not found",
+        message="The requested agent workspace does not exist or is not a directory.",
+        suggested_action="Create the workspace directory or choose a valid existing directory, then retry.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_WORKSPACE_NOT_ALLOWED: ErrorDescriptor(
+        code=ErrorCode.AGENT_WORKSPACE_NOT_ALLOWED,
+        title="Workspace not allowed",
+        message="The requested agent workspace is outside the configured allowed roots.",
+        suggested_action="Choose a workspace inside an allowed root and retry.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_PROTOCOL_ERROR: ErrorDescriptor(
+        code=ErrorCode.AGENT_PROTOCOL_ERROR,
+        title="Agent protocol error",
+        message="The Ordex GPT response did not follow the RUN/FINAL protocol.",
+        suggested_action="Retry the job or inspect the protocol logs for the invalid response.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_PROTOCOL_LIMIT_EXCEEDED: ErrorDescriptor(
+        code=ErrorCode.AGENT_PROTOCOL_LIMIT_EXCEEDED,
+        title="Agent protocol limit exceeded",
+        message="Ordex exceeded the maximum number of protocol errors.",
+        suggested_action="Start a fresh agent job after checking the GPT instructions.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_DUPLICATE_COMMAND_ID: ErrorDescriptor(
+        code=ErrorCode.AGENT_DUPLICATE_COMMAND_ID,
+        title="Duplicate agent command ID",
+        message="Ordex attempted to reuse a command ID that already ran.",
+        suggested_action="Retry the job or inspect the conversation history for repeated RUN actions.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_MAX_STEPS_EXCEEDED: ErrorDescriptor(
+        code=ErrorCode.AGENT_MAX_STEPS_EXCEEDED,
+        title="Agent max steps exceeded",
+        message="The agent reached the configured maximum number of executed steps.",
+        suggested_action="Increase max steps for a new job or narrow the task scope.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_TOOL_NOT_SUPPORTED: ErrorDescriptor(
+        code=ErrorCode.AGENT_TOOL_NOT_SUPPORTED,
+        title="Unsupported agent tool",
+        message="Ordex requested a tool that this bridge does not support.",
+        suggested_action="Retry and let Ordex choose one of the supported tools.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_TOOL_POLICY_DENIED: ErrorDescriptor(
+        code=ErrorCode.AGENT_TOOL_POLICY_DENIED,
+        title="Agent tool denied",
+        message="The requested tool action was blocked by the server-side safety policy.",
+        suggested_action="Retry with a safer command or adjust the task to stay inside the workspace rules.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_COMMAND_TIMEOUT: ErrorDescriptor(
+        code=ErrorCode.AGENT_COMMAND_TIMEOUT,
+        title="Agent command timeout",
+        message="A local agent command exceeded the configured timeout.",
+        suggested_action="Retry with a shorter command or increase the timeout for a new job.",
+        recoverable=True,
+    ),
+    ErrorCode.AGENT_EXECUTION_BACKEND_UNAVAILABLE: ErrorDescriptor(
+        code=ErrorCode.AGENT_EXECUTION_BACKEND_UNAVAILABLE,
+        title="Execution backend unavailable",
+        message="The requested agent execution backend is not available on this machine.",
+        suggested_action="Use the configured host backend or install the requested container runtime.",
+        recoverable=False,
+    ),
+    ErrorCode.AGENT_RESULT_TOO_LARGE: ErrorDescriptor(
+        code=ErrorCode.AGENT_RESULT_TOO_LARGE,
+        title="Agent result too large",
+        message="The tool result exceeded the configured size limits.",
+        suggested_action="Retry with smaller reads or narrower commands.",
         recoverable=True,
     ),
 }

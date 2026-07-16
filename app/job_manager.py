@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from collections import defaultdict
@@ -13,8 +14,11 @@ from typing import Any, Callable
 from fastapi import WebSocket
 from sqlalchemy import func, select
 
+from app.agent.types import AgentResolvedConfig
+from app.agent.workspace import resolve_workspace
+from app.agent.policy import container_runtime_available, validate_execution_backend
 from app.artifacts import storage_absolute_path, storage_relative_path
-from app.automation.browser import open_profile_browser_session
+from app.automation.browser import linux_remote_debugging_available, open_profile_browser_session
 from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
@@ -32,9 +36,11 @@ from app.automation.gemini_worker import (
 from app.config import Settings, settings
 from app.database import SessionLocal
 from app.errors import ErrorCode, get_error_descriptor
-from app.models import Conversation, Job
+from app.models import AgentStep, Conversation, Job
 from app.providers import get_provider_adapter
 from app.schemas import (
+    AgentOptions,
+    AgentStepResponse,
     CleanupResponse,
     ConversationResponse,
     ConversationSummary,
@@ -89,6 +95,12 @@ class JobSnapshot:
     logs: list[dict[str, Any]]
     screenshots: list[str]
     trace_path: str | None
+    agent_workspace: str | None
+    agent_step_count: int
+    agent_max_steps: int | None
+    agent_command_timeout_seconds: int | None
+    agent_execution_backend: str | None
+    agent_network_enabled: bool | None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -117,6 +129,11 @@ class JobSnapshot:
             logs=[LogEntry(**entry) for entry in self.logs],
             screenshots=self.screenshots,
             trace_path=self.trace_path,
+            agent_workspace=self.agent_workspace,
+            agent_step_count=self.agent_step_count,
+            agent_max_steps=self.agent_max_steps,
+            agent_command_timeout_seconds=self.agent_command_timeout_seconds,
+            agent_execution_backend=self.agent_execution_backend,
             created_at=self.created_at,
             started_at=self.started_at,
             finished_at=self.finished_at,
@@ -183,8 +200,56 @@ class JobManager:
         uploads: list[str] | None = None,
         retry_of_job_id: str | None = None,
         run_strategy: str | None = None,
+        agent_options: AgentOptions | None = None,
     ) -> JobCreateResponse:
         uploads = uploads or []
+        resolved_agent_workspace: str | None = None
+        resolved_agent_max_steps: int | None = None
+        resolved_agent_command_timeout_seconds: int | None = None
+        resolved_agent_execution_backend: str | None = None
+        resolved_agent_network_enabled: bool | None = None
+        if mode == "agent":
+            if not self.settings.agent_enabled:
+                raise ValueError("Agent mode is disabled on this ordak instance.")
+            if provider != "chatgpt":
+                raise ValueError("Agent mode currently supports ChatGPT only.")
+            if uploads:
+                raise ValueError("Agent mode does not accept image uploads.")
+            if agent_options is None:
+                raise ValueError("Agent mode requires agent workspace options.")
+            if not self.settings.chatgpt_agent_url:
+                raise ValueError("CHATGPT_AGENT_URL is not configured.")
+            resolved_workspace = resolve_workspace(
+                agent_options.workspace,
+                self.settings.agent_allowed_workspace_roots,
+            )
+            resolved_agent_workspace = str(resolved_workspace.workspace)
+            requested_max_steps = agent_options.max_steps or self.settings.agent_default_max_steps
+            if requested_max_steps > self.settings.agent_max_allowed_steps:
+                raise ValueError(
+                    f"Agent max_steps must be <= {self.settings.agent_max_allowed_steps}."
+                )
+            requested_timeout = (
+                agent_options.command_timeout_seconds
+                or self.settings.agent_default_command_timeout_seconds
+            )
+            if requested_timeout > self.settings.agent_max_command_timeout_seconds:
+                raise ValueError(
+                    f"Agent command_timeout_seconds must be <= {self.settings.agent_max_command_timeout_seconds}."
+                )
+            resolved_agent_max_steps = requested_max_steps
+            resolved_agent_command_timeout_seconds = requested_timeout
+            resolved_agent_execution_backend = validate_execution_backend(
+                agent_options.execution_backend,
+                self.settings,
+            )
+            resolved_agent_network_enabled = (
+                agent_options.network_enabled
+                if agent_options.network_enabled is not None
+                else self.settings.agent_network_enabled
+            )
+        elif agent_options is not None:
+            raise ValueError("Agent options are only valid when mode is agent.")
         resolved_job_id = job_id or str(uuid.uuid4())
         resolved_conversation_id = conversation_id or str(uuid.uuid4())
         conversation = self._get_or_create_conversation(
@@ -217,6 +282,11 @@ class JobManager:
             "output_images": [],
             "retry_of_job_id": retry_of_job_id,
             "run_strategy": run_strategy,
+            "agent_workspace": resolved_agent_workspace,
+            "agent_max_steps": resolved_agent_max_steps,
+            "agent_command_timeout_seconds": resolved_agent_command_timeout_seconds,
+            "agent_execution_backend": resolved_agent_execution_backend,
+            "agent_network_enabled": resolved_agent_network_enabled,
         }
         job = Job(
             id=resolved_job_id,
@@ -229,6 +299,11 @@ class JobManager:
             start_new_chat=bool(start_new_chat),
             retry_of_job_id=retry_of_job_id,
             run_strategy=run_strategy,
+            agent_workspace=resolved_agent_workspace,
+            agent_max_steps=resolved_agent_max_steps,
+            agent_command_timeout_seconds=resolved_agent_command_timeout_seconds,
+            agent_execution_backend=resolved_agent_execution_backend,
+            agent_network_enabled=resolved_agent_network_enabled,
             logs=_dumps_list(
                 [
                     {
@@ -277,6 +352,30 @@ class JobManager:
 
     async def retry_job(self, job_id: str, strategy: str) -> JobCreateResponse:
         source = self.get_job_snapshot(job_id)
+        if source.mode == "agent":
+            continue_same_conversation = strategy in {
+                "same_tab",
+                "new_tab_same_conversation",
+            }
+            return await self.create_job(
+                source.question,
+                provider=source.provider,
+                mode=source.mode,
+                conversation_id=(
+                    source.conversation_id if continue_same_conversation else None
+                ),
+                start_new_chat=not continue_same_conversation,
+                uploads=[],
+                retry_of_job_id=source.job_id,
+                run_strategy=strategy,
+                agent_options=AgentOptions(
+                    workspace=source.agent_workspace or "",
+                    max_steps=source.agent_max_steps,
+                    command_timeout_seconds=source.agent_command_timeout_seconds,
+                    execution_backend=source.agent_execution_backend,
+                    network_enabled=source.agent_network_enabled,
+                ),
+            )
         start_new_chat = strategy == "new_chat"
         conversation_id = None if start_new_chat else source.conversation_id
         return await self.create_job(
@@ -292,6 +391,32 @@ class JobManager:
 
     async def resume_job(self, job_id: str, strategy: str) -> JobCreateResponse:
         source = self.get_job_snapshot(job_id)
+        if source.mode == "agent":
+            if source.status not in {
+                "failed",
+                "manual_verification_required",
+                "cancelled",
+            }:
+                raise ValueError(
+                    "Only failed, manual verification, or cancelled jobs can be resumed."
+                )
+            return await self.create_job(
+                source.question,
+                provider=source.provider,
+                mode=source.mode,
+                conversation_id=source.conversation_id,
+                start_new_chat=False,
+                uploads=[],
+                retry_of_job_id=source.job_id,
+                run_strategy=strategy,
+                agent_options=AgentOptions(
+                    workspace=source.agent_workspace or "",
+                    max_steps=source.agent_max_steps,
+                    command_timeout_seconds=source.agent_command_timeout_seconds,
+                    execution_backend=source.agent_execution_backend,
+                    network_enabled=source.agent_network_enabled,
+                ),
+            )
         if source.status not in {"failed", "manual_verification_required", "cancelled"}:
             raise ValueError("Only failed, manual verification, or cancelled jobs can be resumed.")
         if not source.recoverable and source.error_code:
@@ -328,7 +453,7 @@ class JobManager:
             conversation = (
                 session.get(Conversation, job.conversation_id) if job.conversation_id else None
             )
-            return self._snapshot_from_model(job, conversation)
+            return self._snapshot_from_model(job, conversation, session=session)
 
     def list_jobs(self, limit: int = 20) -> list[JobSnapshot]:
         with SessionLocal() as session:
@@ -341,9 +466,54 @@ class JobManager:
                 for conversation in session.execute(select(Conversation)).scalars().all()
             }
             return [
-                self._snapshot_from_model(job, conversations.get(job.conversation_id))
+                self._snapshot_from_model(job, conversations.get(job.conversation_id), session=session)
                 for job in rows
             ]
+
+    def list_agent_steps(self, job_id: str) -> list[AgentStepResponse]:
+        with SessionLocal() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            steps = session.execute(
+                select(AgentStep)
+                .where(AgentStep.job_id == job_id)
+                .order_by(AgentStep.sequence.asc())
+            ).scalars().all()
+            return [
+                AgentStepResponse(
+                    id=step.id,
+                    job_id=step.job_id,
+                    sequence=step.sequence,
+                    command_id=step.command_id,
+                    tool=step.tool,
+                    status=step.status,
+                    request_json=step.request_json,
+                    result_json=step.result_json,
+                    started_at=step.started_at,
+                    finished_at=step.finished_at,
+                    duration_ms=step.duration_ms,
+                    error_message=step.error_message,
+                )
+                for step in steps
+            ]
+
+    def _conversation_agent_command_ids(
+        self,
+        conversation_id: str,
+        *,
+        excluding_job_id: str | None = None,
+    ) -> tuple[str, ...]:
+        with SessionLocal() as session:
+            statement = (
+                select(AgentStep.command_id)
+                .join(Job, AgentStep.job_id == Job.id)
+                .where(Job.conversation_id == conversation_id)
+            )
+            if excluding_job_id:
+                statement = statement.where(AgentStep.job_id != excluding_job_id)
+            command_ids = session.execute(statement).scalars().all()
+        return tuple(dict.fromkeys(command_ids))
 
     def list_conversations(self, limit: int = 30) -> list[ConversationSummary]:
         with SessionLocal() as session:
@@ -401,7 +571,7 @@ class JobManager:
                 .where(Job.conversation_id == conversation_id)
                 .order_by(Job.created_at.asc())
             ).scalars().all()
-            snapshots = [self._snapshot_from_model(job, conversation) for job in jobs]
+            snapshots = [self._snapshot_from_model(job, conversation, session=session) for job in jobs]
         return ConversationResponse(
             conversation_id=conversation.id,
             title=conversation.title,
@@ -480,6 +650,17 @@ class JobManager:
             last_error_by_provider=last_error_by_provider,
             active_job=active_job,
             queue_depth=self.queue.qsize(),
+            agent={
+                "enabled": self.settings.agent_enabled,
+                "chatgpt_agent_url_configured": bool(self.settings.chatgpt_agent_url),
+                "allowed_workspace_root_count": len(self.settings.agent_allowed_workspace_roots),
+                "execution_backend": self.settings.agent_execution_backend,
+                "container_runtime_available": container_runtime_available(
+                    self.settings.agent_execution_backend
+                ),
+                "remote_debugging_reachable": linux_remote_debugging_available(self.settings),
+                "step_log_dir_writable": os.access(self.settings.agent_step_log_dir, os.W_OK),
+            },
         )
 
     def storage_diagnostics(self) -> StorageDiagnosticsResponse:
@@ -570,6 +751,12 @@ class JobManager:
             "submitting_prompt",
             "waiting_for_response",
             "extracting_answer",
+            "preparing_agent",
+            "waiting_for_agent",
+            "parsing_agent_action",
+            "executing_agent_action",
+            "sending_agent_result",
+            "finalizing_agent",
             "cancelling",
         }
         descriptor = get_error_descriptor(ErrorCode.RESPONSE_TIMEOUT.value)
@@ -622,6 +809,28 @@ class JobManager:
                         storage_absolute_path(path, self.settings) for path in snapshot.uploads
                     ],
                     run_strategy=snapshot.run_strategy,
+                    agent_config=(
+                        AgentResolvedConfig(
+                            workspace=Path(snapshot.agent_workspace),
+                            workspace_display=snapshot.agent_workspace,
+                            max_steps=snapshot.agent_max_steps or self.settings.agent_default_max_steps,
+                            command_timeout_seconds=(
+                                snapshot.agent_command_timeout_seconds
+                                or self.settings.agent_default_command_timeout_seconds
+                            ),
+                            execution_backend=(
+                                snapshot.agent_execution_backend
+                                or self.settings.agent_execution_backend
+                            ),
+                            network_enabled=bool(
+                                snapshot.agent_network_enabled
+                                if snapshot.agent_network_enabled is not None
+                                else self.settings.agent_network_enabled
+                            ),
+                        )
+                        if snapshot.agent_workspace
+                        else None
+                    ),
                 )
                 runtime = WorkerRuntime(
                     update_status=lambda status: self._set_status(job_id, status),
@@ -637,6 +846,25 @@ class JobManager:
                         job_id, message, status, error_code
                     ),
                     should_cancel=control.is_cancel_requested,
+                    start_agent_step=lambda sequence, command_id, tool, request_json: self._start_agent_step(
+                        job_id,
+                        sequence=sequence,
+                        command_id=command_id,
+                        tool=tool,
+                        request_json=request_json,
+                    ),
+                    finish_agent_step=lambda step_id, status, result_json=None, error_message=None: self._finish_agent_step(
+                        job_id,
+                        step_id=step_id,
+                        status=status,
+                        result_json=result_json,
+                        error_message=error_message,
+                    ),
+                    agent_max_protocol_errors=self.settings.agent_max_protocol_errors,
+                    agent_seen_command_ids=self._conversation_agent_command_ids(
+                        snapshot.conversation_id,
+                        excluding_job_id=job_id,
+                    ),
                 )
                 try:
                     self.worker(job_id, job_request, runtime=runtime, app_settings=self.settings)
@@ -700,7 +928,7 @@ class JobManager:
             session.add(job)
             session.commit()
             conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
-            snapshot = self._snapshot_from_model(job, conversation)
+            snapshot = self._snapshot_from_model(job, conversation, session=session)
         self._schedule_broadcast("log", snapshot, log=entry)
 
     def _attach_screenshot(self, job_id: str, path: Path) -> None:
@@ -715,7 +943,7 @@ class JobManager:
             session.add(job)
             session.commit()
             conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
-            snapshot = self._snapshot_from_model(job, conversation)
+            snapshot = self._snapshot_from_model(job, conversation, session=session)
         self._schedule_broadcast("snapshot", snapshot)
 
     def _set_trace_path(self, job_id: str, path: Path) -> None:
@@ -750,7 +978,69 @@ class JobManager:
             session.add(job)
             session.commit()
             conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
-            snapshot = self._snapshot_from_model(job, conversation)
+            snapshot = self._snapshot_from_model(job, conversation, session=session)
+        self._schedule_broadcast("snapshot", snapshot)
+
+    def _start_agent_step(
+        self,
+        job_id: str,
+        *,
+        sequence: int,
+        command_id: str,
+        tool: str,
+        request_json: str,
+    ) -> str:
+        with SessionLocal() as session:
+            step = AgentStep(
+                job_id=job_id,
+                sequence=sequence,
+                command_id=command_id,
+                tool=tool,
+                status="running",
+                request_json=request_json,
+                started_at=utcnow(),
+            )
+            session.add(step)
+            session.commit()
+            job = session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
+            snapshot = self._snapshot_from_model(job, conversation, session=session)
+        self._schedule_broadcast("snapshot", snapshot)
+        return step.id
+
+    def _finish_agent_step(
+        self,
+        job_id: str,
+        *,
+        step_id: str,
+        status: str,
+        result_json: str | None,
+        error_message: str | None,
+    ) -> None:
+        with SessionLocal() as session:
+            step = session.get(AgentStep, step_id)
+            if step is None:
+                raise KeyError(step_id)
+            step.status = status
+            step.result_json = result_json
+            step.error_message = error_message
+            step.finished_at = utcnow()
+            started_at = step.started_at
+            finished_at = step.finished_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            if finished_at.tzinfo is None:
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            step.duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+            session.add(step)
+            session.commit()
+            job = session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
+            snapshot = self._snapshot_from_model(job, conversation, session=session)
         self._schedule_broadcast("snapshot", snapshot)
 
     def _save_error(
@@ -802,12 +1092,14 @@ class JobManager:
             session.add(job)
             session.commit()
             conversation = session.get(Conversation, job.conversation_id) if job.conversation_id else None
-            return self._snapshot_from_model(job, conversation)
+            return self._snapshot_from_model(job, conversation, session=session)
 
     def _snapshot_from_model(
         self,
         job: Job,
         conversation: Conversation | None,
+        *,
+        session=None,
     ) -> JobSnapshot:
         metadata = {
             "conversation_id": job.id,
@@ -817,12 +1109,26 @@ class JobManager:
             "mode": "chat",
             "uploads": [],
             "output_images": [],
+            "agent_workspace": None,
+            "agent_max_steps": None,
+            "agent_command_timeout_seconds": None,
+            "agent_execution_backend": None,
+            "agent_network_enabled": None,
         }
         metadata_rows = _loads_list(job.metadata_json)
         if metadata_rows:
             metadata.update(metadata_rows[0])
         uploads = _loads_list(job.uploads_json) or list(metadata.get("uploads", []))
         output_images = _loads_list(job.output_images_json) or list(metadata.get("output_images", []))
+        if session is None:
+            with SessionLocal() as nested_session:
+                agent_step_count = nested_session.execute(
+                    select(func.count()).select_from(AgentStep).where(AgentStep.job_id == job.id)
+                ).scalar_one()
+        else:
+            agent_step_count = session.execute(
+                select(func.count()).select_from(AgentStep).where(AgentStep.job_id == job.id)
+            ).scalar_one()
         conversation_id = job.conversation_id or metadata.get("conversation_id", job.id)
         conversation_title = (
             job.conversation_title
@@ -855,6 +1161,26 @@ class JobManager:
             logs=_loads_list(job.logs),
             screenshots=_loads_list(job.screenshot_paths),
             trace_path=job.trace_path,
+            agent_workspace=job.agent_workspace or metadata.get("agent_workspace"),
+            agent_step_count=int(agent_step_count or 0),
+            agent_max_steps=(
+                job.agent_max_steps
+                if job.agent_max_steps is not None
+                else metadata.get("agent_max_steps")
+            ),
+            agent_command_timeout_seconds=(
+                job.agent_command_timeout_seconds
+                if job.agent_command_timeout_seconds is not None
+                else metadata.get("agent_command_timeout_seconds")
+            ),
+            agent_execution_backend=(
+                job.agent_execution_backend or metadata.get("agent_execution_backend")
+            ),
+            agent_network_enabled=(
+                job.agent_network_enabled
+                if job.agent_network_enabled is not None
+                else metadata.get("agent_network_enabled")
+            ),
             created_at=job.created_at,
             started_at=job.started_at,
             finished_at=job.finished_at,
@@ -870,8 +1196,14 @@ class JobManager:
             conversation.tab_id = tab_info.tab_id
             conversation.tab_window_key = getattr(tab_info, "window_key", None)
             conversation.tab_target_id = getattr(tab_info, "target_id", None)
-            conversation.external_url = tab_info.url
-            conversation.external_conversation_id = self._extract_external_conversation_id(tab_info.url)
+            existing_url = conversation.external_url or ""
+            new_url = tab_info.url or ""
+            keep_specific_url = "/c/" in existing_url and "/c/" not in new_url
+            if not keep_specific_url:
+                conversation.external_url = new_url
+                conversation.external_conversation_id = self._extract_external_conversation_id(
+                    new_url
+                )
             conversation.tab_alive = True
             conversation.updated_at = utcnow()
             session.add(conversation)

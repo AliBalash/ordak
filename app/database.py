@@ -160,6 +160,11 @@ def _ensure_sqlite_schema(engine: Engine) -> None:
             "error_code": "TEXT",
             "retry_of_job_id": "TEXT",
             "run_strategy": "TEXT",
+            "agent_workspace": "TEXT",
+            "agent_max_steps": "INTEGER",
+            "agent_command_timeout_seconds": "INTEGER",
+            "agent_execution_backend": "TEXT",
+            "agent_network_enabled": "BOOLEAN",
             "recoverable": "BOOLEAN",
             "suggested_action": "TEXT",
             "cancel_requested_at": "DATETIME",
@@ -169,10 +174,47 @@ def _ensure_sqlite_schema(engine: Engine) -> None:
         for column_name, sql_type in job_columns.items():
             _ensure_column(connection, "jobs", column_name, sql_type)
 
+        if "agent_steps" not in {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE agent_steps (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    command_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    started_at DATETIME NOT NULL,
+                    finished_at DATETIME,
+                    duration_ms INTEGER,
+                    error_message TEXT,
+                    FOREIGN KEY(job_id) REFERENCES jobs (id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_agent_steps_job_sequence ON agent_steps(job_id, sequence)"
+            )
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_agent_steps_job_command_id ON agent_steps(job_id, command_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_agent_steps_job_id ON agent_steps(job_id)"
+            )
+
         rows = connection.exec_driver_sql(
             """
             SELECT id, question, created_at, metadata_json, provider, conversation_id, conversation_title,
-                   mode, start_new_chat, uploads_json, output_images_json, answer, logs
+                   mode, start_new_chat, uploads_json, output_images_json, answer, logs,
+                   agent_workspace, agent_max_steps, agent_command_timeout_seconds,
+                   agent_execution_backend, agent_network_enabled
             FROM jobs
             """
         ).fetchall()
@@ -191,6 +233,11 @@ def _ensure_sqlite_schema(engine: Engine) -> None:
                 output_images_json,
                 answer,
                 logs,
+                agent_workspace,
+                agent_max_steps,
+                agent_command_timeout_seconds,
+                agent_execution_backend,
+                agent_network_enabled,
             ) = row
             metadata_rows = _loads_json_list(metadata_json)
             metadata = metadata_rows[0] if metadata_rows else {}
@@ -218,11 +265,32 @@ def _ensure_sqlite_schema(engine: Engine) -> None:
             resolved_outputs = output_images_json or json.dumps(
                 metadata.get("output_images", []), ensure_ascii=False
             )
+            resolved_agent_workspace = agent_workspace or metadata.get("agent_workspace")
+            resolved_agent_max_steps = (
+                agent_max_steps
+                if agent_max_steps is not None
+                else metadata.get("agent_max_steps")
+            )
+            resolved_agent_command_timeout_seconds = (
+                agent_command_timeout_seconds
+                if agent_command_timeout_seconds is not None
+                else metadata.get("agent_command_timeout_seconds")
+            )
+            resolved_agent_execution_backend = (
+                agent_execution_backend or metadata.get("agent_execution_backend")
+            )
+            resolved_agent_network_enabled = (
+                agent_network_enabled
+                if agent_network_enabled is not None
+                else metadata.get("agent_network_enabled")
+            )
             connection.exec_driver_sql(
                 """
                 UPDATE jobs
                 SET provider = ?, conversation_id = ?, conversation_title = ?, mode = ?,
-                    start_new_chat = ?, uploads_json = ?, output_images_json = ?
+                    start_new_chat = ?, uploads_json = ?, output_images_json = ?,
+                    agent_workspace = ?, agent_max_steps = ?, agent_command_timeout_seconds = ?,
+                    agent_execution_backend = ?, agent_network_enabled = ?
                 WHERE id = ?
                 """,
                 (
@@ -233,6 +301,15 @@ def _ensure_sqlite_schema(engine: Engine) -> None:
                     int(bool(resolved_start_new)),
                     resolved_uploads,
                     resolved_outputs,
+                    resolved_agent_workspace,
+                    resolved_agent_max_steps,
+                    resolved_agent_command_timeout_seconds,
+                    resolved_agent_execution_backend,
+                    (
+                        int(bool(resolved_agent_network_enabled))
+                        if resolved_agent_network_enabled is not None
+                        else None
+                    ),
                     job_id,
                 ),
             )

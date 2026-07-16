@@ -17,6 +17,8 @@ from app.automation.existing_chrome import (
     insert_prompt,
     list_google_chrome_tabs,
     open_provider_tab_in_existing_chrome,
+    read_latest_response_baseline,
+    read_latest_response_text,
     submit_prompt,
     wait_for_generated_image_ready,
     wait_for_prompt_input,
@@ -93,14 +95,22 @@ class ExistingChromeProviderAdapter:
     ) -> RebindResult:
         if tab_ref is not None:
             info = get_tab_info(tab_ref)
-            if info is not None and self._matches_provider_url(info.url):
+            if (
+                info is not None
+                and self._matches_provider_url(info.url)
+                and (
+                    not conversation_url
+                    or self._same_conversation(info.url, conversation_url)
+                )
+            ):
                 return RebindResult(tab=tab_ref, info=info)
 
         tabs = list_google_chrome_tabs()
         if conversation_url:
             for tab in tabs:
-                if tab.url == conversation_url:
+                if self._same_conversation(tab.url, conversation_url):
                     return RebindResult(tab=tab.ref, info=tab)
+            return RebindResult(tab=None, info=None, error_code=ErrorCode.TAB_LOST)
 
         domain_matches = [tab for tab in tabs if self._matches_provider_url(tab.url)]
         if domain_matches:
@@ -112,6 +122,23 @@ class ExistingChromeProviderAdapter:
                 preferred = domain_matches[-1]
             return RebindResult(tab=preferred.ref, info=preferred)
         return RebindResult(tab=None, info=None, error_code=ErrorCode.TAB_LOST)
+
+    @staticmethod
+    def _same_conversation(candidate_url: str, expected_url: str) -> bool:
+        if candidate_url == expected_url:
+            return True
+        candidate_parts = [part for part in urlparse(candidate_url).path.split("/") if part]
+        expected_parts = [part for part in urlparse(expected_url).path.split("/") if part]
+        if "c" not in candidate_parts or "c" not in expected_parts:
+            return False
+        candidate_index = candidate_parts.index("c")
+        expected_index = expected_parts.index("c")
+        return (
+            len(candidate_parts) > candidate_index + 1
+            and len(expected_parts) > expected_index + 1
+            and candidate_parts[candidate_index + 1]
+            == expected_parts[expected_index + 1]
+        )
 
     def detect_login_state(self, tab: ChromeTabRef) -> LoginState:
         state = detect_login_or_verification(tab, provider=self.provider)
@@ -136,6 +163,12 @@ class ExistingChromeProviderAdapter:
     def submit_prompt(self, tab: ChromeTabRef) -> None:
         submit_prompt(tab, provider=self.provider)
 
+    def read_latest_response_text(self, tab: ChromeTabRef) -> str:
+        return read_latest_response_text(tab, provider=self.provider)
+
+    def read_latest_response_baseline(self, tab: ChromeTabRef):
+        return read_latest_response_baseline(tab, provider=self.provider)
+
     def wait_for_response(
         self,
         tab: ChromeTabRef,
@@ -144,7 +177,12 @@ class ExistingChromeProviderAdapter:
         stable_seconds: int,
         excluded_text: str,
         expect_images: bool,
+        previous_response: str = "",
+        previous_assistant_turn_count: int | None = None,
         should_cancel=None,
+        stall_refresh_seconds: int = 0,
+        max_stall_refreshes: int = 0,
+        recovery_callback=None,
     ) -> str:
         try:
             return wait_for_response_stable(
@@ -152,9 +190,14 @@ class ExistingChromeProviderAdapter:
                 timeout_ms=timeout_ms,
                 stable_seconds=stable_seconds,
                 excluded_text=excluded_text,
+                previous_response=previous_response,
+                previous_assistant_turn_count=previous_assistant_turn_count,
                 expect_images=expect_images,
                 provider=self.provider,
                 should_cancel=should_cancel,
+                stall_refresh_seconds=stall_refresh_seconds,
+                max_stall_refreshes=max_stall_refreshes,
+                recovery_callback=recovery_callback,
             )
         except TimeoutError as exc:
             if str(exc) == "__ORD_CANCELLED__":

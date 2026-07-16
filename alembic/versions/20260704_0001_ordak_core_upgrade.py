@@ -11,6 +11,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
     op.create_table(
         "conversations",
         sa.Column("id", sa.Text(), primary_key=True),
@@ -29,20 +31,49 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
-    with op.batch_alter_table("jobs") as batch_op:
-        batch_op.add_column(sa.Column("provider", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("conversation_id", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("conversation_title", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("mode", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("start_new_chat", sa.Boolean(), nullable=True))
-        batch_op.add_column(sa.Column("error_code", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("retry_of_job_id", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("run_strategy", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("recoverable", sa.Boolean(), nullable=True))
-        batch_op.add_column(sa.Column("suggested_action", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("cancel_requested_at", sa.DateTime(timezone=True), nullable=True))
-        batch_op.add_column(sa.Column("uploads_json", sa.Text(), nullable=True))
-        batch_op.add_column(sa.Column("output_images_json", sa.Text(), nullable=True))
+    if "jobs" not in inspector.get_table_names():
+        op.create_table(
+            "jobs",
+            sa.Column("id", sa.Text(), primary_key=True),
+            sa.Column("question", sa.Text(), nullable=False),
+            sa.Column("answer", sa.Text(), nullable=True),
+            sa.Column("status", sa.Text(), nullable=False),
+            sa.Column("error_message", sa.Text(), nullable=True),
+            sa.Column("provider", sa.Text(), nullable=True),
+            sa.Column("conversation_id", sa.Text(), nullable=True),
+            sa.Column("conversation_title", sa.Text(), nullable=True),
+            sa.Column("mode", sa.Text(), nullable=True),
+            sa.Column("start_new_chat", sa.Boolean(), nullable=True),
+            sa.Column("error_code", sa.Text(), nullable=True),
+            sa.Column("retry_of_job_id", sa.Text(), nullable=True),
+            sa.Column("run_strategy", sa.Text(), nullable=True),
+            sa.Column("recoverable", sa.Boolean(), nullable=True),
+            sa.Column("suggested_action", sa.Text(), nullable=True),
+            sa.Column("cancel_requested_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("screenshot_paths", sa.Text(), nullable=True),
+            sa.Column("trace_path", sa.Text(), nullable=True),
+            sa.Column("logs", sa.Text(), nullable=True),
+            sa.Column("uploads_json", sa.Text(), nullable=True),
+            sa.Column("output_images_json", sa.Text(), nullable=True),
+        )
+    else:
+        with op.batch_alter_table("jobs") as batch_op:
+            batch_op.add_column(sa.Column("provider", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("conversation_id", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("conversation_title", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("mode", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("start_new_chat", sa.Boolean(), nullable=True))
+            batch_op.add_column(sa.Column("error_code", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("retry_of_job_id", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("run_strategy", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("recoverable", sa.Boolean(), nullable=True))
+            batch_op.add_column(sa.Column("suggested_action", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("cancel_requested_at", sa.DateTime(timezone=True), nullable=True))
+            batch_op.add_column(sa.Column("uploads_json", sa.Text(), nullable=True))
+            batch_op.add_column(sa.Column("output_images_json", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:

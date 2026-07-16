@@ -14,6 +14,7 @@ from app.config import settings
 from app.database import init_db
 from app.job_manager import JobManager
 from app.schemas import (
+    AgentStepListResponse,
     CleanupResponse,
     ConversationListResponse,
     ConversationResponse,
@@ -42,6 +43,31 @@ def _as_form_bool(value: object) -> bool:
 
 def _absolute_url(request: Request, relative_path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}/{relative_path.lstrip('/')}"
+
+
+def _validate_agent_request(
+    *,
+    mode: str,
+    provider: str,
+    agent,
+    uploads_present: bool,
+    multipart: bool,
+) -> None:
+    if mode == "agent":
+        if provider != "chatgpt":
+            raise HTTPException(status_code=422, detail="Agent mode currently supports ChatGPT only.")
+        if uploads_present:
+            raise HTTPException(status_code=422, detail="Agent mode does not accept image uploads.")
+        if multipart:
+            raise HTTPException(
+                status_code=422,
+                detail="Agent mode must be submitted as JSON and does not accept multipart form data.",
+            )
+        if agent is None:
+            raise HTTPException(status_code=422, detail="Agent options are required when mode is agent.")
+        return
+    if agent is not None:
+        raise HTTPException(status_code=422, detail="Agent options are only valid when mode is agent.")
 
 
 def _artifact_link(request: Request, relative_path: str) -> ArtifactLinkResponse:
@@ -95,12 +121,19 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail="Question is required.")
             if provider not in {"gemini", "chatgpt"}:
                 raise HTTPException(status_code=422, detail="Unsupported provider.")
-            if mode not in {"chat", "image_analyze", "image_generate"}:
+            if mode not in {"chat", "image_analyze", "image_generate", "agent"}:
                 raise HTTPException(status_code=422, detail="Unsupported job mode.")
-            if wait_timeout_seconds < 1 or wait_timeout_seconds > 900:
-                raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 900.")
+            if wait_timeout_seconds < 1 or wait_timeout_seconds > 3600:
+                raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 3600.")
             pending_job_id = str(uuid.uuid4())
             upload = form.get("image")
+            _validate_agent_request(
+                mode=mode,
+                provider=provider,
+                agent=None,
+                uploads_present=upload is not None and bool(getattr(upload, "filename", None)),
+                multipart=True,
+            )
             if upload is not None and getattr(upload, "filename", None):
                 try:
                     saved_upload = await save_image_upload(upload, pending_job_id, settings)
@@ -124,6 +157,13 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
         raw_payload = await request.json()
         if forced_provider is None:
             payload = JobCreateRequest.model_validate(raw_payload)
+            _validate_agent_request(
+                mode=payload.mode,
+                provider=payload.provider,
+                agent=payload.agent,
+                uploads_present=False,
+                multipart=False,
+            )
             wait_for_completion = True
             wait_timeout_seconds = 300
             try:
@@ -134,12 +174,20 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     conversation_id=payload.conversation_id,
                     start_new_chat=payload.start_new_chat,
                     uploads=[],
+                    agent_options=payload.agent,
                 )
                 return created, wait_for_completion, wait_timeout_seconds
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         payload = ProviderRunRequest.model_validate(raw_payload)
+        _validate_agent_request(
+            mode=payload.mode,
+            provider=forced_provider,
+            agent=payload.agent,
+            uploads_present=False,
+            multipart=False,
+        )
         try:
             created = await request.app.state.job_manager.create_job(
                 payload.question,
@@ -148,6 +196,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 conversation_id=payload.conversation_id,
                 start_new_chat=payload.start_new_chat,
                 uploads=[],
+                agent_options=payload.agent,
             )
             return created, payload.wait_for_completion, payload.wait_timeout_seconds
         except ValueError as exc:
@@ -293,6 +342,13 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
     async def get_job(job_id: str, request: Request) -> JobResponse:
         try:
             return request.app.state.job_manager.get_job_snapshot(job_id).to_response()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found.") from exc
+
+    @app.get("/api/jobs/{job_id}/steps", response_model=AgentStepListResponse)
+    async def get_job_steps(job_id: str, request: Request) -> AgentStepListResponse:
+        try:
+            return AgentStepListResponse(steps=request.app.state.job_manager.list_agent_steps(job_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Job not found.") from exc
 

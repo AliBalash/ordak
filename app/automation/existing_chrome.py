@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, ProxyHandler, build_opener
 
 from websockets.sync.client import connect as websocket_connect
 
@@ -142,6 +142,12 @@ class ChromeTabInfo:
         )
 
 
+@dataclass(slots=True, frozen=True)
+class ResponseBaseline:
+    text: str
+    assistant_turn_count: int
+
+
 def _browser_platform() -> str:
     configured = settings.browser_platform.strip().lower()
     if configured in {"mac", "macos", "darwin"}:
@@ -166,7 +172,8 @@ def _remote_debugging_base_url() -> str:
 
 def _fetch_json(url: str, *, method: str = "GET") -> Any:
     request = Request(url, method=method)
-    with urlopen(request, timeout=5) as response:
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -714,7 +721,12 @@ def _linux_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
     if info is None or not info.websocket_debugger_url:
         raise _linux_error("Could not find the requested Google Chrome tab.")
 
-    with websocket_connect(info.websocket_debugger_url, open_timeout=5, close_timeout=2) as websocket:
+    with websocket_connect(
+        info.websocket_debugger_url,
+        proxy=None,
+        open_timeout=5,
+        close_timeout=2,
+    ) as websocket:
         websocket.send(
             json.dumps(
                 {
@@ -982,9 +994,16 @@ def detect_login_or_verification(
   const prompt = promptSelectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
     .find((element) => !!element);
+  const authCtas = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .map((element) => `${element.innerText || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase());
   const hasPrompt = !!prompt;
-  if (/verify|captcha|unusual traffic|human verification|prove you are human/.test(bodyText)) {
+  const hasLoginCta = authCtas.some((text) => /(^|\\s)(sign in|log in|sign up|continue with google|continue with apple)(\\s|$)/.test(text));
+  const hasLoggedOutMarketingCopy = /log in to get answers based on saved chats|get responses tailored to you|see plans and pricing|welcome back/.test(bodyText);
+  if (!hasPrompt && /verify|captcha|unusual traffic|human verification|prove you are human/.test(bodyText)) {
     return "manual_verification_required";
+  }
+  if ((hasLoginCta || hasLoggedOutMarketingCopy) && /log in|sign in|sign up|choose an account|continue with google|continue with apple|welcome back/.test(bodyText)) {
+    return "login_required";
   }
   if (!hasPrompt && /sign in|log in|choose an account|continue to gemini|continue with google|continue with apple|welcome back|sign up/.test(bodyText)) {
     return "login_required";
@@ -1500,11 +1519,48 @@ def submit_prompt(
     script = script.replace("__SELECTORS__", provider_selectors)
     deadline = time.monotonic() + 12
     last_result = "not_submitted"
+    initial_user_count = int(
+        execute_javascript(
+            tab,
+            """
+(() => document.querySelectorAll(
+  '[data-message-author-role="user"], [data-message-author-role="human"]'
+).length)()
+""",
+        )
+        or 0
+    )
+    verification_script = """
+(() => {
+  const selectors = __SELECTORS__;
+  const target = selectors
+    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    .find((element) => !!element);
+  const promptText = (target?.innerText || target?.value || "").trim();
+  const userCount = document.querySelectorAll(
+    '[data-message-author-role="user"], [data-message-author-role="human"]'
+  ).length;
+  return JSON.stringify({ promptEmpty: promptText === "", userCount });
+})()
+""".replace("__SELECTORS__", provider_selectors)
     while time.monotonic() < deadline:
         result = execute_javascript(tab, script)
         last_result = result or "not_submitted"
         if last_result in {"clicked", "enter", "busy"}:
-            return
+            confirmation_deadline = min(deadline, time.monotonic() + 3)
+            while time.monotonic() < confirmation_deadline:
+                confirmation = json.loads(
+                    execute_javascript(tab, verification_script) or "{}"
+                )
+                user_turn_added = int(
+                    confirmation.get("userCount") or 0
+                ) > initial_user_count
+                if user_turn_added or (
+                    provider != "chatgpt" and confirmation.get("promptEmpty")
+                ):
+                    return
+                time.sleep(0.25)
+            last_result = f"{last_result}_not_confirmed"
         time.sleep(0.75)
     raise RuntimeError(
         f"Could not submit the {PROVIDER_LABELS[provider]} prompt in the current Chrome tab. Last submit state: {last_result}."
@@ -1973,9 +2029,14 @@ def wait_for_response_stable(
     timeout_ms: int,
     stable_seconds: int,
     excluded_text: str,
+    previous_response: str = "",
+    previous_assistant_turn_count: int | None = None,
     expect_images: bool = False,
     provider: ProviderName = "gemini",
     should_cancel: Callable[[], bool] | None = None,
+    stall_refresh_seconds: int = 0,
+    max_stall_refreshes: int = 0,
+    recovery_callback: Callable[[str], None] | None = None,
 ) -> str:
     if _linux_should_use_x11_backend():
         if provider != "gemini":
@@ -1998,11 +2059,174 @@ def wait_for_response_stable(
         raise TimeoutError(
             f"{PROVIDER_LABELS[provider]} did not finish response within the timeout in the current Chrome tab."
         )
-    deadline = time.monotonic() + timeout_ms / 1000
+    started_at = time.monotonic()
+    deadline = started_at + timeout_ms / 1000
     stable_since = time.monotonic()
     last_text = ""
+    refresh_count = 0
     payload = json.dumps(excluded_text, ensure_ascii=False)
-    assistant_selectors = (
+    previous_payload = json.dumps(previous_response, ensure_ascii=False)
+    previous_turn_count_payload = json.dumps(previous_assistant_turn_count)
+    assistant_root_selectors = (
+        [
+            '[data-message-author-role="assistant"]',
+        ]
+        if provider == "chatgpt"
+        else [
+            '[data-response-id]',
+            '[data-message-author-role="model"]',
+            'main .model-response',
+            'main .markdown',
+            'main .prose',
+        ]
+    )
+    probe = f"""
+(() => {{
+  const excluded = {payload};
+  const previousResponse = {previous_payload};
+  const previousAssistantTurnCount = {previous_turn_count_payload};
+  const transientPatterns = [
+    /^thinking(?:\\.\\.\\.)?$/i,
+    /^analyzing(?:\\.\\.\\.)?$/i,
+    /^searching(?:\\.\\.\\.)?$/i,
+    /^working(?:\\.\\.\\.)?$/i,
+    /^reasoning(?:\\.\\.\\.)?$/i,
+    /^reasoned for \\d+/i,
+  ];
+  const isVisible = (el) => {{
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  }};
+  const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").trim();
+  const assistantRootSelectors = {json.dumps(assistant_root_selectors, ensure_ascii=False)};
+  const assistantRoots = assistantRootSelectors
+    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    .map((candidate) => candidate.closest('article[data-testid^="conversation-turn-"]') || candidate.closest('article') || candidate)
+    .filter((root, index, arr) => root && arr.indexOf(root) === index);
+  const userRoots = Array.from(document.querySelectorAll(
+    '[data-message-author-role="user"], section[data-turn="user"]'
+  ))
+    .map((candidate) => candidate.closest('[data-testid^="conversation-turn-"]') || candidate.closest('article') || candidate)
+    .filter((root, index, arr) => root && arr.indexOf(root) === index);
+  const latestAssistantRoot = assistantRoots.at(-1) || null;
+  const latestUserRoot = userRoots.at(-1) || null;
+  const latestText = clean(latestAssistantRoot?.innerText || "");
+  const latestUserText = clean(latestUserRoot?.innerText || "");
+  const latestTransient = transientPatterns.some((pattern) => pattern.test(latestText));
+  const exchangeMarker = clean(excluded).match(/ORDAK_EXCHANGE_ID_[a-f0-9]+/i)?.[0] || "";
+  const latestUserMatchesExcluded = exchangeMarker
+    ? latestUserText.includes(exchangeMarker)
+    : latestUserText === clean(excluded)
+      || latestUserText.startsWith(`${{clean(excluded)}}\\n`)
+      || latestUserText.startsWith(clean(excluded));
+  const assistantAfterExcludedUser = Boolean(
+    latestAssistantRoot
+    && latestUserRoot
+    && latestUserMatchesExcluded
+    && (latestUserRoot.compareDocumentPosition(latestAssistantRoot) & Node.DOCUMENT_POSITION_FOLLOWING)
+  );
+  const requireOrderedUserTurn = {json.dumps(provider == "chatgpt")};
+  const turnAdvanced = requireOrderedUserTurn
+    ? assistantAfterExcludedUser
+    : previousAssistantTurnCount === null
+      || assistantRoots.length > previousAssistantTurnCount
+      || latestText !== clean(previousResponse);
+  const answer = turnAdvanced
+    && latestText
+    && latestText !== clean(excluded)
+    && (latestText !== clean(previousResponse) || assistantAfterExcludedUser)
+    && !latestTransient
+      ? latestText
+      : "";
+  const allGeneratedImageCandidates = Array.from((latestAssistantRoot || document).querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
+    .filter((img) => isVisible(img) && img.naturalWidth >= 96 && img.naturalHeight >= 96)
+    .filter((img) => !img.closest('[data-message-author-role="user"]'));
+  const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
+  const generatedImages = (generatedHintCandidates.length ? generatedHintCandidates : allGeneratedImageCandidates).length;
+  const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisible(el));
+  const busy = buttons.some((el) => {{
+    const text = `${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase().trim();
+    if (/stopped thinking/.test(text)) return false;
+    return /stop answering|stop generating|stop|cancel/.test(text);
+  }});
+  return JSON.stringify({{
+    answer,
+    busy,
+    generatedImages,
+    assistantTurnCount: assistantRoots.length,
+    latestTransient,
+  }});
+}})()
+"""
+    while time.monotonic() < deadline:
+        if should_cancel and should_cancel():
+            raise TimeoutError("__ORD_CANCELLED__")
+        elapsed = time.monotonic() - started_at
+        should_refresh = (
+            provider == "chatgpt"
+            and stall_refresh_seconds > 0
+            and refresh_count < max_stall_refreshes
+            and elapsed >= stall_refresh_seconds * (refresh_count + 1)
+        )
+        if should_refresh:
+            refresh_count += 1
+            message = (
+                "ChatGPT response is still pending. Refreshing the exact conversation "
+                f"to reconcile the latest assistant turn ({refresh_count}/{max_stall_refreshes})."
+            )
+            if recovery_callback is not None:
+                recovery_callback(message)
+            info = get_tab_info(tab)
+            recovery_url = info.url if info is not None else ""
+            try:
+                if recovery_url:
+                    execute_javascript(
+                        tab,
+                        f"window.location.href = {recovery_url!r}; 'recovering'",
+                    )
+                else:
+                    execute_javascript(tab, "window.location.reload(); 'recovering'")
+            except RuntimeError:
+                pass
+            time.sleep(4)
+            try:
+                wait_for_prompt_input(
+                    tab,
+                    timeout_ms=min(30_000, max(1_000, int((deadline - time.monotonic()) * 1000))),
+                    provider=provider,
+                )
+            except (RuntimeError, TimeoutError):
+                pass
+            stable_since = time.monotonic()
+            last_text = ""
+            continue
+        state = json.loads(execute_javascript(tab, probe) or "{}")
+        current = (state.get("answer") or "").strip()
+        busy = bool(state.get("busy"))
+        generated_images = int(state.get("generatedImages") or 0)
+        stable_elapsed = time.monotonic() - stable_since
+        if current and current != last_text:
+            last_text = current
+            stable_since = time.monotonic()
+            stable_elapsed = 0
+        elif current and not busy and stable_elapsed >= stable_seconds:
+            return current
+        elif expect_images and generated_images > 0 and not busy and stable_elapsed >= stable_seconds:
+            return f"__GENERATED_IMAGES__:{generated_images}"
+        time.sleep(1)
+    raise TimeoutError(
+        f"{PROVIDER_LABELS[provider]} did not finish response within the timeout in the current Chrome tab."
+    )
+
+
+def read_latest_response_baseline(
+    tab: ChromeTabRef,
+    *,
+    provider: ProviderName = "gemini",
+) -> ResponseBaseline:
+    selectors = (
         [
             '[data-response-id]',
             '[data-message-author-role="model"]',
@@ -2021,93 +2245,34 @@ def wait_for_response_stable(
             'main .prose',
         ]
     )
-    assistant_root_selectors = (
-        [
-            '[data-message-author-role="assistant"]',
-            'article[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]',
-            'main [data-message-author-role="assistant"]',
-            'main .markdown',
-            'main .prose',
-        ]
+    root_selectors = (
+        ['[data-message-author-role="assistant"]']
         if provider == "chatgpt"
-        else [
-            '[data-response-id]',
-            '[data-message-author-role="model"]',
-            'main .model-response',
-            'main .markdown',
-            'main .prose',
-        ]
+        else selectors
     )
-    probe = f"""
+    script = f"""
 (() => {{
-  const excluded = {payload};
-  const transientPatterns = [/^thinking$/i, /^analyzing$/i, /^searching$/i, /^reasoned for \\d+/i];
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-  }};
   const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").trim();
-  const selectors = {json.dumps(assistant_selectors, ensure_ascii=False)};
-  const assistantRootSelectors = {json.dumps(assistant_root_selectors, ensure_ascii=False)};
-  const blocks = selectors
+  const roots = {json.dumps(root_selectors, ensure_ascii=False)}
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .filter((el) => isVisible(el))
-    .map((el) => clean(el.innerText))
-    .filter(Boolean);
-  const lastBlock = [...blocks].reverse()[0] || "";
-  const answer = [...blocks]
-    .reverse()
-    .find((text) => text !== clean(excluded) && !transientPatterns.some((pattern) => pattern.test(text))) || "";
-  const assistantRoots = assistantRootSelectors
-    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .filter((el) => isVisible(el))
     .map((candidate) => candidate.closest('article[data-testid^="conversation-turn-"]') || candidate.closest('article') || candidate)
-    .filter((root, index, arr) => root && isVisible(root) && arr.indexOf(root) === index)
-    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-  const latestAssistantRoot = [...assistantRoots]
-    .reverse()
-    .find((root) => Array.from(root.querySelectorAll('img, picture img')).some((img) => isVisible(img)))
-    || assistantRoots.at(-1)
-    || null;
-  const allGeneratedImageCandidates = Array.from((latestAssistantRoot || document).querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
-    .filter((img) => isVisible(img) && img.naturalWidth >= 96 && img.naturalHeight >= 96)
-    .filter((img) => !img.closest('[data-message-author-role="user"]'));
-  const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
-  const generatedImages = (generatedHintCandidates.length ? generatedHintCandidates : allGeneratedImageCandidates).length;
-  const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisible(el));
-  const busy = buttons.some((el) => {{
-    const text = `${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase().trim();
-    if (/stopped thinking/.test(text)) return false;
-    return /stop answering|stop generating|stop|cancel/.test(text);
+    .filter((root, index, arr) => root && arr.indexOf(root) === index);
+  return JSON.stringify({{
+    text: clean(roots.at(-1)?.innerText || ""),
+    assistantTurnCount: roots.length,
   }});
-  const transientTail = transientPatterns.some((pattern) => pattern.test(lastBlock));
-  return JSON.stringify({{ answer, busy, generatedImages, transientTail }});
 }})()
 """
-    while time.monotonic() < deadline:
-        if should_cancel and should_cancel():
-            raise TimeoutError("__ORD_CANCELLED__")
-        state = json.loads(execute_javascript(tab, probe) or "{}")
-        current = (state.get("answer") or "").strip()
-        busy = bool(state.get("busy"))
-        generated_images = int(state.get("generatedImages") or 0)
-        transient_tail = bool(state.get("transientTail"))
-        stable_elapsed = time.monotonic() - stable_since
-        if current and current != last_text:
-            last_text = current
-            stable_since = time.monotonic()
-            stable_elapsed = 0
-        elif current and ((not busy) or transient_tail) and stable_elapsed >= stable_seconds:
-            return current
-        elif current and provider == "chatgpt" and busy and stable_elapsed >= max(stable_seconds + 2, 6):
-            return current
-        elif expect_images and generated_images > 0 and not busy and stable_elapsed >= stable_seconds:
-            return f"__GENERATED_IMAGES__:{generated_images}"
-        elif expect_images and generated_images > 0 and provider == "chatgpt" and stable_elapsed >= max(stable_seconds + 2, 6):
-            return f"__GENERATED_IMAGES__:{generated_images}"
-        time.sleep(1)
-    raise TimeoutError(
-        f"{PROVIDER_LABELS[provider]} did not finish response within the timeout in the current Chrome tab."
+    state = json.loads(execute_javascript(tab, script) or "{}")
+    return ResponseBaseline(
+        text=str(state.get("text") or "").strip(),
+        assistant_turn_count=int(state.get("assistantTurnCount") or 0),
     )
+
+
+def read_latest_response_text(
+    tab: ChromeTabRef,
+    *,
+    provider: ProviderName = "gemini",
+) -> str:
+    return read_latest_response_baseline(tab, provider=provider).text

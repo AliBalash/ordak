@@ -22,6 +22,12 @@ JobStatus = Literal[
     "submitting_prompt",
     "waiting_for_response",
     "extracting_answer",
+    "preparing_agent",
+    "waiting_for_agent",
+    "parsing_agent_action",
+    "executing_agent_action",
+    "sending_agent_result",
+    "finalizing_agent",
     "cancelling",
     "cancelled",
     "completed",
@@ -29,9 +35,10 @@ JobStatus = Literal[
     "manual_verification_required",
 ]
 
-JobMode = Literal["chat", "image_analyze", "image_generate"]
+JobMode = Literal["chat", "image_analyze", "image_generate", "agent"]
 RetryStrategy = Literal["same_tab", "new_tab_same_conversation", "new_chat"]
 ResumeStrategy = Literal["same_tab", "new_tab_same_conversation"]
+ExecutionBackend = Literal["host", "docker", "podman"]
 
 
 class LogEntry(BaseModel):
@@ -40,12 +47,21 @@ class LogEntry(BaseModel):
     message: str
 
 
+class AgentOptions(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4096)
+    max_steps: int | None = Field(default=None, ge=1, le=200)
+    command_timeout_seconds: int | None = Field(default=None, ge=1, le=1800)
+    execution_backend: ExecutionBackend | None = None
+    network_enabled: bool | None = None
+
+
 class JobCreateRequest(BaseModel):
     question: str = Field(min_length=1, max_length=20_000)
     provider: Provider = "gemini"
     mode: JobMode = "chat"
     conversation_id: str | None = None
     start_new_chat: bool = False
+    agent: AgentOptions | None = None
 
 
 class ProviderRunRequest(BaseModel):
@@ -54,7 +70,8 @@ class ProviderRunRequest(BaseModel):
     conversation_id: str | None = None
     start_new_chat: bool = False
     wait_for_completion: bool = True
-    wait_timeout_seconds: int = Field(default=300, ge=1, le=900)
+    wait_timeout_seconds: int = Field(default=300, ge=1, le=3600)
+    agent: AgentOptions | None = None
 
 
 class JobCreateResponse(BaseModel):
@@ -85,6 +102,11 @@ class JobResponse(BaseModel):
     logs: list[LogEntry]
     screenshots: list[str]
     trace_path: str | None
+    agent_workspace: str | None = None
+    agent_step_count: int = 0
+    agent_max_steps: int | None = None
+    agent_command_timeout_seconds: int | None = None
+    agent_execution_backend: str | None = None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -194,6 +216,7 @@ class DiagnosticsResponse(BaseModel):
     last_error_by_provider: dict[str, str | None]
     active_job: dict[str, object] | None = None
     queue_depth: int
+    agent: dict[str, object] = Field(default_factory=dict)
 
 
 class StorageDiagnosticsResponse(BaseModel):
@@ -207,6 +230,25 @@ class StorageDiagnosticsResponse(BaseModel):
 class CleanupResponse(BaseModel):
     deleted_files: int
     freed_bytes: int
+
+
+class AgentStepResponse(BaseModel):
+    id: str
+    job_id: str
+    sequence: int
+    command_id: str
+    tool: str
+    status: str
+    request_json: str
+    result_json: str | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    duration_ms: int | None = None
+    error_message: str | None = None
+
+
+class AgentStepListResponse(BaseModel):
+    steps: list[AgentStepResponse]
 
 
 class WebSocketEvent(BaseModel):

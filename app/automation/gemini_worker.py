@@ -3,13 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 import mimetypes
 from pathlib import Path
+import time
 from typing import Callable
+import uuid
 
+from app.agent import run_agent_job
+from app.agent.executor import AgentExecutor
+from app.agent.types import AgentResolvedConfig
 from app.automation.browser import ensure_linux_remote_debugging_session
 from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
     activate_create_image_mode,
+    execute_javascript,
     get_tab_info,
     insert_prompt as insert_prompt_existing,
     is_google_chrome_running,
@@ -55,6 +61,10 @@ class WorkerRuntime:
     save_answer: Callable[[str], None]
     save_error: Callable[[str, str, str | None], None]
     should_cancel: Callable[[], bool] | None = None
+    start_agent_step: Callable[[int, str, str, str], str] | None = None
+    finish_agent_step: Callable[[str, str, str | None, str | None], None] | None = None
+    agent_max_protocol_errors: int = 5
+    agent_seen_command_ids: tuple[str, ...] = ()
 
     def checkpoint(self) -> None:
         if self.should_cancel and self.should_cancel():
@@ -77,6 +87,7 @@ class AutomationJobRequest:
     mode: JobMode = "chat"
     upload_paths: list[Path] | None = None
     run_strategy: str | None = None
+    agent_config: AgentResolvedConfig | None = None
 
     @property
     def uploads(self) -> list[Path]:
@@ -164,6 +175,430 @@ def _effective_prompt(job: AutomationJobRequest) -> str:
     return job.question
 
 
+def _prepare_and_submit_prompt(
+    *,
+    tab: ChromeTabRef,
+    adapter,
+    provider: Provider,
+    prompt: str,
+    runtime: WorkerRuntime | None,
+    app_settings: Settings,
+) -> None:
+    last_error: RuntimeError | None = None
+    initial_tab_info = get_tab_info(tab)
+    recovery_url = (
+        initial_tab_info.url
+        if initial_tab_info is not None and "/c/" in initial_tab_info.url
+        else None
+    )
+    for attempt in range(3):
+        if attempt:
+            if runtime is not None:
+                recovery_action = (
+                    "Reopening the current conversation and retrying"
+                    if attempt == 2 and recovery_url
+                    else "Retrying without leaving the current conversation"
+                )
+                runtime.append_log(
+                    f"Prompt submission did not complete. {recovery_action} "
+                    f"({attempt + 1}/3).",
+                    level="warning",
+                )
+                _runtime_checkpoint(runtime)
+            if attempt == 2:
+                try:
+                    if recovery_url:
+                        execute_javascript(
+                            tab,
+                            f"window.location.href = {recovery_url!r}; 'reopening'",
+                        )
+                    else:
+                        execute_javascript(tab, "window.location.reload(); 'reloading'")
+                except RuntimeError:
+                    pass
+                time.sleep(4)
+            else:
+                time.sleep(1)
+
+        if runtime is not None:
+            runtime.update_status("finding_input")
+            runtime.append_log(
+                f"Looking for the {_provider_name(provider)} prompt input in the current Google Chrome tab."
+            )
+            _runtime_checkpoint(runtime)
+        adapter.find_prompt_input(tab, timeout_ms=min(app_settings.browser_timeout_ms, 60_000))
+        _map_login_error(provider, adapter.detect_login_state(tab))
+        insert_prompt_existing(tab, prompt, provider=provider)
+
+        if runtime is not None:
+            runtime.update_status("submitting_prompt")
+            runtime.append_log("Submitting prompt through the existing Google Chrome tab.")
+            _runtime_checkpoint(runtime)
+        try:
+            adapter.submit_prompt(tab)
+            return
+        except RuntimeError as exc:
+            last_error = exc
+
+    _raise_structured_error(
+        OrdaKError(
+            code=ErrorCode.SUBMIT_FAILED,
+            message=str(last_error) if last_error else "Prompt submission failed.",
+        )
+    )
+
+
+def _find_prompt_input_with_recovery(
+    *,
+    tab: ChromeTabRef,
+    adapter,
+    provider: Provider,
+    timeout_ms: int,
+    runtime: WorkerRuntime | None,
+    recovery_url: str | None,
+) -> None:
+    last_error: RuntimeError | TimeoutError | None = None
+    for attempt in range(2):
+        try:
+            adapter.find_prompt_input(tab, timeout_ms=timeout_ms)
+            return
+        except (RuntimeError, TimeoutError) as exc:
+            last_error = exc
+            if attempt:
+                break
+            if runtime is not None:
+                runtime.append_log(
+                    f"{_provider_name(provider)} input is not ready. Reopening the exact conversation and retrying.",
+                    level="warning",
+                )
+                _runtime_checkpoint(runtime)
+            try:
+                if recovery_url:
+                    execute_javascript(
+                        tab,
+                        f"window.location.href = {recovery_url!r}; 'reopening'",
+                    )
+                else:
+                    execute_javascript(tab, "window.location.reload(); 'reloading'")
+            except RuntimeError:
+                pass
+            time.sleep(4)
+            _map_login_error(provider, adapter.detect_login_state(tab))
+    if last_error is not None:
+        raise last_error
+
+
+def send_prompt_and_wait_for_text(
+    *,
+    tab: ChromeTabRef,
+    adapter,
+    provider: Provider,
+    prompt: str,
+    runtime: WorkerRuntime | None,
+    app_settings: Settings,
+    max_recoveries: int = 0,
+) -> str:
+    exchange_prompt = (
+        f"{prompt}\n\nORDAK_EXCHANGE_ID_{uuid.uuid4().hex}"
+        if provider == "chatgpt"
+        else prompt
+    )
+    recovery_attempt = 0
+    while True:
+        baseline_reader = getattr(adapter, "read_latest_response_baseline", None)
+        if baseline_reader is not None:
+            baseline = baseline_reader(tab)
+            previous_response = baseline.text
+            previous_assistant_turn_count = baseline.assistant_turn_count
+        else:
+            previous_response = adapter.read_latest_response_text(tab)
+            previous_assistant_turn_count = None
+        _prepare_and_submit_prompt(
+            tab=tab,
+            adapter=adapter,
+            provider=provider,
+            prompt=exchange_prompt,
+            runtime=runtime,
+            app_settings=app_settings,
+        )
+        if runtime is not None:
+            runtime.update_status("waiting_for_response")
+            runtime.append_log(
+                f"Waiting for {_provider_name(provider)} to finish generating a stable response."
+            )
+        wait_options = {
+            "timeout_ms": _provider_response_timeout_ms(app_settings, provider),
+            "stable_seconds": _provider_stable_seconds(app_settings, provider),
+            "excluded_text": exchange_prompt,
+            "previous_response": previous_response,
+            "expect_images": False,
+            "should_cancel": (
+                getattr(runtime, "should_cancel", None) if runtime is not None else None
+            ),
+            "stall_refresh_seconds": (
+                app_settings.chatgpt_stall_refresh_seconds
+                if provider == "chatgpt"
+                else 0
+            ),
+            "max_stall_refreshes": (
+                app_settings.chatgpt_max_stall_refreshes
+                if provider == "chatgpt"
+                else 0
+            ),
+            "recovery_callback": (
+                (
+                    lambda message: runtime.append_log(message, level="warning")
+                )
+                if runtime is not None
+                else None
+            ),
+        }
+        if previous_assistant_turn_count is not None:
+            wait_options["previous_assistant_turn_count"] = previous_assistant_turn_count
+        try:
+            answer = adapter.wait_for_response(tab, **wait_options)
+            break
+        except TimeoutError as exc:
+            if str(exc) == "__ORD_CANCELLED__":
+                raise JobCancelled() from exc
+            adapter.best_effort_stop(tab)
+            if recovery_attempt >= max_recoveries:
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.RESPONSE_TIMEOUT,
+                        message=(
+                            f"{_provider_name(provider)} did not finish response within "
+                            "the timeout after automatic recovery."
+                        ),
+                    )
+                )
+            recovery_attempt += 1
+            if runtime is not None:
+                runtime.append_log(
+                    "The provider response remained stuck after refresh. "
+                    f"Reopening the same conversation and retrying this exchange "
+                    f"({recovery_attempt}/{max_recoveries}).",
+                    level="warning",
+                )
+                _runtime_checkpoint(runtime)
+            info = get_tab_info(tab)
+            recovery_url = info.url if info is not None else ""
+            try:
+                if recovery_url:
+                    execute_javascript(
+                        tab,
+                        f"window.location.href = {recovery_url!r}; 'recovering'",
+                    )
+                else:
+                    execute_javascript(tab, "window.location.reload(); 'recovering'")
+            except RuntimeError:
+                pass
+            time.sleep(app_settings.agent_recovery_delay_seconds)
+            try:
+                adapter.find_prompt_input(
+                    tab,
+                    timeout_ms=min(app_settings.browser_timeout_ms, 60_000),
+                )
+                _map_login_error(provider, adapter.detect_login_state(tab))
+            except (RuntimeError, TimeoutError):
+                continue
+
+            # A refresh can reveal a response that finished server-side while the
+            # local page was stale. Reconcile it before resubmitting the prompt.
+            try:
+                answer = adapter.wait_for_response(
+                    tab,
+                    timeout_ms=20_000,
+                    stable_seconds=min(
+                        2,
+                        _provider_stable_seconds(app_settings, provider),
+                    ),
+                    excluded_text=prompt,
+                    previous_response=previous_response,
+                    previous_assistant_turn_count=previous_assistant_turn_count,
+                    expect_images=False,
+                    should_cancel=(
+                        getattr(runtime, "should_cancel", None)
+                        if runtime is not None
+                        else None
+                    ),
+                )
+                if answer:
+                    if runtime is not None:
+                        runtime.append_log(
+                            "Recovered the completed assistant response after refreshing "
+                            "the same conversation.",
+                            level="warning",
+                        )
+                    break
+            except TimeoutError as reconcile_error:
+                if str(reconcile_error) == "__ORD_CANCELLED__":
+                    raise JobCancelled() from reconcile_error
+                continue
+    if runtime is not None:
+        runtime.update_status("extracting_answer")
+        runtime.append_log("Extracting the final response from the current Google Chrome tab.")
+        _runtime_checkpoint(runtime)
+    answer = adapter.extract_text_result(answer)
+    if not answer:
+        _raise_structured_error(
+            OrdaKError(
+                code=ErrorCode.RESULT_NOT_EXTRACTABLE,
+                message=f"Could not extract final answer from {_provider_name(provider)} UI.",
+            )
+        )
+    return answer
+
+
+def _run_agent_job_in_existing_chrome(
+    job_id: str,
+    job: AutomationJobRequest,
+    runtime: WorkerRuntime | None,
+    resolved: Settings,
+) -> str:
+    if job.provider != "chatgpt":
+        _raise_structured_error(
+            OrdaKError(
+                code=ErrorCode.AGENT_TOOL_NOT_SUPPORTED,
+                message="Agent mode currently supports ChatGPT only.",
+            )
+        )
+    if job.agent_config is None:
+        _raise_structured_error(
+            OrdaKError(
+                code=ErrorCode.AGENT_WORKSPACE_REQUIRED,
+                message="Agent mode requires a resolved workspace configuration.",
+            )
+        )
+    adapter = get_provider_adapter(job.provider)
+    tab: ChromeTabRef | None = None
+    try:
+        if runtime is not None:
+            runtime.update_status("checking_browser")
+            runtime.append_log("Checking whether Google Chrome is already open.")
+            _runtime_checkpoint(runtime)
+        try:
+            _ensure_linux_browser_ready(resolved, job.provider)
+        except (FileNotFoundError, RuntimeError) as exc:
+            _raise_structured_error(
+                OrdaKError(
+                    code=ErrorCode.CHROME_NOT_OPEN,
+                    message=str(exc) or _chrome_not_ready_message(resolved, job.provider),
+                )
+            )
+        if not is_google_chrome_running():
+            _raise_structured_error(
+                OrdaKError(
+                    code=ErrorCode.CHROME_NOT_OPEN,
+                    message=_chrome_not_ready_message(resolved, job.provider),
+                )
+            )
+        if runtime is not None:
+            runtime.update_status("opening_provider_tab")
+            runtime.append_log(
+                "Opening the Ordex Custom GPT in the existing ChatGPT Chrome session."
+            )
+            _runtime_checkpoint(runtime)
+        if job.start_new_chat:
+            opened = adapter.open_tab(
+                target_url=resolved.provider_new_chat_url(job.provider, mode="agent")
+            )
+            tab = opened.ref
+            _remember_tab(runtime, tab)
+        else:
+            rebound = adapter.rebind_tab(
+                conversation_url=job.conversation_url,
+                tab_ref=job.target_tab,
+            )
+            if rebound.tab is not None:
+                tab = rebound.tab
+                _remember_tab(runtime, tab)
+            elif job.conversation_url:
+                if runtime is not None:
+                    runtime.append_log(
+                        "The saved tab is unavailable. Reopening the exact previous ChatGPT conversation URL.",
+                        level="warning",
+                    )
+                opened = adapter.open_tab(target_url=job.conversation_url)
+                tab = opened.ref
+                _remember_tab(runtime, tab)
+            else:
+                _raise_structured_error(OrdaKError(code=ErrorCode.TAB_LOST))
+        if runtime is not None:
+            runtime.update_status("checking_login")
+            runtime.append_log(
+                "Checking whether ChatGPT is already authenticated in the current Google Chrome session."
+            )
+            _runtime_checkpoint(runtime)
+        _map_login_error(job.provider, adapter.detect_login_state(tab))
+        _find_prompt_input_with_recovery(
+            tab=tab,
+            adapter=adapter,
+            provider=job.provider,
+            timeout_ms=min(resolved.browser_timeout_ms, 60_000),
+            runtime=runtime,
+            recovery_url=job.conversation_url,
+        )
+        _remember_tab(runtime, tab)
+
+        def exchange(prompt: str) -> str:
+            nonlocal tab
+            answer = send_prompt_and_wait_for_text(
+                tab=tab,
+                adapter=adapter,
+                provider=job.provider,
+                prompt=prompt,
+                runtime=runtime,
+                app_settings=resolved,
+                max_recoveries=resolved.agent_max_exchange_recoveries,
+            )
+            _remember_tab(runtime, tab)
+            rebound_info = get_tab_info(tab)
+            if runtime is not None and rebound_info is not None:
+                runtime.remember_conversation_state(rebound_info)
+            return answer
+
+        executor = AgentExecutor(
+            settings=resolved,
+            job_id=job_id,
+            storage_dir=resolved.agent_step_log_dir / job_id,
+        )
+        return run_agent_job(
+            question=job.question,
+            resolved_config=job.agent_config,
+            executor=executor,
+            runtime=runtime,
+            exchange=exchange,
+            resume=job.run_strategy in {"same_tab", "new_tab_same_conversation"},
+        )
+    except JobCancelled as exc:
+        if runtime is not None:
+            if tab is not None:
+                adapter.best_effort_stop(tab)
+            runtime.save_error(exc.message, "cancelled", None)
+            runtime.append_log(exc.message, level="warning")
+        raise GeminiAutomationError(exc.message, status="cancelled") from exc
+    except GeminiAutomationError as exc:
+        if runtime is not None:
+            runtime.save_error(exc.message, exc.status, exc.error_code)
+            runtime.append_log(exc.message, level="error")
+        raise
+    except OrdaKError as exc:
+        if runtime is not None:
+            runtime.save_error(exc.message, "failed", exc.code.value)
+            runtime.append_log(exc.message, level="error")
+        raise GeminiAutomationError(exc.message, error_code=exc.code.value) from exc
+    except RuntimeError as exc:
+        message = str(exc) or "Unexpected ChatGPT agent automation failure."
+        if runtime is not None:
+            runtime.save_error(message, "failed", ErrorCode.PROVIDER_UI_CHANGED.value)
+            runtime.append_log(message, level="error")
+        raise GeminiAutomationError(
+            message,
+            error_code=ErrorCode.PROVIDER_UI_CHANGED.value,
+        ) from exc
+
+
 def _remember_tab(runtime: WorkerRuntime | None, tab: ChromeTabRef) -> None:
     if runtime is None:
         return
@@ -233,6 +668,13 @@ def run_gemini_job(
     runtime: WorkerRuntime | None = None,
     app_settings: Settings | None = None,
 ) -> str:
+    if job.mode == "agent":
+        return _run_agent_job_in_existing_chrome(
+            job_id,
+            job,
+            runtime=runtime,
+            resolved=app_settings or settings,
+        )
     return _run_gemini_job_in_existing_chrome(
         job_id,
         job,
@@ -312,7 +754,14 @@ def _run_gemini_job_in_existing_chrome(
             )
             _runtime_checkpoint(runtime)
         _map_login_error(job.provider, adapter.detect_login_state(tab))
-        adapter.find_prompt_input(tab, timeout_ms=min(resolved.browser_timeout_ms, 60_000))
+        _find_prompt_input_with_recovery(
+            tab=tab,
+            adapter=adapter,
+            provider=job.provider,
+            timeout_ms=min(resolved.browser_timeout_ms, 60_000),
+            runtime=runtime,
+            recovery_url=job.conversation_url,
+        )
 
         if job.mode == "image_generate":
             activated = activate_create_image_mode(tab, provider=job.provider)
@@ -346,53 +795,52 @@ def _run_gemini_job_in_existing_chrome(
                     OrdaKError(code=ErrorCode.UPLOAD_INCOMPLETE)
                 )
 
-        if runtime is not None:
-            runtime.update_status("finding_input")
-            runtime.append_log(
-                f"Looking for the {_provider_name(job.provider)} prompt input in the current Google Chrome tab."
+        if job.mode == "image_generate":
+            _prepare_and_submit_prompt(
+                tab=tab,
+                adapter=adapter,
+                provider=job.provider,
+                prompt=effective_prompt,
+                runtime=runtime,
+                app_settings=resolved,
             )
-            _runtime_checkpoint(runtime)
-        insert_prompt_existing(tab, effective_prompt, provider=job.provider)
-
-        if runtime is not None:
-            runtime.update_status("submitting_prompt")
-            runtime.append_log("Submitting prompt through the existing Google Chrome tab.")
-            _runtime_checkpoint(runtime)
-        try:
-            adapter.submit_prompt(tab)
-        except RuntimeError as exc:
-            _raise_structured_error(
-                OrdaKError(code=ErrorCode.SUBMIT_FAILED, message=str(exc))
-            )
-
-        if runtime is not None:
-            runtime.update_status("waiting_for_response")
-            runtime.append_log(
-                f"Waiting for {_provider_name(job.provider)} to finish generating a stable response."
-            )
-        try:
+            if runtime is not None:
+                runtime.update_status("waiting_for_response")
+                runtime.append_log(
+                    f"Waiting for {_provider_name(job.provider)} to finish generating a stable response."
+                )
+            try:
                 answer = adapter.wait_for_response(
                     tab,
                     timeout_ms=_provider_response_timeout_ms(resolved, job.provider),
                     stable_seconds=_provider_stable_seconds(resolved, job.provider),
                     excluded_text=effective_prompt,
-                    expect_images=job.mode == "image_generate",
+                    expect_images=True,
                     should_cancel=getattr(runtime, "should_cancel", None) if runtime is not None else None,
                 )
-        except TimeoutError as exc:
-            if str(exc) == "__ORD_CANCELLED__":
-                raise JobCancelled() from exc
-            _raise_structured_error(
-                OrdaKError(
-                    code=ErrorCode.RESPONSE_TIMEOUT,
-                    message=f"{_provider_name(job.provider)} did not finish response within the timeout.",
+            except TimeoutError as exc:
+                if str(exc) == "__ORD_CANCELLED__":
+                    raise JobCancelled() from exc
+                adapter.best_effort_stop(tab)
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.RESPONSE_TIMEOUT,
+                        message=f"{_provider_name(job.provider)} did not finish response within the timeout.",
+                    )
                 )
+            if runtime is not None:
+                runtime.update_status("extracting_answer")
+                runtime.append_log("Extracting the final response from the current Google Chrome tab.")
+                _runtime_checkpoint(runtime)
+        else:
+            answer = send_prompt_and_wait_for_text(
+                tab=tab,
+                adapter=adapter,
+                provider=job.provider,
+                prompt=effective_prompt,
+                runtime=runtime,
+                app_settings=resolved,
             )
-
-        if runtime is not None:
-            runtime.update_status("extracting_answer")
-            runtime.append_log("Extracting the final response from the current Google Chrome tab.")
-            _runtime_checkpoint(runtime)
         if answer.startswith("__GENERATED_IMAGES__:"):
             tab = _refresh_linux_provider_tab_for_images(
                 resolved,
