@@ -4,60 +4,77 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ordak | اردک 🦆</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260704g" />
+    <link rel="stylesheet" href="/static/style.css?v=20260716-resilient-ui-v2" />
   </head>
   <body>
     <div class="ambient ambient-a"></div>
     <div class="ambient ambient-b"></div>
     <div class="ambient ambient-c"></div>
 
-    <main class="chat-shell">
-      <aside class="sidebar">
-        <section class="sidebar-card brand-card">
+    <main class="workbench-shell">
+      <aside class="rail">
+        <section class="panel brand-card">
           <div class="brand-mark" aria-hidden="true">
             <span class="duck-body"></span>
             <span class="duck-wing"></span>
             <span class="duck-head"></span>
           </div>
-          <div>
-            <p class="eyebrow">Chrome-native</p>
+          <div class="brand-copy">
+            <p class="eyebrow">Agent Workbench</p>
             <h1>ordak <span class="brand-inline">اردک</span></h1>
-            <p class="muted">Gemini + ChatGPT, in your own Chrome.</p>
+            <p class="muted">A calm operator panel for ChatGPT, Gemini, and Ordex Agent Mode.</p>
           </div>
         </section>
 
-        <section class="sidebar-card actions-card">
-          <button id="new-chat-btn" class="primary wide"><span class="button-icon">+</span><span>New Chat</span></button>
-          <button id="open-profile-btn" class="secondary wide"><span class="button-icon">◌</span><span>Open Session</span></button>
-          <a id="diagnostics-btn" class="secondary wide link-button" href="/diagnostics"><span class="button-icon">⌁</span><span>Health</span></a>
-          <span id="profile-message" class="support-text"></span>
+        <section class="panel action-panel">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow small">Workspace</p>
+              <h2>Quick controls</h2>
+            </div>
+          </div>
+          <div class="action-stack">
+            <button id="new-chat-btn" class="primary wide">
+              <span class="button-icon">+</span>
+              <span>Fresh Run</span>
+            </button>
+            <button id="open-profile-btn" class="secondary wide">
+              <span class="button-icon">◌</span>
+              <span>Open Session</span>
+            </button>
+            <a id="diagnostics-btn" class="secondary wide link-button" href="/diagnostics">
+              <span class="button-icon">⌁</span>
+              <span>Health</span>
+            </a>
+            <span id="profile-message" class="support-text">Using your current Chrome session.</span>
+          </div>
         </section>
 
-        <section class="sidebar-card conversation-card">
+        <section class="panel session-panel">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow small">Session Pulse</p>
+              <h2>Browser state</h2>
+            </div>
+          </div>
+          <p id="session-summary" class="muted">
+            Checking the current Chrome session and bound tabs.
+          </p>
+          <div id="provider-presence" class="provider-presence"></div>
+          <dl id="diagnostics-stats" class="stats-grid"></dl>
+        </section>
+
+        <section class="panel history-panel">
           <div class="section-head">
             <div>
               <p class="eyebrow small">History</p>
-              <h2>Conversations</h2>
+              <h2>Runs and threads</h2>
             </div>
           </div>
           <ul id="conversation-list" class="conversation-list"></ul>
         </section>
 
-        <section class="sidebar-card details-card">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow small">Activity</p>
-              <h2>Live details</h2>
-            </div>
-          </div>
-          <div class="mini-status">
-            <strong id="status-badge" class="badge idle">Idle</strong>
-            <span id="job-id" class="support-text">Ready for a prompt.</span>
-          </div>
-          <ol id="logs" class="mini-log-list"></ol>
-        </section>
-
-        <section class="sidebar-card artifacts-card">
+        <section class="panel artifact-panel">
           <div class="section-head">
             <div>
               <p class="eyebrow small">Artifacts</p>
@@ -68,55 +85,186 @@
         </section>
       </aside>
 
-      <section class="chat-stage">
-        <header class="chat-header">
-          <div>
-            <p class="eyebrow">Current conversation</p>
+      <section class="workspace-stage">
+        <header class="panel workspace-header">
+          <div class="header-copy">
+            <p class="eyebrow">Current thread</p>
             <h2 id="conversation-title">ordak</h2>
-            <p id="conversation-subtitle" class="muted">Same tab, same thread.</p>
+            <p id="conversation-subtitle" class="muted">Pick a thread or start a fresh run.</p>
           </div>
-          <div class="header-meta">
+
+          <div class="header-stack">
             <div class="conversation-actions">
               <button id="pin-conversation-btn" type="button" class="secondary small">Pin</button>
               <span id="tab-health-pill" class="mode-pill subtle">No bound tab</span>
-              <a id="provider-link" class="secondary small link-button hidden" href="#" target="_blank" rel="noreferrer"><span class="button-icon">↗</span><span>Open provider tab</span></a>
+              <a
+                id="provider-link"
+                class="secondary small link-button hidden"
+                href="#"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <span class="button-icon">↗</span>
+                <span>Open provider tab</span>
+              </a>
             </div>
+
             <div class="provider-switch" id="provider-switch">
-              <button type="button" class="provider-chip active" data-provider="gemini">
+              <button type="button" class="provider-chip" data-provider="gemini">
                 <img class="provider-logo" src="/static/icons/gemini.svg" alt="" />
                 <span>Gemini</span>
               </button>
-              <button type="button" class="provider-chip" data-provider="chatgpt">
+              <button type="button" class="provider-chip active" data-provider="chatgpt">
                 <img class="provider-logo" src="/static/icons/chatgpt.svg" alt="" />
                 <span>ChatGPT</span>
               </button>
             </div>
+
             <span id="conversation-mode" class="mode-pill">
-              <img id="conversation-mode-logo" class="provider-logo" src="/static/icons/gemini.svg" alt="" />
-              <span id="conversation-mode-label">Ask Gemini</span>
+              <img id="conversation-mode-logo" class="provider-logo" src="/static/icons/chatgpt.svg" alt="" />
+              <span id="conversation-mode-label">Ordex Agent</span>
             </span>
           </div>
         </header>
 
-        <section id="chat-thread" class="chat-thread">
-          <div id="thread-empty" class="thread-empty">
-            <div class="thread-empty-mark" aria-hidden="true"></div>
-            <h3>ordak is ready</h3>
-            <p>Start here or open a clean chat.</p>
-          </div>
+        <section class="runtime-strip">
+          <article class="panel runtime-card accent">
+            <span class="runtime-label">Run status</span>
+            <strong id="status-badge" class="badge idle">Idle</strong>
+            <span id="job-id" class="runtime-note">Ready for a prompt.</span>
+          </article>
+          <article class="panel runtime-card">
+            <span class="runtime-label">Agent workspace</span>
+            <strong id="runtime-workspace">No workspace selected</strong>
+            <span class="runtime-note">Ordex Agent Mode will use this root.</span>
+          </article>
+          <article class="panel runtime-card">
+            <span class="runtime-label">Steps</span>
+            <strong id="runtime-steps">0</strong>
+            <span id="runtime-steps-note" class="runtime-note">No tool calls yet.</span>
+          </article>
+          <article class="panel runtime-card">
+            <span class="runtime-label">Session health</span>
+            <strong id="runtime-session-state">Checking…</strong>
+            <span id="runtime-session-note" class="runtime-note">Waiting for diagnostics.</span>
+          </article>
         </section>
 
-        <section class="composer-dock">
+        <section class="workspace-grid">
+          <section class="panel transcript-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow small">Transcript</p>
+                <h3>Prompt and result flow</h3>
+              </div>
+              <span id="composer-hint" class="muted">Next send stays in the current chat.</span>
+            </div>
+
+            <section id="chat-thread" class="chat-thread">
+              <div id="thread-empty" class="thread-empty">
+                <div class="thread-empty-mark" aria-hidden="true"></div>
+                <h3>Ordex is ready</h3>
+                <p>Write a prompt, point it at a workspace, and inspect every step as it works.</p>
+              </div>
+            </section>
+          </section>
+
+          <aside class="inspector-column">
+            <section class="panel log-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow small">Live events</p>
+                  <h3>Job log</h3>
+                </div>
+              </div>
+              <ol id="logs" class="event-list"></ol>
+            </section>
+
+            <section class="panel step-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow small">Tool timeline</p>
+                  <h3>Agent steps</h3>
+                </div>
+                <span id="step-summary-pill" class="muted">Select a step to inspect it.</span>
+              </div>
+              <ol id="agent-steps" class="step-timeline"></ol>
+            </section>
+
+            <section class="panel inspector-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow small">Inspector</p>
+                  <h3 id="step-detail-title">Step details</h3>
+                </div>
+                <span id="step-detail-meta" class="muted">No step selected.</span>
+              </div>
+
+              <div id="inspector-tab-row" class="tab-row">
+                <button type="button" class="tab-button active" data-inspector-tab="summary">Summary</button>
+                <button type="button" class="tab-button" data-inspector-tab="request">Request JSON</button>
+                <button type="button" class="tab-button" data-inspector-tab="result">Result JSON</button>
+              </div>
+
+              <div id="step-detail-body" class="step-detail-body">
+                <div class="empty-state large">
+                  Ordex tool requests, command output, changed paths, and raw JSON will appear here.
+                </div>
+              </div>
+            </section>
+          </aside>
+        </section>
+
+        <section class="panel composer-dock">
           <div class="composer-topline">
             <div class="mode-switch" id="mode-switch">
-              <button type="button" class="mode-chip active" data-mode="chat">Ask</button>
+              <button type="button" class="mode-chip" data-mode="chat">Ask</button>
               <button type="button" class="mode-chip" data-mode="image_analyze">Analyze Image</button>
               <button type="button" class="mode-chip" data-mode="image_generate">Create Image</button>
+              <button type="button" class="mode-chip active" data-mode="agent">Agent</button>
             </div>
-            <span id="composer-hint" class="muted">
-              Next send stays in the current chat.
-            </span>
+            <span id="composer-note" class="muted">Current tab will be reused.</span>
           </div>
+
+          <details class="agent-settings hidden" id="agent-settings">
+            <summary>
+              <div>
+                <p class="eyebrow small">Ordex Agent Mode</p>
+                <strong>Execution settings</strong>
+              </div>
+              <span class="support-text">Workspace, limits, backend</span>
+            </summary>
+            <div class="field-grid">
+              <label class="field">
+                <span>Workspace</span>
+                <input id="agent-workspace" type="text" placeholder="/home/you/Code/project" />
+              </label>
+              <label class="field">
+                <span>Max steps</span>
+                <input id="agent-max-steps" type="number" min="1" max="200" placeholder="50" />
+              </label>
+              <label class="field">
+                <span>Command timeout</span>
+                <input id="agent-command-timeout" type="number" min="1" max="1800" placeholder="180" />
+              </label>
+              <label class="field">
+                <span>Backend</span>
+                <select id="agent-execution-backend">
+                  <option value="">Server default</option>
+                  <option value="host">host</option>
+                  <option value="docker">docker</option>
+                  <option value="podman">podman</option>
+                </select>
+              </label>
+            </div>
+            <label class="field checkbox-field">
+              <input id="agent-network-enabled" type="checkbox" />
+              <span>Allow network inside the agent backend when supported</span>
+            </label>
+            <p class="support-text agent-help">
+              کار را ساده و طبیعی بنویسید؛ Ordex خودش پروژه را بررسی، اجرا، اصلاح و تست می‌کند.
+            </p>
+          </details>
 
           <div class="upload-preview hidden" id="upload-preview">
             <img id="upload-preview-image" alt="Selected upload preview" />
@@ -128,29 +276,30 @@
           </div>
 
           <div class="composer-row">
-            <label for="question" class="sr-only">Question</label>
+            <label for="question" class="sr-only">Prompt</label>
             <textarea
               id="question"
-              rows="4"
-              placeholder="سلام gemini خوبی؟"
+              rows="3"
+              dir="auto"
+              placeholder="مثلاً: این پروژه را بررسی کن، قابلیت موردنظر را کامل بساز، اجرا و تست کن و تا وقتی مطمئن نشدی درست کار می‌کند متوقف نشو."
             ></textarea>
           </div>
 
           <div class="composer-actions">
             <div class="left-actions">
-              <label for="image-input" class="upload-trigger">
+              <label for="image-input" id="upload-trigger" class="upload-trigger">
                 <span class="upload-glyph">+</span>
                 <span>Add image</span>
               </label>
               <input id="image-input" type="file" accept="image/*" />
-              <span id="composer-note" class="muted">Current tab will be reused.</span>
+              <span class="support-text">Use <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Enter</kbd> to send.</span>
             </div>
-            <button id="submit-btn" class="primary">Send</button>
+            <button id="submit-btn" class="primary">Start Ordex</button>
           </div>
         </section>
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260704g" type="module"></script>
+    <script src="/static/app.js?v=20260716-resilient-ui-v2" type="module"></script>
   </body>
 </html>

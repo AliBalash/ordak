@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ordak diagnostics</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260704e" />
+    <link rel="stylesheet" href="/static/style.css?v=20260716-resilient-ui-v2" />
   </head>
   <body data-provider-theme="gemini">
     <main class="chat-shell" style="grid-template-columns: 1fr; max-width: 1120px;">
@@ -122,6 +122,7 @@
           active_job: diagnostics.active_job,
           project_url_configured: diagnostics.project_url_configured,
         }));
+        root.appendChild(renderJson("Agent mode", diagnostics.agent || {}));
 
         const storageArticle = renderJson("Storage", storage);
         const actions = document.createElement("div");
