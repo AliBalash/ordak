@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from app.automation.existing_chrome import ChromeTabInfo, ChromeTabRef
+from app.agent.types import AgentResolvedConfig
+from app.automation.existing_chrome import ChromeTabInfo, ChromeTabRef, ResponseBaseline
 from app.automation.gemini_worker import GeminiAutomationError, GeminiJobRequest, run_gemini_job
 from app.config import settings
 from app.providers.base import ImageExtractionResult, ProviderDiagnostics, RebindResult
@@ -21,6 +22,12 @@ class RuntimeSpy:
     answer: str | None = None
     errors: list[tuple[str, str, str | None]] = field(default_factory=list)
     remembered_tabs: list[ChromeTabInfo] = field(default_factory=list)
+    agent_max_protocol_errors: int = 5
+    agent_seen_command_ids: tuple[str, ...] = ()
+    should_cancel = None
+
+    def checkpoint(self) -> None:
+        return None
 
     def update_status(self, status: str) -> None:
         self.statuses.append(status)
@@ -52,16 +59,24 @@ class FakeAdapter:
         self.opened_url: str | None = None
         self.inserted: list[str] = []
         self.submit_calls = 0
+        self.submit_failures_remaining = 0
         self.best_effort_stop_calls = 0
         self.last_max_images: int | None = None
         self.rebind_calls: list[tuple[str | None, ChromeTabRef | None]] = []
         self.result = "سلام! من خوبم."
+        self.previous_response = ""
+        self.previous_assistant_turn_count = 0
+        self.wait_previous_responses: list[str] = []
+        self.wait_previous_turn_counts: list[int | None] = []
+        self.wait_failures_remaining = 0
         self.image_paths: list[Path] = []
         self.rebind_result = RebindResult(
             tab=ChromeTabRef(window_id=11, tab_id=22),
             info=ChromeTabInfo(window_id=11, tab_id=22, url="https://example.com/c/1", title="tab", active=True),
         )
         self.login_state = "ready"
+        self.find_prompt_calls = 0
+        self.find_prompt_failures_remaining = 0
         self.upload_state = {
             "attachment": True,
             "hasPreview": True,
@@ -84,6 +99,10 @@ class FakeAdapter:
         return False
 
     def find_prompt_input(self, tab: ChromeTabRef, timeout_ms: int) -> None:
+        self.find_prompt_calls += 1
+        if self.find_prompt_failures_remaining:
+            self.find_prompt_failures_remaining -= 1
+            raise RuntimeError("prompt input is still loading")
         return None
 
     def verify_upload_complete(self, tab: ChromeTabRef) -> dict[str, object]:
@@ -91,6 +110,18 @@ class FakeAdapter:
 
     def submit_prompt(self, tab: ChromeTabRef) -> None:
         self.submit_calls += 1
+        if self.submit_failures_remaining:
+            self.submit_failures_remaining -= 1
+            raise RuntimeError("temporary submit failure")
+
+    def read_latest_response_text(self, tab: ChromeTabRef) -> str:
+        return self.previous_response
+
+    def read_latest_response_baseline(self, tab: ChromeTabRef) -> ResponseBaseline:
+        return ResponseBaseline(
+            text=self.previous_response,
+            assistant_turn_count=self.previous_assistant_turn_count,
+        )
 
     def wait_for_response(
         self,
@@ -100,10 +131,20 @@ class FakeAdapter:
         stable_seconds: int,
         excluded_text: str,
         expect_images: bool,
+        previous_response: str = "",
+        previous_assistant_turn_count: int | None = None,
         should_cancel=None,
+        stall_refresh_seconds: int = 0,
+        max_stall_refreshes: int = 0,
+        recovery_callback=None,
     ) -> str:
+        self.wait_previous_responses.append(previous_response)
+        self.wait_previous_turn_counts.append(previous_assistant_turn_count)
         if should_cancel and should_cancel():
             raise TimeoutError("__ORD_CANCELLED__")
+        if self.wait_failures_remaining:
+            self.wait_failures_remaining -= 1
+            raise TimeoutError("temporary response stall")
         return self.result
 
     def extract_text_result(self, raw_text: str) -> str:
@@ -149,9 +190,14 @@ def install_fake_adapter(monkeypatch: pytest.MonkeyPatch, adapter: FakeAdapter) 
     monkeypatch.setattr("app.automation.gemini_worker.upload_local_file", lambda *args, **kwargs: None)
 
 
+def generic_worker_settings():
+    return replace(settings, browser_platform="auto")
+
+
 def test_chat_job_fails_when_google_chrome_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: False)
 
@@ -160,7 +206,7 @@ def test_chat_job_fails_when_google_chrome_is_closed(monkeypatch: pytest.MonkeyP
             "job-no-chrome",
             GeminiJobRequest(question="سلام", start_new_chat=True),
             runtime=runtime,
-            app_settings=settings,
+            app_settings=local_settings,
         )
 
     assert runtime.statuses == ["checking_browser"]
@@ -176,6 +222,7 @@ def test_chat_job_fails_when_google_chrome_is_closed(monkeypatch: pytest.MonkeyP
 def test_chat_job_uses_adapter_open_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
 
@@ -183,13 +230,13 @@ def test_chat_job_uses_adapter_open_tab(monkeypatch: pytest.MonkeyPatch) -> None
         "job-existing-chrome",
         GeminiJobRequest(question="سلام gemini خوبی ؟", start_new_chat=True),
         runtime=runtime,
-        app_settings=settings,
+        app_settings=local_settings,
     )
 
     assert answer == "سلام! من خوبم."
     assert adapter.inserted == ["سلام gemini خوبی ؟"]
     assert runtime.answer == "سلام! من خوبم."
-    assert adapter.opened_url == settings.provider_new_chat_url("gemini")
+    assert adapter.opened_url == local_settings.provider_new_chat_url("gemini")
     assert runtime.statuses == [
         "checking_browser",
         "opening_provider_tab",
@@ -202,9 +249,177 @@ def test_chat_job_uses_adapter_open_tab(monkeypatch: pytest.MonkeyPatch) -> None
     ]
 
 
+def test_chat_job_recovers_from_transient_submit_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    adapter.submit_failures_remaining = 1
+    local_settings = generic_worker_settings()
+    reloads: list[str] = []
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.execute_javascript",
+        lambda tab, script: reloads.append(script) or "reloading",
+    )
+    monkeypatch.setattr("app.automation.gemini_worker.time.sleep", lambda _: None)
+
+    answer = run_gemini_job(
+        "job-submit-recovery",
+        GeminiJobRequest(question="recover this prompt", start_new_chat=True),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "سلام! من خوبم."
+    assert adapter.submit_calls == 2
+    assert adapter.inserted == ["recover this prompt", "recover this prompt"]
+    assert reloads == []
+
+
+def test_agent_job_recovers_when_prompt_input_is_still_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    adapter.find_prompt_failures_remaining = 1
+    adapter.result = "FINAL\nRecovered after input reload."
+    reloads: list[str] = []
+    local_settings = replace(
+        generic_worker_settings(),
+        agent_allowed_workspace_roots=(tmp_path.resolve(),),
+    )
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.execute_javascript",
+        lambda tab, script: reloads.append(script) or "reopening",
+    )
+    monkeypatch.setattr("app.automation.gemini_worker.time.sleep", lambda _: None)
+
+    answer = run_gemini_job(
+        "job-input-recovery",
+        GeminiJobRequest(
+            question="continue",
+            provider="chatgpt",
+            mode="agent",
+            start_new_chat=False,
+            conversation_url="https://chatgpt.com/g/custom/c/conversation-123",
+            agent_config=AgentResolvedConfig(
+                workspace=tmp_path.resolve(),
+                workspace_display=str(tmp_path.resolve()),
+                max_steps=5,
+                command_timeout_seconds=60,
+                execution_backend="host",
+                network_enabled=False,
+            ),
+        ),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "Recovered after input reload."
+    assert adapter.find_prompt_calls >= 2
+    assert any("conversation-123" in script for script in reloads)
+    assert any("input is not ready" in message for _, message in runtime.logs)
+
+
+def test_chat_job_excludes_the_response_visible_before_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    adapter.previous_response = "the previous assistant response"
+    adapter.previous_assistant_turn_count = 5
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+
+    run_gemini_job(
+        "job-response-baseline",
+        GeminiJobRequest(question="continue", start_new_chat=True),
+        runtime=runtime,
+        app_settings=generic_worker_settings(),
+    )
+
+    assert adapter.wait_previous_responses == ["the previous assistant response"]
+    assert adapter.wait_previous_turn_counts == [5]
+
+
+def test_chatgpt_exchange_adds_a_stable_correlation_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+
+    run_gemini_job(
+        "job-chatgpt-correlation",
+        GeminiJobRequest(
+            question="متن دارای `backtick` و literal_*_value",
+            provider="chatgpt",
+            start_new_chat=True,
+        ),
+        runtime=runtime,
+        app_settings=generic_worker_settings(),
+    )
+
+    assert len(adapter.inserted) == 1
+    assert adapter.inserted[0].startswith("متن دارای `backtick` و literal_*_value\n\n")
+    assert adapter.inserted[0].rsplit("\n", 1)[-1].startswith("ORDAK_EXCHANGE_ID_")
+
+
+def test_agent_exchange_recovers_completed_response_after_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    adapter.wait_failures_remaining = 1
+    adapter.result = "FINAL\nRecovered successfully."
+    local_settings = replace(
+        generic_worker_settings(),
+        agent_allowed_workspace_roots=(tmp_path.resolve(),),
+        agent_max_exchange_recoveries=1,
+        agent_recovery_delay_seconds=0,
+    )
+    refresh_scripts = []
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker.execute_javascript",
+        lambda tab, script: refresh_scripts.append(script) or "recovering",
+    )
+    monkeypatch.setattr("app.automation.gemini_worker.time.sleep", lambda _: None)
+
+    answer = run_gemini_job(
+        "job-agent-response-recovery",
+        GeminiJobRequest(
+            question="کار را کامل کن",
+            provider="chatgpt",
+            mode="agent",
+            start_new_chat=True,
+            agent_config=AgentResolvedConfig(
+                workspace=tmp_path.resolve(),
+                workspace_display=str(tmp_path.resolve()),
+                max_steps=5,
+                command_timeout_seconds=60,
+                execution_backend="host",
+                network_enabled=False,
+            ),
+        ),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "Recovered successfully."
+    assert adapter.submit_calls == 1
+    assert len(refresh_scripts) == 1
+    assert any("Recovered the completed assistant response" in message for _, message in runtime.logs)
+
+
 def test_chat_job_reuses_existing_conversation_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
 
@@ -217,7 +432,7 @@ def test_chat_job_reuses_existing_conversation_tab(monkeypatch: pytest.MonkeyPat
             target_tab=ChromeTabRef(window_id=11, tab_id=22),
         ),
         runtime=runtime,
-        app_settings=settings,
+        app_settings=local_settings,
     )
 
     assert answer == "سلام! من خوبم."
@@ -228,6 +443,7 @@ def test_chat_job_reuses_existing_conversation_tab(monkeypatch: pytest.MonkeyPat
 def test_image_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
     upload_path = tmp_path / "sample-image-test.png"
@@ -242,7 +458,7 @@ def test_image_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch, 
             start_new_chat=True,
         ),
         runtime=runtime,
-        app_settings=settings,
+        app_settings=local_settings,
     )
 
     assert answer == "سلام! من خوبم."
@@ -254,6 +470,7 @@ def test_image_generate_job_collects_output_images(
 ) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     output_path = tmp_path / "generated.png"
     output_path.write_bytes(b"fake-output")
     adapter.result = "__GENERATED_IMAGES__:2"
@@ -269,12 +486,12 @@ def test_image_generate_job_collects_output_images(
             start_new_chat=True,
         ),
         runtime=runtime,
-        app_settings=settings,
+        app_settings=local_settings,
     )
 
     assert answer == "Gemini generated image output in the current Chrome tab. Saved images: 1."
     assert runtime.output_images == [output_path]
-    assert adapter.last_max_images == settings.max_output_images_per_job
+    assert adapter.last_max_images == local_settings.max_output_images_per_job
 
 
 def test_linux_chatgpt_image_generate_refreshes_tab_before_extracting_images(
@@ -315,6 +532,7 @@ def test_linux_chatgpt_image_generate_refreshes_tab_before_extracting_images(
 def test_chatgpt_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
+    local_settings = generic_worker_settings()
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
 
@@ -322,11 +540,11 @@ def test_chatgpt_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch
         "job-chatgpt-existing-chrome",
         GeminiJobRequest(question="سلام", provider="chatgpt", start_new_chat=True),
         runtime=runtime,
-        app_settings=settings,
+        app_settings=local_settings,
     )
 
     assert answer == "سلام! من خوبم."
-    assert adapter.opened_url == settings.provider_new_chat_url("chatgpt")
+    assert adapter.opened_url == local_settings.provider_new_chat_url("chatgpt")
 
 
 def test_chatgpt_job_without_project_url_falls_back_to_default_chat_url(
@@ -334,7 +552,7 @@ def test_chatgpt_job_without_project_url_falls_back_to_default_chat_url(
 ) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
-    local_settings = replace(settings, chatgpt_project_url=None)
+    local_settings = replace(generic_worker_settings(), chatgpt_project_url=None)
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
 

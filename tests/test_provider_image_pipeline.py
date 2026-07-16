@@ -162,14 +162,33 @@ def test_wait_for_response_uses_full_timeout_window(monkeypatch) -> None:
     adapter = ExistingChromeProviderAdapter("gemini")
     captured: dict[str, object] = {}
 
-    def fake_wait(tab, *, timeout_ms, stable_seconds, excluded_text, expect_images, provider, should_cancel=None):
+    def fake_wait(
+        tab,
+        *,
+        timeout_ms,
+        stable_seconds,
+        excluded_text,
+        previous_response,
+        previous_assistant_turn_count,
+        expect_images,
+        provider,
+        should_cancel=None,
+        stall_refresh_seconds=0,
+        max_stall_refreshes=0,
+        recovery_callback=None,
+    ):
         captured.update(
             timeout_ms=timeout_ms,
             stable_seconds=stable_seconds,
             excluded_text=excluded_text,
+            previous_response=previous_response,
+            previous_assistant_turn_count=previous_assistant_turn_count,
             expect_images=expect_images,
             provider=provider,
             cancelled=bool(should_cancel and should_cancel()),
+            stall_refresh_seconds=stall_refresh_seconds,
+            max_stall_refreshes=max_stall_refreshes,
+            has_recovery_callback=recovery_callback is not None,
         )
         return "final answer"
 
@@ -189,9 +208,14 @@ def test_wait_for_response_uses_full_timeout_window(monkeypatch) -> None:
         "timeout_ms": 240_000,
         "stable_seconds": 4,
         "excluded_text": "سلام",
+        "previous_response": "",
+        "previous_assistant_turn_count": None,
         "expect_images": False,
         "provider": "gemini",
         "cancelled": False,
+        "stall_refresh_seconds": 0,
+        "max_stall_refreshes": 0,
+        "has_recovery_callback": False,
     }
 
 
@@ -225,6 +249,19 @@ def test_wait_for_response_stops_provider_on_cancel(monkeypatch) -> None:
         raise AssertionError("TimeoutError was expected")
 
     assert stop_calls == 1
+
+
+def test_latest_response_baseline_preserves_exact_dom_text(monkeypatch) -> None:
+    adapter = ExistingChromeProviderAdapter("chatgpt")
+    raw = "RUN\nsame line\nsame line"
+    monkeypatch.setattr(
+        "app.providers.existing_chrome.read_latest_response_text",
+        lambda tab, provider: raw,
+    )
+
+    assert adapter.read_latest_response_text(
+        ChromeTabRef(window_id=1, tab_id=1)
+    ) == raw
 
 
 def test_read_generated_image_export_payloads_skips_html_payloads(

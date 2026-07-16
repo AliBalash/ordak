@@ -10,6 +10,7 @@ from app.automation.browser import (
     _linux_launch_remote_debugging_chrome,
     ensure_linux_remote_debugging_session,
     open_profile_browser_session,
+    linux_remote_debugging_available,
 )
 from app.config import settings
 
@@ -151,3 +152,29 @@ def test_open_profile_browser_session_on_linux_launches_and_opens_gemini_tab(
 
     assert launches == ["about:blank"]
     assert opened_urls == [settings.gemini_url]
+
+
+def test_linux_remote_debugging_available_bypasses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    proxies: list[dict[object, object]] = []
+    opened: list[tuple[str, int]] = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeOpener:
+        def open(self, request, timeout=5):
+            opened.append((request.full_url, timeout))
+            return FakeResponse()
+
+    monkeypatch.setattr("app.automation.browser.ProxyHandler", lambda mapping: proxies.append(mapping) or object())
+    monkeypatch.setattr("app.automation.browser.build_opener", lambda handler: FakeOpener())
+
+    assert linux_remote_debugging_available(settings) is True
+    assert proxies == [{}]
+    assert opened == [(f"{settings.browser_remote_debugging_url.rstrip('/')}/json/version", 5)]

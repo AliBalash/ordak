@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -29,6 +30,26 @@ def create_test_client(tmp_path: Path) -> TestClient:
     configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
     init_db()
     app = create_app(JobManager(worker=_fake_worker))
+    return TestClient(app)
+
+
+def create_agent_test_client(tmp_path: Path) -> TestClient:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+    app_settings = replace(
+        settings,
+        agent_allowed_workspace_roots=(tmp_path.resolve(),),
+        chatgpt_agent_url="https://chatgpt.com/g/g-agent",
+    )
+
+    def fake_agent_worker(job_id: str, job_request, runtime=None, app_settings=None) -> str:
+        step_id = runtime.start_agent_step(1, "step-1", "exec", '{"tool":"exec"}')
+        runtime.finish_agent_step(step_id, "completed", '{"ok":true}', None)
+        runtime.save_answer("agent-complete")
+        runtime.update_status("completed")
+        return "agent-complete"
+
+    app = create_app(JobManager(worker=fake_agent_worker, app_settings=app_settings))
     return TestClient(app)
 
 
@@ -167,3 +188,75 @@ def test_cancel_retry_resume_endpoints(tmp_path: Path) -> None:
         resume = client.post(f"/api/jobs/{job_id}/resume", json={"strategy": "same_tab"})
         assert resume.status_code in {200, 409}
         time.sleep(1.2)
+
+
+def test_agent_job_routes_and_steps_endpoint(tmp_path: Path) -> None:
+    with create_agent_test_client(tmp_path) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "question": "Inspect and fix",
+                "provider": "chatgpt",
+                "mode": "agent",
+                "start_new_chat": True,
+                "agent": {
+                    "workspace": str(tmp_path),
+                },
+            },
+        )
+        assert created.status_code == 200
+        job_id = created.json()["job_id"]
+
+        deadline = time.time() + 3
+        final = None
+        while time.time() < deadline:
+            final = client.get(f"/api/jobs/{job_id}")
+            if final.json()["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert final is not None
+        assert final.json()["agent_workspace"] == str(tmp_path.resolve())
+        assert final.json()["agent_step_count"] == 1
+
+        steps = client.get(f"/api/jobs/{job_id}/steps")
+        assert steps.status_code == 200
+        assert steps.json()["steps"][0]["command_id"] == "step-1"
+
+
+def test_agent_mode_validation_errors(tmp_path: Path) -> None:
+    with create_agent_test_client(tmp_path) as client:
+        wrong_provider = client.post(
+            "/api/jobs",
+            json={
+                "question": "Inspect and fix",
+                "provider": "gemini",
+                "mode": "agent",
+                "start_new_chat": True,
+                "agent": {"workspace": str(tmp_path)},
+            },
+        )
+        assert wrong_provider.status_code == 422
+
+        missing_agent = client.post(
+            "/api/jobs",
+            json={
+                "question": "Inspect and fix",
+                "provider": "chatgpt",
+                "mode": "agent",
+                "start_new_chat": True,
+            },
+        )
+        assert missing_agent.status_code == 422
+
+        multipart_agent = client.post(
+            "/api/jobs",
+            data={
+                "question": "Inspect and fix",
+                "provider": "chatgpt",
+                "mode": "agent",
+                "start_new_chat": "true",
+            },
+            files={"image": ("", b"", "application/octet-stream")},
+        )
+        assert multipart_agent.status_code == 422
