@@ -23,6 +23,7 @@ Typical local addresses:
 - `multipart/form-data`
 
 Use multipart when sending an image.
+Use JSON for agent mode.
 
 ## Core enums
 
@@ -36,6 +37,7 @@ Use multipart when sending an image.
 - `chat`
 - `image_analyze`
 - `image_generate`
+- `agent`
 
 ### Terminal job states
 
@@ -73,6 +75,8 @@ The main payload families are:
 - logs
 - screenshots
 - trace path
+- agent workspace and resolved limits
+- agent step count
 - timestamps
 
 ## Root and static routes
@@ -152,7 +156,8 @@ Creates a new asynchronous job.
   "provider": "gemini",
   "mode": "chat",
   "conversation_id": null,
-  "start_new_chat": false
+  "start_new_chat": false,
+  "agent": null
 }
 ```
 
@@ -163,6 +168,25 @@ Creates a new asynchronous job.
 - `mode`: defaults to `chat`
 - `conversation_id`: optional existing `ordak` conversation ID
 - `start_new_chat`: if `true`, clears the saved tab binding and conversation external URL before the new run
+- `agent`: required when `mode == "agent"` and rejected for non-agent modes
+
+### Agent JSON example
+
+```json
+{
+  "question": "Inspect this repository, fix failing tests, and validate the result.",
+  "provider": "chatgpt",
+  "mode": "agent",
+  "start_new_chat": true,
+  "agent": {
+    "workspace": "/home/you/Code/project",
+    "max_steps": 50,
+    "command_timeout_seconds": 180,
+    "execution_backend": "host",
+    "network_enabled": false
+  }
+}
+```
 
 ### Multipart request behavior
 
@@ -181,6 +205,8 @@ Multipart mode also accepts:
 - `wait_timeout_seconds`
 
 Those fields matter mainly for provider direct endpoints but are parsed by the shared helper.
+
+Agent mode does not accept multipart requests or uploads.
 
 ### Success response
 
@@ -218,6 +244,31 @@ Important fields in practice:
 - `suggested_action`
 - `recoverable`
 - `uploads`
+
+## `GET /api/jobs/{job_id}/steps`
+
+Returns ordered agent-step details for one job.
+
+```json
+{
+  "steps": [
+    {
+      "id": "uuid",
+      "job_id": "uuid",
+      "sequence": 1,
+      "command_id": "step-0001",
+      "tool": "exec",
+      "status": "completed",
+      "request_json": "{\"version\":1,...}",
+      "result_json": "{\"ok\":true,...}",
+      "started_at": "2026-07-14T00:00:00Z",
+      "finished_at": "2026-07-14T00:00:01Z",
+      "duration_ms": 1000,
+      "error_message": null
+    }
+  ]
+}
+```
 - `output_images`
 - `screenshots`
 - `trace_path`

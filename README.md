@@ -9,6 +9,7 @@ The project is designed for personal desktop workflows, local tools, and interna
 - Reuses an existing signed-in Chrome session instead of creating a fully separate browser workflow.
 - Supports both Gemini and ChatGPT through one local orchestration layer.
 - Handles chat, image analysis, and image generation / image editing jobs.
+- Adds Ordex Agent Mode for iterative local coding tasks through a Custom GPT in the real ChatGPT UI.
 - Persists conversations, jobs, tab bindings, logs, screenshots, traces, uploads, and output images.
 - Exposes asynchronous job APIs, direct provider response APIs, and live WebSocket job updates.
 - Includes a built-in web panel and a diagnostics page for operational visibility.
@@ -22,6 +23,25 @@ The project is designed for personal desktop workflows, local tools, and interna
 3. The worker opens or rebinds a Gemini or ChatGPT tab in an existing Chrome session.
 4. The automation layer inserts the prompt, optionally uploads an image, submits the request, waits for the provider UI to stabilize, and extracts the result.
 5. The final answer, generated images, logs, screenshots, and metadata are saved locally and exposed through the API and panel.
+
+## Ordex Agent Mode
+
+Ordex Agent Mode keeps the normal Chrome-backed workflow, but lets a Custom GPT issue one structured local tool action at a time and receive `TOOL_RESULT` responses in the same ChatGPT conversation.
+
+Agent mode currently:
+
+- supports `chatgpt` only
+- uses a separate `CHATGPT_AGENT_URL`
+- persists per-step records under `agent_steps`
+- supports `exec`, `read_file`, `list_directory`, `write_file`, and `apply_patch`
+- confines file access to configured workspace roots
+
+Typical flow:
+
+1. Start Chrome on Linux with remote debugging on `127.0.0.1:9222` or open your regular signed-in Chrome on macOS.
+2. Sign in to ChatGPT in that exact Chrome session.
+3. Set `CHATGPT_AGENT_URL` and `AGENT_ALLOWED_WORKSPACE_ROOTS` in `.env`.
+4. In the panel, choose `ChatGPT` + `Agent`, provide a workspace, and send a coding task.
 
 ## Platform model
 
@@ -120,6 +140,7 @@ tests/             Automated test suite
 - `POST /api/jobs`
 - `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/steps`
 - `POST /api/jobs/{job_id}/cancel`
 - `POST /api/jobs/{job_id}/retry`
 - `POST /api/jobs/{job_id}/resume`
@@ -153,6 +174,7 @@ The project includes automated coverage for:
 - Chrome tab rebinding and tab identity handling
 - Upload flow and generated image readiness
 - Worker orchestration, errors, retries, and image extraction
+- Agent protocol parsing, workspace confinement, executor behavior, job-step persistence, and agent routes
 - Job manager queue behavior and recovery
 - Main route behavior and direct provider endpoints
 

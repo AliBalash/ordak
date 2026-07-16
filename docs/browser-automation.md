@@ -47,6 +47,19 @@ The normal flow is:
 11. wait for response stability
 12. extract text or images
 
+## Agent flow
+
+When `mode == "agent"`, the worker still binds a real ChatGPT tab, but the prompt/response loop becomes multi-turn:
+
+1. open the Ordex Custom GPT URL
+2. send the initial task and workspace constraints
+3. wait for a strict `RUN` or `FINAL` response
+4. execute exactly one local tool request
+5. send `TOOL_RESULT` back into the same ChatGPT conversation
+6. repeat until `FINAL`
+
+The loop lives in `app/agent/` and keeps using the same Chrome tab whenever possible.
+
 ## Effective prompt behavior
 
 The worker adjusts the prompt for image modes:
