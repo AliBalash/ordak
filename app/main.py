@@ -126,15 +126,15 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
             if wait_timeout_seconds < 1 or wait_timeout_seconds > 3600:
                 raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 3600.")
             pending_job_id = str(uuid.uuid4())
-            upload = form.get("image")
+            upload_items = [item for item in form.getlist("image") if getattr(item, "filename", None)]
             _validate_agent_request(
                 mode=mode,
                 provider=provider,
                 agent=None,
-                uploads_present=upload is not None and bool(getattr(upload, "filename", None)),
+                uploads_present=bool(upload_items),
                 multipart=True,
             )
-            if upload is not None and getattr(upload, "filename", None):
+            for upload in upload_items:
                 try:
                     saved_upload = await save_image_upload(upload, pending_job_id, settings)
                 except ValueError as exc:

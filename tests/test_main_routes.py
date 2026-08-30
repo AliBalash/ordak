@@ -144,6 +144,36 @@ def test_provider_direct_response_multipart_image_endpoint(tmp_path: Path) -> No
         assert payload["output_images"][0]["url"].endswith(payload["output_images"][0]["path"])
 
 
+def test_chatgpt_image_job_accepts_multiple_ordered_references(tmp_path: Path) -> None:
+    with create_test_client(tmp_path) as client:
+        response = client.post(
+            "/api/jobs",
+            data={
+                "question": "Generate exactly one landscape image.",
+                "provider": "chatgpt",
+                "mode": "image_generate",
+                "start_new_chat": "true",
+            },
+            files=[
+                ("image", ("01_style_anchor.png", b"style", "image/png")),
+                ("image", ("02_character_anchor.png", b"character", "image/png")),
+                ("image", ("03_previous_beat.png", b"previous", "image/png")),
+            ],
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/jobs/{job_id}").json()
+            if job["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert job["status"] == "completed"
+        assert [Path(path).name.endswith(name) for path, name in zip(job["uploads"], [
+            "01_style_anchor.png", "02_character_anchor.png", "03_previous_beat.png"
+        ])] == [True, True, True]
+
+
 def test_profile_open_endpoint(tmp_path: Path, monkeypatch) -> None:
     with create_test_client(tmp_path) as client:
         monkeypatch.setattr(client.app.state.job_manager, "launch_profile_browser", lambda: True)

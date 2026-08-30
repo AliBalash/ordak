@@ -616,25 +616,35 @@ def _attach_uploads_in_existing_chrome(
 ) -> None:
     if not upload_paths:
         return
-    if len(upload_paths) > 1:
-        raise OrdaKError(
-            code=ErrorCode.UPLOAD_INCOMPLETE,
-            message="This MVP currently supports one uploaded image at a time.",
+    for index, upload_path in enumerate(upload_paths, start=1):
+        mime_type = mimetypes.guess_type(upload_path.name)[0] or "application/octet-stream"
+        runtime and runtime.append_log(
+            f"Attaching reference {index}/{len(upload_paths)} from {upload_path.name}."
         )
-    upload_path = upload_paths[0]
-    mime_type = mimetypes.guess_type(upload_path.name)[0] or "application/octet-stream"
-    runtime and runtime.append_log(
-        f"Attaching uploaded image in the current Google Chrome tab from {upload_path.name}."
-    )
-    upload_local_file(
-        tab,
-        file_path=upload_path,
-        file_name=upload_path.name,
-        mime_type=mime_type,
-        timeout_ms=min(app_settings.browser_timeout_ms, 90_000),
-        provider=provider,
-    )
-    runtime and runtime.append_log("Image upload attached in the current Google Chrome tab.")
+        upload_local_file(
+            tab,
+            file_path=upload_path,
+            file_name=upload_path.name,
+            mime_type=mime_type,
+            timeout_ms=min(app_settings.browser_timeout_ms, 90_000),
+            provider=provider,
+        )
+        upload_state = get_provider_adapter(provider).verify_upload_complete(tab)
+        if not (
+            upload_state.get("attachment")
+            and int(upload_state.get("attachmentCount") or 0) >= index
+            and upload_state.get("hasPreview")
+            and not upload_state.get("loading")
+            and upload_state.get("submitReady")
+        ):
+            raise OrdaKError(
+                code=ErrorCode.UPLOAD_INCOMPLETE,
+                message=(
+                    f"Reference {index}/{len(upload_paths)} is not ready for submission "
+                    f"(provider reports {upload_state.get('attachmentCount', 0)} attachments)."
+                ),
+            )
+    runtime and runtime.append_log(f"All {len(upload_paths)} reference attachments are ready.")
 
 
 def _raise_structured_error(exc: OrdaKError) -> None:
@@ -817,6 +827,12 @@ def _run_gemini_job_in_existing_chrome(
                     excluded_text=effective_prompt,
                     expect_images=True,
                     should_cancel=getattr(runtime, "should_cancel", None) if runtime is not None else None,
+                    stall_refresh_seconds=resolved.chatgpt_stall_refresh_seconds,
+                    max_stall_refreshes=resolved.chatgpt_max_stall_refreshes,
+                    recovery_callback=(
+                        lambda message: runtime.append_log(message, level="warning")
+                        if runtime is not None else None
+                    ),
                 )
             except TimeoutError as exc:
                 if str(exc) == "__ORD_CANCELLED__":

@@ -29,6 +29,7 @@ def test_ensure_linux_remote_debugging_session_auto_launches_and_waits(monkeypat
         return polls["count"] >= 3
 
     monkeypatch.setattr("app.automation.browser.platform.system", lambda: "Linux")
+    monkeypatch.setattr("app.automation.browser._normal_chrome_process_running", lambda: False)
     monkeypatch.setattr("app.automation.browser.linux_remote_debugging_available", fake_available)
     monkeypatch.setattr(
         "app.automation.browser._linux_launch_remote_debugging_chrome",
@@ -52,6 +53,7 @@ def test_ensure_linux_remote_debugging_session_respects_disabled_auto_launch(
     launches: list[str | None] = []
 
     monkeypatch.setattr("app.automation.browser.platform.system", lambda: "Linux")
+    monkeypatch.setattr("app.automation.browser._normal_chrome_process_running", lambda: False)
     monkeypatch.setattr("app.automation.browser.linux_remote_debugging_available", lambda app_settings=None: False)
     monkeypatch.setattr(
         "app.automation.browser._linux_launch_remote_debugging_chrome",
@@ -76,6 +78,7 @@ def test_ensure_linux_remote_debugging_session_raises_after_launch_timeout(
     monotonic_values = iter([0.0, 0.1, 0.3, 0.6, 0.8])
 
     monkeypatch.setattr("app.automation.browser.platform.system", lambda: "Linux")
+    monkeypatch.setattr("app.automation.browser._normal_chrome_process_running", lambda: False)
     monkeypatch.setattr("app.automation.browser.linux_remote_debugging_available", lambda app_settings=None: False)
     monkeypatch.setattr(
         "app.automation.browser._linux_launch_remote_debugging_chrome",
@@ -98,8 +101,10 @@ def test_linux_launch_remote_debugging_chrome_uses_ordak_profile(
         settings,
         browser_executable_path=Path("/usr/bin/google-chrome"),
         browser_remote_debugging_url="http://127.0.0.1:9222",
-        browser_remote_debugging_user_data_dir=tmp_path / "ordak-chrome",
+        browser_user_data_dir=tmp_path / "real-chrome",
+        browser_profile_name="Profile 1",
     )
+    (local_settings.browser_user_data_dir / local_settings.browser_profile_name).mkdir(parents=True)
     commands: list[list[str]] = []
 
     monkeypatch.setattr(
@@ -116,7 +121,8 @@ def test_linux_launch_remote_debugging_chrome_uses_ordak_profile(
         "/usr/bin/google-chrome",
         "--remote-debugging-address=127.0.0.1",
         "--remote-debugging-port=9222",
-        f"--user-data-dir={local_settings.browser_remote_debugging_user_data_dir}",
+        f"--user-data-dir={local_settings.browser_user_data_dir}",
+        "--profile-directory=Profile 1",
         "--new-window",
         "--no-first-run",
         "--no-default-browser-check",

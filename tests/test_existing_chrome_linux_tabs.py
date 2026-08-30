@@ -173,7 +173,7 @@ def test_wait_for_chatgpt_response_never_scans_back_from_thinking(
     def fake_execute(tab, script):
         captured["script"] = script
         return (
-            '{"answer":"","busy":true,"generatedImages":0,'
+            '{"answer":"","busy":false,"generatedImages":0,'
             '"assistantTurnCount":6,"latestTransient":true}'
         )
 
@@ -224,7 +224,7 @@ def test_wait_for_chatgpt_response_refreshes_same_chat_and_recovers_answer(
                 '"assistantTurnCount":6,"latestTransient":false}'
             )
         return (
-            '{"answer":"","busy":true,"generatedImages":0,'
+            '{"answer":"","busy":false,"generatedImages":0,'
             '"assistantTurnCount":6,"latestTransient":true}'
         )
 
@@ -276,6 +276,34 @@ def test_wait_for_chatgpt_response_refreshes_same_chat_and_recovers_answer(
         "latestText !== clean(previousResponse) || assistantAfterExcludedUser" in script
         for script in probes
     )
+
+
+def test_active_chatgpt_generation_is_not_treated_as_stall(monkeypatch) -> None:
+    clock = [0.0]
+    refreshes = []
+
+    def fake_monotonic():
+        clock[0] += 0.25
+        return clock[0]
+
+    def fake_execute(tab, script):
+        if "'recovering'" in script:
+            refreshes.append(script)
+            return "recovering"
+        return '{"answer":"","busy":true,"generatedImages":0,"assistantTurnCount":1,"latestTransient":true}'
+
+    monkeypatch.setattr("app.automation.existing_chrome._linux_should_use_x11_backend", lambda: False)
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+
+    with pytest.raises(TimeoutError):
+        wait_for_response_stable(
+            ChromeTabRef(window_id=0, tab_id=0), timeout_ms=1_000, stable_seconds=1,
+            excluded_text="prompt", provider="chatgpt", stall_refresh_seconds=1,
+            max_stall_refreshes=3,
+        )
+    assert refreshes == []
 
 
 def test_fetch_json_bypasses_proxy_for_devtools(monkeypatch) -> None:

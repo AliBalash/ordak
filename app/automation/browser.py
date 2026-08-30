@@ -258,14 +258,25 @@ def _linux_launch_remote_debugging_chrome(
 ) -> None:
     resolved = app_settings or settings
     port = _linux_remote_debugging_port(resolved)
-    user_data_dir = resolved.browser_remote_debugging_user_data_dir
-    user_data_dir.mkdir(parents=True, exist_ok=True)
+    # DevTools must be exposed by the *configured* Chrome profile.  Launching
+    # with the historical ordak-chrome directory here is a silent fresh-profile
+    # fallback and therefore both loses the authenticated session and violates
+    # the video pipeline contract.
+    user_data_dir = resolved.browser_user_data_dir
+    profile_name = detect_selected_profile(resolved)
+    profile_dir = user_data_dir / profile_name
+    if not profile_dir.is_dir():
+        raise RuntimeError(
+            f"Configured Chrome profile '{profile_name}' was not found in {user_data_dir}. "
+            "Ordak will not create or fall back to another profile."
+        )
     launch_url = target_url or "about:blank"
     cmd = [
         str(resolved.browser_executable_path),
         "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={profile_name}",
         "--new-window",
         "--no-first-run",
         "--no-default-browser-check",
@@ -301,6 +312,18 @@ def _linux_remote_debugging_unavailable_message(app_settings: Settings | None = 
     )
 
 
+def _normal_chrome_process_running() -> bool:
+    """Return whether a non-crashpad Chrome browser process is already alive."""
+    result = subprocess.run(
+        ["ps", "-eo", "args="], capture_output=True, text=True, check=False
+    )
+    for command in result.stdout.splitlines():
+        executable = command.strip().split(" ", 1)[0]
+        if executable.endswith(("/google-chrome", "/chrome")):
+            return True
+    return False
+
+
 def ensure_linux_remote_debugging_session(
     app_settings: Settings | None = None,
     *,
@@ -313,6 +336,17 @@ def ensure_linux_remote_debugging_session(
         return
     if not resolved.browser_remote_debugging_auto_launch:
         raise RuntimeError(_linux_remote_debugging_unavailable_message(resolved))
+
+    # Do not compete with an existing normal Chrome instance: Chrome may reuse
+    # its profile lock and ignore our debugging flags, producing an
+    # uncontrollable session.  The user must explicitly restart that session
+    # with DevTools enabled instead.
+    if _normal_chrome_process_running():
+        raise RuntimeError(
+            "Configured Google Chrome is already running but DevTools is not reachable. "
+            "Ordak will not launch a second or fallback profile; restart the configured "
+            "Chrome profile with remote debugging enabled."
+        )
 
     _linux_launch_remote_debugging_chrome(
         app_settings=resolved,

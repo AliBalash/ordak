@@ -79,6 +79,7 @@ class FakeAdapter:
         self.find_prompt_failures_remaining = 0
         self.upload_state = {
             "attachment": True,
+            "attachmentCount": 3,
             "hasPreview": True,
             "loading": False,
             "submitReady": True,

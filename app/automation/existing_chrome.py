@@ -1305,9 +1305,9 @@ def inspect_upload_state(
   const loadingSelectors = provider === "chatgpt"
     ? ['[role="status"]', '.animate-spin', '[data-testid*="uploading" i]', '[data-testid="send-button"][disabled]']
     : ['.gem-attachment-content.loading', '.gem-attachment-loading-container', 'mat-spinner[aria-label="Loading image"]'];
-  const attachment = attachmentSelectors
+  const attachments = attachmentSelectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .find((el) => isVisible(el));
+    .filter((el, index, items) => isVisible(el) && items.indexOf(el) === index);
   const loadingBySelector = loadingSelectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
     .some((el) => {
@@ -1332,7 +1332,8 @@ def inspect_upload_state(
       return /send message|send prompt|send|submit/.test(text) || el.getAttribute("data-testid") === "send-button";
     });
   return JSON.stringify({
-    attachment: !!attachment,
+    attachment: attachments.length > 0,
+    attachmentCount: attachments.length,
     loading,
     hasPreview,
     submitReady: !!sendButton && !sendButton.disabled,
@@ -2062,7 +2063,9 @@ def wait_for_response_stable(
     started_at = time.monotonic()
     deadline = started_at + timeout_ms / 1000
     stable_since = time.monotonic()
+    last_meaningful_progress = stable_since
     last_text = ""
+    last_generated_images = 0
     refresh_count = 0
     payload = json.dumps(excluded_text, ensure_ascii=False)
     previous_payload = json.dumps(previous_response, ensure_ascii=False)
@@ -2163,12 +2166,22 @@ def wait_for_response_stable(
     while time.monotonic() < deadline:
         if should_cancel and should_cancel():
             raise TimeoutError("__ORD_CANCELLED__")
-        elapsed = time.monotonic() - started_at
+        state = json.loads(execute_javascript(tab, probe) or "{}")
+        current = (state.get("answer") or "").strip()
+        busy = bool(state.get("busy"))
+        generated_images = int(state.get("generatedImages") or 0)
+        now = time.monotonic()
+        if busy or current != last_text or generated_images != last_generated_images:
+            # A visible stop control, streaming text, or a changing image count
+            # is positive progress.  Never turn an active generation into a
+            # stall merely because it has taken a long time.
+            last_meaningful_progress = now
         should_refresh = (
             provider == "chatgpt"
+            and not busy
             and stall_refresh_seconds > 0
             and refresh_count < max_stall_refreshes
-            and elapsed >= stall_refresh_seconds * (refresh_count + 1)
+            and now - last_meaningful_progress >= stall_refresh_seconds
         )
         if should_refresh:
             refresh_count += 1
@@ -2200,12 +2213,10 @@ def wait_for_response_stable(
             except (RuntimeError, TimeoutError):
                 pass
             stable_since = time.monotonic()
+            last_meaningful_progress = stable_since
             last_text = ""
+            last_generated_images = 0
             continue
-        state = json.loads(execute_javascript(tab, probe) or "{}")
-        current = (state.get("answer") or "").strip()
-        busy = bool(state.get("busy"))
-        generated_images = int(state.get("generatedImages") or 0)
         stable_elapsed = time.monotonic() - stable_since
         if current and current != last_text:
             last_text = current
@@ -2215,6 +2226,7 @@ def wait_for_response_stable(
             return current
         elif expect_images and generated_images > 0 and not busy and stable_elapsed >= stable_seconds:
             return f"__GENERATED_IMAGES__:{generated_images}"
+        last_generated_images = generated_images
         time.sleep(1)
     raise TimeoutError(
         f"{PROVIDER_LABELS[provider]} did not finish response within the timeout in the current Chrome tab."
