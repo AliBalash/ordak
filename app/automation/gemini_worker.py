@@ -716,10 +716,15 @@ def _run_gemini_job_in_existing_chrome(
         try:
             _ensure_linux_browser_ready(resolved, job.provider)
         except (FileNotFoundError, RuntimeError) as exc:
+            message = str(exc) or _chrome_not_ready_message(resolved, job.provider)
             _raise_structured_error(
                 OrdaKError(
-                    code=ErrorCode.CHROME_NOT_OPEN,
-                    message=str(exc) or _chrome_not_ready_message(resolved, job.provider),
+                    code=(
+                        ErrorCode.CHROME_CONTROL_UNAVAILABLE
+                        if "already running but DevTools" in message
+                        else ErrorCode.CHROME_NOT_OPEN
+                    ),
+                    message=message,
                 )
             )
         if not is_google_chrome_running():
