@@ -704,6 +704,38 @@ def _linux_open_url_in_existing_chrome(target_url: str) -> ChromeTabRef:
     raise _linux_error("Chrome did not expose the new tab through DevTools in time.")
 
 
+def _linux_close_other_tabs(keep: ChromeTabRef) -> None:
+    """Keep the newly opened work tab as the only Chrome page on Linux.
+
+    Ordak serializes browser work, so retaining stale conversations only wastes
+    RAM and risks the next job binding to an unrelated tab.
+    """
+    keep_id = (keep.target_id or "").strip()
+    if not keep_id:
+        raise _linux_error("Cannot close stale Chrome tabs because the new tab has no DevTools target ID.")
+    opener = build_opener(ProxyHandler({}))
+    for candidate in _linux_list_google_chrome_tabs():
+        target_id = (candidate.target_id or "").strip()
+        if not target_id or target_id == keep_id:
+            continue
+        try:
+            request = Request(
+                f"{_remote_debugging_base_url()}/json/close/{quote(target_id, safe='')}",
+                method="GET",
+            )
+            with opener.open(request, timeout=5):
+                pass
+        except (URLError, HTTPError, TimeoutError) as exc:
+            raise _linux_error(f"Could not close stale Chrome tab {target_id}.") from exc
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        tabs = _linux_list_google_chrome_tabs()
+        if len(tabs) == 1 and tabs[0].target_id == keep_id:
+            return
+        time.sleep(0.1)
+    raise _linux_error("Stale Chrome tabs did not close after opening the work tab.")
+
+
 def _coerce_javascript_result(value: Any) -> str:
     if value is None:
         return ""
@@ -902,7 +934,9 @@ def open_url_in_existing_chrome(target_url: str) -> ChromeTabRef:
     if not _is_mac_backend():
         if _linux_should_use_x11_backend():
             return _linux_x11_open_url_in_current_chrome(target_url)
-        return _linux_open_url_in_existing_chrome(target_url)
+        tab = _linux_open_url_in_existing_chrome(target_url)
+        _linux_close_other_tabs(tab)
+        return tab
     script = """
 on run argv
     set targetUrl to item 1 of argv
