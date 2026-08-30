@@ -2192,6 +2192,11 @@ def wait_for_response_stable(
     deadline = started_at + timeout_ms / 1000
     stable_since = time.monotonic()
     last_meaningful_progress = stable_since
+    # A Stop control is useful evidence that ChatGPT accepted the request, but
+    # it can itself get stuck on a stale page.  Treat DOM/result changes as
+    # progress; a static "Thinking" UI eventually enters refresh/reconcile.
+    active_no_progress_refresh_seconds = max(stall_refresh_seconds * 3, 180)
+    last_progress_signature = ""
     last_text = ""
     last_generated_images = 0
     refresh_count = 0
@@ -2288,6 +2293,7 @@ def wait_for_response_stable(
     generatedImages,
     assistantTurnCount: assistantRoots.length,
     latestTransient,
+    latestText,
   }});
 }})()
 """
@@ -2299,22 +2305,34 @@ def wait_for_response_stable(
         busy = bool(state.get("busy"))
         generated_images = int(state.get("generatedImages") or 0)
         now = time.monotonic()
-        if busy or current != last_text or generated_images != last_generated_images:
-            # A visible stop control, streaming text, or a changing image count
-            # is positive progress.  Never turn an active generation into a
-            # stall merely because it has taken a long time.
+        progress_signature = json.dumps(
+            {
+                "text": str(state.get("latestText") or ""),
+                "assistant_turns": int(state.get("assistantTurnCount") or 0),
+                "images": generated_images,
+                "transient": bool(state.get("latestTransient")),
+            },
+            sort_keys=True,
+        )
+        if progress_signature != last_progress_signature:
+            # A changing response, turn count, placeholder or image count is
+            # meaningful activity.  A merely persistent Stop button is not.
             last_meaningful_progress = now
+            last_progress_signature = progress_signature
         should_refresh = (
             provider == "chatgpt"
-            and not busy
             and stall_refresh_seconds > 0
             and refresh_count < max_stall_refreshes
-            and now - last_meaningful_progress >= stall_refresh_seconds
+            and (
+                (not busy and now - last_meaningful_progress >= stall_refresh_seconds)
+                or (busy and now - last_meaningful_progress >= active_no_progress_refresh_seconds)
+            )
         )
         if should_refresh:
             refresh_count += 1
+            reason = "active UI stopped making progress" if busy else "page is idle with no new result"
             message = (
-                "ChatGPT response is still pending. Refreshing the exact conversation "
+                f"ChatGPT response is still pending ({reason}). Refreshing the exact conversation "
                 f"to reconcile the latest assistant turn ({refresh_count}/{max_stall_refreshes})."
             )
             if recovery_callback is not None:
@@ -2344,6 +2362,7 @@ def wait_for_response_stable(
             last_meaningful_progress = stable_since
             last_text = ""
             last_generated_images = 0
+            last_progress_signature = ""
             continue
         stable_elapsed = time.monotonic() - stable_since
         if current and current != last_text:

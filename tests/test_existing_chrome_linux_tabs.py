@@ -266,7 +266,7 @@ def test_wait_for_chatgpt_response_refreshes_same_chat_and_recovers_answer(
     assert len(refreshed) == 1
     assert "conversation-123" in refreshed[0]
     assert recovery_messages == [
-        "ChatGPT response is still pending. Refreshing the exact conversation "
+        "ChatGPT response is still pending (page is idle with no new result). Refreshing the exact conversation "
         "to reconcile the latest assistant turn (1/1)."
     ]
     assert any("assistantAfterExcludedUser" in script for script in probes)
