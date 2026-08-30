@@ -1357,6 +1357,12 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim();
+  const effortSlider = document.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
+  if (effortSlider) {
+    const current = Number(effortSlider.getAttribute("aria-valuenow"));
+    const maximum = Number(effortSlider.getAttribute("aria-valuemax"));
+    return current === maximum ? "high" : "opened";
+  }
   const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"], [data-testid*="reasoning" i][aria-haspopup="menu"]'))
     .find(visible);
   if (!pill) return "unavailable";
@@ -1388,6 +1394,18 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
+  const slider = document.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
+  const sliderControl = slider?.closest('[data-model-reasoning-effort-slider]')?.closest('[role="menuitem"]');
+  if (slider && sliderControl) {
+    const current = Number(slider.getAttribute("aria-valuenow"));
+    const maximum = Number(slider.getAttribute("aria-valuemax"));
+    if (current >= maximum) return "selected";
+    sliderControl.focus();
+    sliderControl.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowRight", code: "ArrowRight", bubbles: true, cancelable: true,
+    }));
+    return "selected";
+  }
   const high = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], button, [role="button"]'))
     .filter(visible)
     .find((el) => (label(el) === "high" || /reasoning effort:\s*high/.test(label(el)))
