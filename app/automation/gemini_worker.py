@@ -102,6 +102,26 @@ def _provider_name(provider: Provider) -> str:
     return "ChatGPT" if provider == "chatgpt" else "Gemini"
 
 
+def _verify_chatgpt_project_tab(
+    tab: ChromeTabRef,
+    *,
+    app_settings: Settings,
+    runtime: WorkerRuntime | None,
+) -> None:
+    """Refuse a new project job if Chrome did not stay on its configured project URL."""
+    project_url = (app_settings.chatgpt_project_url or "").rstrip("/")
+    if not project_url:
+        return
+    info = get_tab_info(tab)
+    current_url = (info.url if info is not None else "").rstrip("/")
+    if current_url != project_url:
+        raise GeminiAutomationError(
+            "ChatGPT did not open the configured project URL; refusing to submit into a normal chat."
+        )
+    if runtime is not None:
+        runtime.append_log("Verified the configured ChatGPT Project URL before creating the new chat.")
+
+
 def _browser_platform_label(app_settings: Settings) -> str:
     platform_name = (app_settings.browser_platform or "").strip().lower()
     if platform_name in {"darwin", "mac", "macos"}:
@@ -763,6 +783,8 @@ def _run_gemini_job_in_existing_chrome(
             opened = adapter.open_tab(target_url=target_url or _provider_new_chat_url(resolved, job.provider))
             tab = opened.ref
             _remember_tab(runtime, tab)
+            if job.provider == "chatgpt" and target_url is None:
+                _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
         else:
             if runtime is not None:
                 runtime.update_status("opening_provider_tab")
@@ -794,6 +816,8 @@ def _run_gemini_job_in_existing_chrome(
             runtime=runtime,
             recovery_url=job.conversation_url,
         )
+        if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
+            _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
 
         if job.mode == "image_generate":
             activated = activate_create_image_mode(tab, provider=job.provider)
