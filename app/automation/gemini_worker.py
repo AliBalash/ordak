@@ -5,6 +5,7 @@ import mimetypes
 from pathlib import Path
 import time
 from typing import Callable
+from urllib.parse import urlparse
 import uuid
 
 from app.agent import run_agent_job
@@ -109,12 +110,31 @@ def _verify_chatgpt_project_tab(
     runtime: WorkerRuntime | None,
 ) -> None:
     """Refuse a new project job if Chrome did not stay on its configured project URL."""
-    project_url = (app_settings.chatgpt_project_url or "").rstrip("/")
+    project_url = app_settings.chatgpt_project_url or ""
     if not project_url:
         return
     info = get_tab_info(tab)
-    current_url = (info.url if info is not None else "").rstrip("/")
-    if current_url != project_url:
+    current_url = info.url if info is not None else ""
+    configured = urlparse(project_url)
+    current = urlparse(current_url)
+    configured_parts = [part for part in configured.path.split("/") if part]
+    current_parts = [part for part in current.path.split("/") if part]
+    # ChatGPT may immediately restore a project conversation as
+    # /g/<project-id>-<workspace>/c/<conversation-id>.  This remains inside
+    # the configured project; only a generic /c/... route is unsafe here.
+    project_slug = configured_parts[1] if len(configured_parts) >= 2 and configured_parts[0] == "g" else ""
+    project_scoped = (
+        current.scheme == configured.scheme
+        and current.netloc == configured.netloc
+        and len(current_parts) >= 2
+        and current_parts[0] == "g"
+        and project_slug
+        and (
+            current_parts[1] == project_slug
+            or current_parts[1].startswith(f"{project_slug}-")
+        )
+    )
+    if not project_scoped:
         raise GeminiAutomationError(
             "ChatGPT did not open the configured project URL; refusing to submit into a normal chat."
         )
