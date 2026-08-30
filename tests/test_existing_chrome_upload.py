@@ -145,6 +145,8 @@ def test_insert_prompt_fallback_avoids_trusted_html_innerhtml(monkeypatch) -> No
     def fake_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
         scripts.append(javascript)
         assert 'target.innerHTML = ""' not in javascript
+        if "reasoning effort" in javascript:
+            return "high"
         if "target.replaceChildren();" in javascript:
             return "ok"
         return "ok"
@@ -158,6 +160,21 @@ def test_insert_prompt_fallback_avoids_trusted_html_innerhtml(monkeypatch) -> No
     )
 
     assert any("target.replaceChildren();" in script for script in scripts)
+
+
+def test_chatgpt_high_effort_is_verified_before_prompt(monkeypatch) -> None:
+    from app.automation.existing_chrome import ensure_chatgpt_high_effort
+
+    seen = []
+
+    def fake_execute(tab, javascript):
+        seen.append(javascript)
+        return "high"
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    ensure_chatgpt_high_effort(ChromeTabRef(window_id=1, tab_id=2))
+    assert len(seen) == 1
+    assert "reasoning effort" in seen[0]
 
 
 def test_chatgpt_submit_accepts_busy_state_without_duplicate_retry(monkeypatch) -> None:

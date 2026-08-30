@@ -1346,6 +1346,61 @@ def inspect_upload_state(
     return json.loads(execute_javascript(tab, readiness_probe) or "{}")
 
 
+def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
+    """Select and verify ChatGPT's visible reasoning-effort control is High.
+
+    The control has changed labels and markup several times.  This deliberately
+    uses visible button/menu semantics and verifies the resulting state instead
+    of assuming a click succeeded.
+    """
+    inspect_script = r"""
+(() => {
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim();
+  const controls = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"]'))
+    .filter(visible)
+    .map((el) => ({ el, label: label(el), normalized: label(el).toLowerCase() }));
+  if (controls.some(({ normalized }) => normalized === "high" || /reasoning effort:\s*high/.test(normalized))) return "high";
+  const trigger = controls.find(({ normalized }) => /^(instant|low|medium|standard|extended|high)$/.test(normalized)
+    || /reasoning effort|thinking effort/.test(normalized));
+  if (!trigger) return "unavailable";
+  ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
+    trigger.el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
+  );
+  return "opened";
+})()
+"""
+    state = execute_javascript(tab, inspect_script).strip()
+    if state == "high":
+        return
+    if state != "opened":
+        raise RuntimeError("ChatGPT reasoning-effort control is unavailable; High effort could not be verified.")
+    deadline = time.monotonic() + 8
+    select_script = r"""
+(() => {
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
+  const high = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"]'))
+    .filter(visible)
+    .find((el) => label(el) === "high" || /reasoning effort:\s*high/.test(label(el)));
+  if (!high) return "waiting";
+  ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
+    high.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
+  );
+  return "selected";
+})()
+"""
+    while time.monotonic() < deadline:
+        if execute_javascript(tab, select_script).strip() == "selected":
+            # The UI closes the picker and shows the selected effort as a
+            # visible button. Verify that state before any prompt is inserted.
+            time.sleep(0.4)
+            if execute_javascript(tab, inspect_script).strip() == "high":
+                return
+        time.sleep(0.25)
+    raise RuntimeError("ChatGPT reasoning effort could not be set to High.")
+
+
 def insert_prompt(
     tab: ChromeTabRef,
     prompt: str,
@@ -1367,6 +1422,8 @@ def insert_prompt(
                 f"Could not insert prompt into {PROVIDER_LABELS[provider]} in the current Chrome tab."
             )
         return
+    if provider == "chatgpt":
+        ensure_chatgpt_high_effort(tab)
     payload = json.dumps(prompt, ensure_ascii=False)
     script = f"""
 (() => {{
@@ -1533,6 +1590,7 @@ def submit_prompt(
     )
     verification_script = """
 (() => {
+  const isVisible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const selectors = __SELECTORS__;
   const target = selectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
