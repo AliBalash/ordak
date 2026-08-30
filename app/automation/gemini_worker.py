@@ -639,6 +639,7 @@ def _attach_uploads_in_existing_chrome(
             mime_type=mime_type,
             timeout_ms=min(app_settings.browser_timeout_ms, 90_000),
             provider=provider,
+            cumulative_file_paths=upload_paths[:index],
         )
         upload_state = get_provider_adapter(provider).verify_upload_complete(tab)
         if not (

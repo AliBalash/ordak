@@ -760,6 +760,35 @@ def _linux_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
             return _coerce_javascript_result(value)
 
 
+def _linux_set_chatgpt_file_input_files(tab: ChromeTabRef, file_paths: list[Path]) -> None:
+    """Use CDP's trusted file chooser path for ChatGPT's hidden uploader."""
+    info = _linux_find_tab(tab)
+    if info is None or not info.websocket_debugger_url:
+        raise _linux_error("Could not find the requested Google Chrome tab.")
+    with websocket_connect(info.websocket_debugger_url, proxy=None, open_timeout=5, close_timeout=5) as websocket:
+        request_id = 0
+
+        def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal request_id
+            request_id += 1
+            websocket.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
+            while True:
+                message = json.loads(websocket.recv())
+                if message.get("id") != request_id:
+                    continue
+                if message.get("error"):
+                    raise RuntimeError(str(message["error"].get("message") or "Chrome DevTools file upload failed."))
+                return message.get("result", {})
+
+        document = call("DOM.getDocument", {"depth": 1})
+        root_id = int(document["root"]["nodeId"])
+        node = call("DOM.querySelector", {"nodeId": root_id, "selector": "#upload-files"})
+        node_id = int(node.get("nodeId") or 0)
+        if not node_id:
+            raise RuntimeError("ChatGPT upload input is not available in the current tab.")
+        call("DOM.setFileInputFiles", {"files": [str(path.resolve()) for path in file_paths], "nodeId": node_id})
+
+
 def _run_osascript(script: str, *args: str) -> str:
     command = ["osascript", "-"] + list(args)
     result = subprocess.run(
@@ -1079,6 +1108,63 @@ def upload_local_file(
     mime_type: str,
     timeout_ms: int = 90_000,
     provider: ProviderName = "gemini",
+    cumulative_file_paths: list[Path] | None = None,
+) -> None:
+    if provider == "chatgpt" and platform.system().lower() == "linux" and not _linux_should_use_x11_backend():
+        files = cumulative_file_paths or [file_path]
+        _linux_set_chatgpt_file_input_files(tab, files)
+        execute_javascript(tab, "window.__codexUploadStatus = 'awaiting-ack'; 'ok'")
+    else:
+        _upload_local_file_via_javascript(
+            tab,
+            file_path=file_path,
+            file_name=file_name,
+            mime_type=mime_type,
+            provider=provider,
+        )
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    ready_checks = 0
+    while time.monotonic() < deadline:
+        state = execute_javascript(
+            tab,
+            """
+(() => window.__codexUploadStatus || "pending")()
+""",
+        ).strip()
+        if state.startswith("error:"):
+            raise RuntimeError(state.removeprefix("error:").strip() or "Image upload failed.")
+        if state in {"attached", "awaiting-ack", "done"}:
+            upload_state = inspect_upload_state(tab, provider=provider)
+            if (
+                upload_state.get("attachment")
+                and upload_state.get("hasPreview")
+                and not upload_state.get("loading")
+                and upload_state.get("submitReady", True)
+            ):
+                ready_checks += 1
+                if ready_checks >= 2:
+                    execute_javascript(
+                        tab,
+                        '''(() => {
+  window.__codexUploadStatus = "done";
+  return "ok";
+})()''',
+                    )
+                    return
+            else:
+                ready_checks = 0
+        time.sleep(1)
+    raise TimeoutError("Timed out while waiting for image upload in the current Chrome tab.")
+
+
+def _upload_local_file_via_javascript(
+    tab: ChromeTabRef,
+    *,
+    file_path: Path,
+    file_name: str,
+    mime_type: str,
+    provider: ProviderName,
 ) -> None:
     payload_name = json.dumps(file_name, ensure_ascii=False)
     payload_mime = json.dumps(mime_type, ensure_ascii=False)
@@ -1269,42 +1355,6 @@ def upload_local_file(
     result = execute_javascript(tab, bootstrap)
     if result != "started":
         raise RuntimeError("Could not start image upload in the current Chrome tab.")
-
-    deadline = time.monotonic() + timeout_ms / 1000
-    ready_checks = 0
-    while time.monotonic() < deadline:
-        state = execute_javascript(
-            tab,
-            """
-(() => window.__codexUploadStatus || "pending")()
-""",
-        ).strip()
-        if state.startswith("error:"):
-            raise RuntimeError(state.removeprefix("error:").strip() or "Image upload failed.")
-        if state in {"attached", "awaiting-ack", "done"}:
-            upload_state = inspect_upload_state(tab, provider=provider)
-            if (
-                upload_state.get("attachment")
-                and upload_state.get("hasPreview")
-                and not upload_state.get("loading")
-                and upload_state.get("submitReady", True)
-            ):
-                ready_checks += 1
-                if ready_checks >= 2:
-                    execute_javascript(
-                        tab,
-                        """
-(() => {
-  window.__codexUploadStatus = "done";
-  return "ok";
-})()
-""",
-                    )
-                    return
-            else:
-                ready_checks = 0
-        time.sleep(1)
-    raise TimeoutError("Timed out while waiting for image upload in the current Chrome tab.")
 
 
 def inspect_upload_state(
