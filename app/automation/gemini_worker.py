@@ -17,6 +17,7 @@ from app.automation.existing_chrome import (
     activate_create_image_mode,
     execute_javascript,
     get_tab_info,
+    wait_for_chatgpt_workspace_ready,
     insert_prompt as insert_prompt_existing,
     is_google_chrome_running,
     upload_local_file,
@@ -228,6 +229,11 @@ def _prepare_and_submit_prompt(
             _runtime_checkpoint(runtime)
         adapter.find_prompt_input(tab, timeout_ms=min(app_settings.browser_timeout_ms, 60_000))
         _map_login_error(provider, adapter.detect_login_state(tab))
+        if provider == "chatgpt":
+            wait_for_chatgpt_workspace_ready(
+                tab,
+                timeout_ms=min(app_settings.browser_timeout_ms, 60_000),
+            )
         insert_prompt_existing(tab, prompt, provider=provider)
 
         if runtime is not None:

@@ -1357,12 +1357,12 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim();
-  const controls = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"]'))
-    .filter(visible)
-    .map((el) => ({ el, label: label(el), normalized: label(el).toLowerCase() }));
-  if (controls.some(({ normalized }) => normalized === "high" || /reasoning effort:\s*high/.test(normalized))) return "high";
-  const trigger = controls.find(({ normalized }) => /^(instant|low|medium|standard|extended|high)$/.test(normalized)
-    || /reasoning effort|thinking effort/.test(normalized));
+  const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"], [data-testid*="reasoning" i][aria-haspopup="menu"]'))
+    .find(visible);
+  if (!pill) return "unavailable";
+  const selected = label(pill).toLowerCase();
+  if (selected === "high" || /reasoning effort:\s*high/.test(selected)) return "high";
+  const trigger = pill;
   if (!trigger) return "unavailable";
   ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
     trigger.el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
@@ -1388,9 +1388,10 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
-  const high = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"]'))
+  const high = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], button, [role="button"]'))
     .filter(visible)
-    .find((el) => label(el) === "high" || /reasoning effort:\s*high/.test(label(el)));
+    .find((el) => (label(el) === "high" || /reasoning effort:\s*high/.test(label(el)))
+      && !el.matches('.__composer-pill'));
   if (!high) return "waiting";
   ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
     high.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
@@ -1407,6 +1408,40 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
                 return
         time.sleep(0.25)
     raise RuntimeError("ChatGPT reasoning effort could not be set to High.")
+
+
+def wait_for_chatgpt_workspace_ready(
+    tab: ChromeTabRef,
+    *,
+    timeout_ms: int = 60_000,
+) -> None:
+    """Require a hydrated ChatGPT sidebar before treating a new tab as usable."""
+    probe = r"""
+(() => {
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const sidebar = Array.from(document.querySelectorAll('nav[aria-label="Chat history"], [aria-label="Chat history"]'))
+    .find(visible);
+  const text = (sidebar?.innerText || "").trim();
+  const hasRecent = /\bRecents\b/i.test(text);
+  const chats = sidebar ? Array.from(sidebar.querySelectorAll('a[href*="/c/"]')).filter(visible).length : 0;
+  const loading = sidebar ? Array.from(sidebar.querySelectorAll('[class*="skeleton" i], [class*="loading" i], [aria-busy="true"]')).some(visible) : true;
+  return JSON.stringify({ sidebar: !!sidebar, hasNavigation: /ChatGPT/i.test(text) && /New chat/i.test(text), hasRecent, chats, loading });
+})()
+"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        state = json.loads(execute_javascript(tab, probe) or "{}")
+        if (
+            state.get("sidebar")
+            and state.get("hasNavigation")
+            and not state.get("loading")
+            and (state.get("hasRecent") or int(state.get("chats") or 0) > 0)
+        ):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        "ChatGPT sidebar/chat history did not finish loading; refusing to submit into a partially loaded page."
+    )
 
 
 def insert_prompt(

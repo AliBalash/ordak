@@ -189,6 +189,10 @@ def install_fake_adapter(monkeypatch: pytest.MonkeyPatch, adapter: FakeAdapter) 
     monkeypatch.setattr("app.automation.gemini_worker.insert_prompt_existing", lambda tab, prompt, provider="gemini": adapter.inserted.append(prompt))
     monkeypatch.setattr("app.automation.gemini_worker.activate_create_image_mode", lambda tab, provider="gemini": True)
     monkeypatch.setattr("app.automation.gemini_worker.upload_local_file", lambda *args, **kwargs: None)
+    # Browser hydration is covered directly in existing_chrome tests.  Worker
+    # tests use synthetic tab references and should not reach the live CDP
+    # transport while exercising their recovery logic.
+    monkeypatch.setattr("app.automation.gemini_worker.wait_for_chatgpt_workspace_ready", lambda *args, **kwargs: None)
 
 
 def generic_worker_settings():
