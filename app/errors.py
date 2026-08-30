@@ -15,6 +15,7 @@ class ErrorCode(StrEnum):
     PROVIDER_UI_CHANGED = "provider_ui_changed"
     PROJECT_URL_MISSING = "project_url_missing"
     CHROME_NOT_OPEN = "chrome_not_open"
+    CHROME_CONTROL_UNAVAILABLE = "chrome_control_unavailable"
     APPLE_EVENTS_BLOCKED = "apple_events_blocked"
     AGENT_DISABLED = "agent_disabled"
     AGENT_TARGET_NOT_CONFIGURED = "agent_target_not_configured"
@@ -110,6 +111,13 @@ ERROR_DESCRIPTORS: dict[ErrorCode, ErrorDescriptor] = {
         title="Chrome is not open",
         message="Google Chrome is not currently open.",
         suggested_action="Open your regular Google Chrome first, then retry.",
+        recoverable=True,
+    ),
+    ErrorCode.CHROME_CONTROL_UNAVAILABLE: ErrorDescriptor(
+        code=ErrorCode.CHROME_CONTROL_UNAVAILABLE,
+        title="Chrome control unavailable",
+        message="The configured Chrome profile is running but Ordak cannot attach through DevTools.",
+        suggested_action="Restart that exact Chrome profile with DevTools enabled, then resume the job. Ordak will not open a fallback profile.",
         recoverable=True,
     ),
     ErrorCode.APPLE_EVENTS_BLOCKED: ErrorDescriptor(
