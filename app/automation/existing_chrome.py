@@ -1365,7 +1365,7 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
   const trigger = pill;
   if (!trigger) return "unavailable";
   ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
-    trigger.el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
+    trigger.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
   );
   return "opened";
 })()

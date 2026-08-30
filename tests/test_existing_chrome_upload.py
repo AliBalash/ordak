@@ -177,6 +177,23 @@ def test_chatgpt_high_effort_is_verified_before_prompt(monkeypatch) -> None:
     assert "reasoning effort" in seen[0]
 
 
+def test_chatgpt_high_effort_uses_the_visible_composer_control(monkeypatch) -> None:
+    from app.automation.existing_chrome import ensure_chatgpt_high_effort
+
+    replies = iter(["opened", "selected", "high"])
+    seen: list[str] = []
+
+    def fake_execute(tab, javascript):
+        seen.append(javascript)
+        return next(replies)
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+    ensure_chatgpt_high_effort(ChromeTabRef(window_id=1, tab_id=2))
+    assert "trigger.dispatchEvent" in seen[0]
+    assert "trigger.el" not in seen[0]
+
+
 def test_chatgpt_submit_accepts_busy_state_without_duplicate_retry(monkeypatch) -> None:
     from app.automation.existing_chrome import submit_prompt
 
