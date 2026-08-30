@@ -1370,12 +1370,20 @@ def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
   return "opened";
 })()
 """
-    state = execute_javascript(tab, inspect_script).strip()
+    # A just-created ChatGPT tab often renders the composer before the effort
+    # picker. Wait for that UI state instead of treating transient hydration as
+    # a selector failure.
+    deadline = time.monotonic() + 30
+    state = "unavailable"
+    while time.monotonic() < deadline:
+        state = execute_javascript(tab, inspect_script).strip()
+        if state in {"high", "opened"}:
+            break
+        time.sleep(0.5)
     if state == "high":
         return
     if state != "opened":
-        raise RuntimeError("ChatGPT reasoning-effort control is unavailable; High effort could not be verified.")
-    deadline = time.monotonic() + 8
+        raise RuntimeError("ChatGPT reasoning-effort control is unavailable after waiting; High effort could not be verified.")
     select_script = r"""
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
