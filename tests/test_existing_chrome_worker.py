@@ -220,6 +220,28 @@ def test_chat_job_fails_when_google_chrome_is_closed(monkeypatch: pytest.MonkeyP
     ]
 
 
+def test_chat_job_reports_running_but_uncontrollable_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker._ensure_linux_browser_ready",
+        lambda *args: (_ for _ in ()).throw(RuntimeError(
+            "Configured Google Chrome is already running but DevTools is not reachable."
+        )),
+    )
+
+    with pytest.raises(GeminiAutomationError, match="already running but DevTools"):
+        run_gemini_job(
+            "job-uncontrollable-chrome",
+            GeminiJobRequest(question="hello", provider="chatgpt", start_new_chat=True),
+            runtime=runtime,
+            app_settings=replace(settings, browser_platform="linux"),
+        )
+
+    assert runtime.errors[-1][2] == "chrome_control_unavailable"
+
+
 def test_chat_job_uses_adapter_open_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
