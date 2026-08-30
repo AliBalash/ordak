@@ -1134,6 +1134,12 @@ def upload_local_file(
     const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
     for (const input of inputs) {{
       const dataTransfer = new DataTransfer();
+      // ChatGPT accepts one cumulative FileList.  Replacing it with only the
+      // newest file silently drops the style anchor before the character
+      // anchor is submitted, so retain every already-attached file.
+      for (const existing of Array.from(input.files || [])) {{
+        dataTransfer.items.add(existing);
+      }}
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
       if (!input.files || input.files.length < 1) continue;

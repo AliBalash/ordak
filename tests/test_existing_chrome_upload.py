@@ -20,8 +20,10 @@ def test_upload_local_file_waits_until_loading_clears(monkeypatch, tmp_path: Pat
         "readiness_polls": 0,
         "marked_done": 0,
     }
+    scripts: list[str] = []
 
     def fake_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
+        scripts.append(javascript)
         assert tab == ChromeTabRef(window_id=1, tab_id=2)
         if 'return "started"' in javascript:
             return "started"
@@ -61,6 +63,7 @@ def test_upload_local_file_waits_until_loading_clears(monkeypatch, tmp_path: Pat
     assert calls["status_polls"] >= 1
     assert calls["readiness_polls"] >= 4
     assert calls["marked_done"] == 1
+    assert "for (const existing of Array.from(input.files || []))" in "\n".join(scripts)
 
 
 def test_upload_local_file_accepts_awaiting_ack_when_dom_readiness_catches_up(
