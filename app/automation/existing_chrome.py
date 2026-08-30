@@ -1027,7 +1027,7 @@ def activate_create_image_mode(
     label_pattern = (
         r"create image|image generation"
         if provider == "gemini"
-        else r"create image|generate image|4o image|image"
+        else r"create (?:an )?image|generate image|4o image|image"
     )
     menu_selectors = (
         ['[data-test-id="bard-mode-menu-button"]', 'button[aria-haspopup="menu"]']
