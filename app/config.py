@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT_DIR / ".env")
+ENV_FILE = Path(
+    os.path.expanduser(os.getenv("ORDAK_ENV_FILE", str(ROOT_DIR / ".env")))
+).resolve()
+load_dotenv(ENV_FILE, override=False)
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
