@@ -2200,6 +2200,7 @@ def wait_for_response_stable(
     last_text = ""
     last_generated_images = 0
     refresh_count = 0
+    reconciled_after_refresh = False
     payload = json.dumps(excluded_text, ensure_ascii=False)
     previous_payload = json.dumps(previous_response, ensure_ascii=False)
     previous_turn_count_payload = json.dumps(previous_assistant_turn_count)
@@ -2305,6 +2306,11 @@ def wait_for_response_stable(
         busy = bool(state.get("busy"))
         generated_images = int(state.get("generatedImages") or 0)
         now = time.monotonic()
+        if reconciled_after_refresh and not busy and not current and generated_images == 0:
+            # The exact conversation has been reloaded, its sidebar/composer
+            # is ready, and there is no server-side result to reconcile.  The
+            # caller may now safely reattach references and resubmit once.
+            raise TimeoutError("__ORD_RECONCILED_IDLE_INCOMPLETE__")
         progress_signature = json.dumps(
             {
                 "text": str(state.get("latestText") or ""),
@@ -2351,6 +2357,11 @@ def wait_for_response_stable(
                 pass
             time.sleep(4)
             try:
+                if provider == "chatgpt":
+                    wait_for_chatgpt_workspace_ready(
+                        tab,
+                        timeout_ms=min(30_000, max(1_000, int((deadline - time.monotonic()) * 1000))),
+                    )
                 wait_for_prompt_input(
                     tab,
                     timeout_ms=min(30_000, max(1_000, int((deadline - time.monotonic()) * 1000))),
@@ -2363,6 +2374,7 @@ def wait_for_response_stable(
             last_text = ""
             last_generated_images = 0
             last_progress_signature = ""
+            reconciled_after_refresh = True
             continue
         stable_elapsed = time.monotonic() - stable_since
         if current and current != last_text:

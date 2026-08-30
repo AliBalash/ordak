@@ -835,31 +835,60 @@ def _run_gemini_job_in_existing_chrome(
                 runtime.append_log(
                     f"Waiting for {_provider_name(job.provider)} to finish generating a stable response."
                 )
-            try:
-                answer = adapter.wait_for_response(
-                    tab,
-                    timeout_ms=_provider_response_timeout_ms(resolved, job.provider),
-                    stable_seconds=_provider_stable_seconds(resolved, job.provider),
-                    excluded_text=effective_prompt,
-                    expect_images=True,
-                    should_cancel=getattr(runtime, "should_cancel", None) if runtime is not None else None,
-                    stall_refresh_seconds=resolved.chatgpt_stall_refresh_seconds,
-                    max_stall_refreshes=resolved.chatgpt_max_stall_refreshes,
-                    recovery_callback=(
-                        lambda message: runtime.append_log(message, level="warning")
-                        if runtime is not None else None
-                    ),
-                )
-            except TimeoutError as exc:
-                if str(exc) == "__ORD_CANCELLED__":
-                    raise JobCancelled() from exc
-                adapter.best_effort_stop(tab)
-                _raise_structured_error(
-                    OrdaKError(
-                        code=ErrorCode.RESPONSE_TIMEOUT,
-                        message=f"{_provider_name(job.provider)} did not finish response within the timeout.",
+            resubmits = 0
+            while True:
+                try:
+                    answer = adapter.wait_for_response(
+                        tab,
+                        timeout_ms=_provider_response_timeout_ms(resolved, job.provider),
+                        stable_seconds=_provider_stable_seconds(resolved, job.provider),
+                        excluded_text=effective_prompt,
+                        expect_images=True,
+                        should_cancel=getattr(runtime, "should_cancel", None) if runtime is not None else None,
+                        stall_refresh_seconds=resolved.chatgpt_stall_refresh_seconds,
+                        max_stall_refreshes=resolved.chatgpt_max_stall_refreshes,
+                        recovery_callback=(
+                            lambda message: runtime.append_log(message, level="warning")
+                            if runtime is not None else None
+                        ),
                     )
-                )
+                    break
+                except TimeoutError as exc:
+                    if str(exc) == "__ORD_CANCELLED__":
+                        raise JobCancelled() from exc
+                    # wait_for_response_stable emits this marker only after a
+                    # refresh/reopen found a healthy, idle page with no new
+                    # image.  It is the sole safe point for a bounded resend.
+                    if (
+                        str(exc) == "__ORD_RECONCILED_IDLE_INCOMPLETE__"
+                        and resubmits < 1
+                    ):
+                        resubmits += 1
+                        if runtime is not None:
+                            runtime.append_log(
+                                "Reconciliation found no generated image on an idle ChatGPT page; resubmitting once.",
+                                level="warning",
+                            )
+                        if job.uploads:
+                            _attach_uploads_in_existing_chrome(
+                                tab, job.uploads, resolved, job.provider, runtime
+                            )
+                        _prepare_and_submit_prompt(
+                            tab=tab,
+                            adapter=adapter,
+                            provider=job.provider,
+                            prompt=effective_prompt,
+                            runtime=runtime,
+                            app_settings=resolved,
+                        )
+                        continue
+                    adapter.best_effort_stop(tab)
+                    _raise_structured_error(
+                        OrdaKError(
+                            code=ErrorCode.RESPONSE_TIMEOUT,
+                            message=f"{_provider_name(job.provider)} did not finish response within the timeout.",
+                        )
+                    )
             if runtime is not None:
                 runtime.update_status("extracting_answer")
                 runtime.append_log("Extracting the final response from the current Google Chrome tab.")

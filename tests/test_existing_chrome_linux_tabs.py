@@ -240,6 +240,10 @@ def test_wait_for_chatgpt_response_refreshes_same_chat_and_recovers_answer(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
+        "app.automation.existing_chrome.wait_for_chatgpt_workspace_ready",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
         "app.automation.existing_chrome.get_tab_info",
         lambda tab: ChromeTabInfo(
             window_id=0,
