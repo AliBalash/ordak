@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -270,6 +271,21 @@ def _linux_launch_remote_debugging_chrome(
             f"Configured Chrome profile '{profile_name}' was not found in {user_data_dir}. "
             "Ordak will not create or fall back to another profile."
         )
+    # Chrome 136+ deliberately ignores remote-debugging switches when it
+    # decides the supplied path is its default data directory.  Keep using the
+    # exact configured profile, but isolate HOME/XDG runtime defaults so that
+    # this explicit user-data-dir is not treated as a default-profile request.
+    # No profile files are copied or created in this launch home.
+    launch_home = resolved.browser_runtime_root_dir / "devtools-launch-home"
+    launch_home.mkdir(parents=True, exist_ok=True)
+    launch_env = os.environ.copy()
+    launch_env.update(
+        {
+            "HOME": str(launch_home),
+            "XDG_CONFIG_HOME": str(launch_home / ".config"),
+            "XDG_CACHE_HOME": str(launch_home / ".cache"),
+        }
+    )
     launch_url = target_url or "about:blank"
     cmd = [
         str(resolved.browser_executable_path),
@@ -282,12 +298,15 @@ def _linux_launch_remote_debugging_chrome(
         "--no-default-browser-check",
         launch_url,
     ]
-    subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    log_path = resolved.browser_log_dir / "chrome-devtools-launch.log"
+    with log_path.open("ab") as log_file:
+        subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=log_file,
+            env=launch_env,
+            start_new_session=True,
+        )
 
 
 def _wait_for_linux_remote_debugging(app_settings: Settings | None = None) -> None:

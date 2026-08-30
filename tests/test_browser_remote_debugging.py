@@ -107,9 +107,10 @@ def test_linux_launch_remote_debugging_chrome_uses_ordak_profile(
     (local_settings.browser_user_data_dir / local_settings.browser_profile_name).mkdir(parents=True)
     commands: list[list[str]] = []
 
+    launch_kwargs = []
     monkeypatch.setattr(
         "app.automation.browser.subprocess.Popen",
-        lambda cmd, **kwargs: commands.append(cmd),
+        lambda cmd, **kwargs: (commands.append(cmd), launch_kwargs.append(kwargs)),
     )
 
     _linux_launch_remote_debugging_chrome(
@@ -128,6 +129,8 @@ def test_linux_launch_remote_debugging_chrome_uses_ordak_profile(
         "--no-default-browser-check",
         "https://gemini.google.com/app",
     ]]
+    assert launch_kwargs[0]["env"]["HOME"].endswith("devtools-launch-home")
+    assert launch_kwargs[0]["env"]["XDG_CONFIG_HOME"].endswith("devtools-launch-home/.config")
 
 
 def test_open_profile_browser_session_on_linux_launches_and_opens_gemini_tab(
