@@ -358,6 +358,11 @@ def send_prompt_and_wait_for_text(
                 if runtime is not None
                 else None
             ),
+            "observation_callback": (
+                (lambda message: runtime.append_log(message, level="info"))
+                if runtime is not None
+                else None
+            ),
         }
         if previous_assistant_turn_count is not None:
             wait_options["previous_assistant_turn_count"] = previous_assistant_turn_count
@@ -850,6 +855,10 @@ def _run_gemini_job_in_existing_chrome(
                         max_stall_refreshes=resolved.chatgpt_max_stall_refreshes,
                         recovery_callback=(
                             lambda message: runtime.append_log(message, level="warning")
+                            if runtime is not None else None
+                        ),
+                        observation_callback=(
+                            lambda message: runtime.append_log(message, level="info")
                             if runtime is not None else None
                         ),
                     )

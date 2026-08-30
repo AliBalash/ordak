@@ -138,6 +138,7 @@ class FakeAdapter:
         stall_refresh_seconds: int = 0,
         max_stall_refreshes: int = 0,
         recovery_callback=None,
+        observation_callback=None,
     ) -> str:
         self.wait_previous_responses.append(previous_response)
         self.wait_previous_turn_counts.append(previous_assistant_turn_count)

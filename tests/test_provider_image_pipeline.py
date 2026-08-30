@@ -173,9 +173,10 @@ def test_wait_for_response_uses_full_timeout_window(monkeypatch) -> None:
         expect_images,
         provider,
         should_cancel=None,
-        stall_refresh_seconds=0,
-        max_stall_refreshes=0,
-        recovery_callback=None,
+            stall_refresh_seconds=0,
+            max_stall_refreshes=0,
+            recovery_callback=None,
+            observation_callback=None,
     ):
         captured.update(
             timeout_ms=timeout_ms,
@@ -187,8 +188,9 @@ def test_wait_for_response_uses_full_timeout_window(monkeypatch) -> None:
             provider=provider,
             cancelled=bool(should_cancel and should_cancel()),
             stall_refresh_seconds=stall_refresh_seconds,
-            max_stall_refreshes=max_stall_refreshes,
-            has_recovery_callback=recovery_callback is not None,
+                max_stall_refreshes=max_stall_refreshes,
+                has_recovery_callback=recovery_callback is not None,
+                has_observation_callback=observation_callback is not None,
         )
         return "final answer"
 
@@ -216,6 +218,7 @@ def test_wait_for_response_uses_full_timeout_window(monkeypatch) -> None:
         "stall_refresh_seconds": 0,
         "max_stall_refreshes": 0,
         "has_recovery_callback": False,
+        "has_observation_callback": False,
     }
 
 

@@ -2233,6 +2233,8 @@ def wait_for_response_stable(
     stall_refresh_seconds: int = 0,
     max_stall_refreshes: int = 0,
     recovery_callback: Callable[[str], None] | None = None,
+    observation_callback: Callable[[str], None] | None = None,
+    active_no_progress_refresh_seconds: int | None = None,
 ) -> str:
     if _linux_should_use_x11_backend():
         if provider != "gemini":
@@ -2262,12 +2264,18 @@ def wait_for_response_stable(
     # A Stop control is useful evidence that ChatGPT accepted the request, but
     # it can itself get stuck on a stale page.  Treat DOM/result changes as
     # progress; a static "Thinking" UI eventually enters refresh/reconcile.
-    active_no_progress_refresh_seconds = max(stall_refresh_seconds * 3, 180)
+    active_no_progress_refresh_seconds = (
+        active_no_progress_refresh_seconds
+        if active_no_progress_refresh_seconds is not None
+        else max(stall_refresh_seconds * 3, 180)
+    )
     last_progress_signature = ""
     last_text = ""
     last_generated_images = 0
     refresh_count = 0
     reconciled_after_refresh = False
+    last_observation = ""
+    last_observation_at = 0.0
     payload = json.dumps(excluded_text, ensure_ascii=False)
     previous_payload = json.dumps(previous_response, ensure_ascii=False)
     previous_turn_count_payload = json.dumps(previous_assistant_turn_count)
@@ -2356,6 +2364,10 @@ def wait_for_response_stable(
     if (/stopped thinking/.test(text)) return false;
     return /stop answering|stop generating|stop|cancel/.test(text);
   }});
+  const sidebar = document.querySelector('nav[aria-label="Chat history"]');
+  const sidebarReady = isVisible(sidebar)
+    && !Array.from(sidebar.querySelectorAll('[class*="skeleton" i], [data-testid*="skeleton" i]')).some(isVisible)
+    && Array.from(sidebar.querySelectorAll('a, button')).some((el) => isVisible(el));
   return JSON.stringify({{
     answer,
     busy,
@@ -2364,6 +2376,7 @@ def wait_for_response_stable(
     latestTransient,
     latestText,
     providerError,
+    sidebarReady,
   }});
 }})()
 """
@@ -2376,6 +2389,8 @@ def wait_for_response_stable(
         generated_images = int(state.get("generatedImages") or 0)
         now = time.monotonic()
         if bool(state.get("providerError")):
+            if observation_callback is not None:
+                observation_callback("ChatGPT observer: PROVIDER_ERROR detected in the visible page.")
             raise TimeoutError("__ORD_PROVIDER_ERROR__")
         if reconciled_after_refresh and not busy and not current and generated_images == 0:
             # The exact conversation has been reloaded, its sidebar/composer
@@ -2396,13 +2411,35 @@ def wait_for_response_stable(
             # meaningful activity.  A merely persistent Stop button is not.
             last_meaningful_progress = now
             last_progress_signature = progress_signature
+        no_progress_seconds = int(now - last_meaningful_progress)
+        if current or generated_images:
+            observation = "RESULT_PROGRESS"
+        elif busy and no_progress_seconds >= active_no_progress_refresh_seconds:
+            observation = "STALL_CANDIDATE"
+        elif busy:
+            observation = "ACTIVE_GENERATION"
+        elif not bool(state.get("sidebarReady")):
+            observation = "SIDEBAR_NOT_READY"
+        else:
+            observation = "IDLE_INCOMPLETE"
+        if observation_callback is not None and (
+            observation != last_observation or now - last_observation_at >= 15
+        ):
+            observation_callback(
+                "ChatGPT observer: "
+                f"{observation}; sidebar={'ready' if state.get('sidebarReady') else 'not-ready'}; "
+                f"busy={str(busy).lower()}; assistant_turns={int(state.get('assistantTurnCount') or 0)}; "
+                f"images={generated_images}; no_meaningful_progress={no_progress_seconds}s."
+            )
+            last_observation = observation
+            last_observation_at = now
         should_refresh = (
             provider == "chatgpt"
             and stall_refresh_seconds > 0
             and refresh_count < max_stall_refreshes
             and (
                 (not busy and now - last_meaningful_progress >= stall_refresh_seconds)
-                or (busy and now - last_meaningful_progress >= active_no_progress_refresh_seconds)
+                or (busy and no_progress_seconds >= active_no_progress_refresh_seconds)
             )
         )
         if should_refresh:

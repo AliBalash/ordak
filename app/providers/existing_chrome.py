@@ -183,6 +183,7 @@ class ExistingChromeProviderAdapter:
         stall_refresh_seconds: int = 0,
         max_stall_refreshes: int = 0,
         recovery_callback=None,
+        observation_callback=None,
     ) -> str:
         try:
             return wait_for_response_stable(
@@ -198,6 +199,7 @@ class ExistingChromeProviderAdapter:
                 stall_refresh_seconds=stall_refresh_seconds,
                 max_stall_refreshes=max_stall_refreshes,
                 recovery_callback=recovery_callback,
+                observation_callback=observation_callback,
             )
         except TimeoutError as exc:
             if str(exc) == "__ORD_CANCELLED__":

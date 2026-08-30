@@ -88,6 +88,7 @@ class ProviderAdapter(Protocol):
         stall_refresh_seconds: int = 0,
         max_stall_refreshes: int = 0,
         recovery_callback: Callable[[str], None] | None = None,
+        observation_callback: Callable[[str], None] | None = None,
     ) -> str: ...
 
     def extract_text_result(self, raw_text: str) -> str: ...
