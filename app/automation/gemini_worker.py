@@ -233,6 +233,7 @@ def _prepare_and_submit_prompt(
         else None
     )
     for attempt in range(3):
+        submit_started = time.perf_counter()
         if attempt:
             if runtime is not None:
                 recovery_action = (
@@ -282,6 +283,11 @@ def _prepare_and_submit_prompt(
             _runtime_checkpoint(runtime)
         try:
             adapter.submit_prompt(tab)
+            if runtime is not None:
+                runtime.append_log(
+                    "TIMING operation=prompt_submit "
+                    f"attempt={attempt + 1} elapsed_seconds={time.perf_counter() - submit_started:.3f}"
+                )
             return
         except RuntimeError as exc:
             last_error = exc
@@ -673,6 +679,7 @@ def _attach_uploads_in_existing_chrome(
     if not upload_paths:
         return
     for index, upload_path in enumerate(upload_paths, start=1):
+        upload_started = time.perf_counter()
         mime_type = mimetypes.guess_type(upload_path.name)[0] or "application/octet-stream"
         runtime and runtime.append_log(
             f"Attaching reference {index}/{len(upload_paths)} from {upload_path.name}."
@@ -701,6 +708,11 @@ def _attach_uploads_in_existing_chrome(
                     f"(provider reports {upload_state.get('attachmentCount', 0)} attachments)."
                 ),
             )
+        runtime and runtime.append_log(
+            "TIMING operation=reference_upload "
+            f"reference_index={index} reference_name={upload_path.name} "
+            f"elapsed_seconds={time.perf_counter() - upload_started:.3f}"
+        )
     runtime and runtime.append_log(f"All {len(upload_paths)} reference attachments are ready.")
 
 
