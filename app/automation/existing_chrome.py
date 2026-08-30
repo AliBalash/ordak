@@ -2319,6 +2319,7 @@ def wait_for_response_stable(
   const latestText = clean(latestAssistantRoot?.innerText || "");
   const latestUserText = clean(latestUserRoot?.innerText || "");
   const latestTransient = transientPatterns.some((pattern) => pattern.test(latestText));
+  const providerError = /something went wrong|network error|failed to load|error generating/i.test(document.body?.innerText || "");
   const exchangeMarker = clean(excluded).match(/ORDAK_EXCHANGE_ID_[a-f0-9]+/i)?.[0] || "";
   const latestUserMatchesExcluded = exchangeMarker
     ? latestUserText.includes(exchangeMarker)
@@ -2362,6 +2363,7 @@ def wait_for_response_stable(
     assistantTurnCount: assistantRoots.length,
     latestTransient,
     latestText,
+    providerError,
   }});
 }})()
 """
@@ -2373,6 +2375,8 @@ def wait_for_response_stable(
         busy = bool(state.get("busy"))
         generated_images = int(state.get("generatedImages") or 0)
         now = time.monotonic()
+        if bool(state.get("providerError")):
+            raise TimeoutError("__ORD_PROVIDER_ERROR__")
         if reconciled_after_refresh and not busy and not current and generated_images == 0:
             # The exact conversation has been reloaded, its sidebar/composer
             # is ready, and there is no server-side result to reconcile.  The

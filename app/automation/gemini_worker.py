@@ -302,7 +302,7 @@ def send_prompt_and_wait_for_text(
     prompt: str,
     runtime: WorkerRuntime | None,
     app_settings: Settings,
-    max_recoveries: int = 0,
+    max_recoveries: int = 1,
 ) -> str:
     exchange_prompt = (
         f"{prompt}\n\nORDAK_EXCHANGE_ID_{uuid.uuid4().hex}"
