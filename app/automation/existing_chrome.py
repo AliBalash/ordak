@@ -1032,7 +1032,7 @@ def activate_create_image_mode(
     menu_selectors = (
         ['[data-test-id="bard-mode-menu-button"]', 'button[aria-haspopup="menu"]']
         if provider == "gemini"
-        else ['button[aria-haspopup="menu"]', '#composer-plus-btn', 'button[aria-label*="tools" i]', 'button[aria-label*="more" i]']
+        else ['[data-testid="composer-plus-btn"]', '#composer-plus-btn', 'button[aria-label*="add files" i]', 'button[aria-label*="tools" i]']
     )
     script = """
 (() => {
@@ -1042,7 +1042,7 @@ def activate_create_image_mode(
       element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
     });
   };
-  const direct = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"]'))
+  const direct = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"], [tabindex]'))
     .find((el) => isVisible(el) && /__LABEL_PATTERN__/.test(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase()));
   if (direct) {
     clickLikeUser(direct);
