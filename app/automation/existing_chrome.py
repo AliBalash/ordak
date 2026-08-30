@@ -1500,32 +1500,29 @@ def wait_for_chatgpt_workspace_ready(
     *,
     timeout_ms: int = 60_000,
 ) -> None:
-    """Require a hydrated ChatGPT sidebar before treating a new tab as usable."""
+    """Require the ChatGPT workspace itself, not sidebar history, to be usable.
+
+    Project pages can keep their history panel virtualized or deferred for a
+    long time even while the authenticated composer is fully functional.
+    """
     probe = r"""
 (() => {
   const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const sidebar = Array.from(document.querySelectorAll('nav[aria-label="Chat history"], [aria-label="Chat history"]'))
-    .find(visible);
-  const text = (sidebar?.innerText || "").trim();
-  const hasRecent = /\bRecents\b/i.test(text);
-  const chats = sidebar ? Array.from(sidebar.querySelectorAll('a[href*="/c/"]')).filter(visible).length : 0;
-  const loading = sidebar ? Array.from(sidebar.querySelectorAll('[class*="skeleton" i], [class*="loading" i], [aria-busy="true"]')).some(visible) : true;
-  return JSON.stringify({ sidebar: !!sidebar, hasNavigation: /ChatGPT/i.test(text) && /New chat/i.test(text), hasRecent, chats, loading });
+  const composer = Array.from(document.querySelectorAll('#prompt-textarea, textarea, [contenteditable="true"]')).find(visible);
+  const blocking = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error" i]'))
+    .filter(visible)
+    .some((el) => /something went wrong|try again|network error/i.test(el.innerText || ""));
+  return JSON.stringify({ composer: !!composer, blocking });
 })()
 """
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         state = json.loads(execute_javascript(tab, probe) or "{}")
-        if (
-            state.get("sidebar")
-            and state.get("hasNavigation")
-            and not state.get("loading")
-            and (state.get("hasRecent") or int(state.get("chats") or 0) > 0)
-        ):
+        if state.get("composer") and not state.get("blocking"):
             return
         time.sleep(0.5)
     raise RuntimeError(
-        "ChatGPT sidebar/chat history did not finish loading; refusing to submit into a partially loaded page."
+        "ChatGPT composer did not become ready; refusing to submit into a partially loaded page."
     )
 
 
