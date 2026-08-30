@@ -1541,7 +1541,12 @@ def submit_prompt(
   const userCount = document.querySelectorAll(
     '[data-message-author-role="user"], [data-message-author-role="human"]'
   ).length;
-  return JSON.stringify({ promptEmpty: promptText === "", userCount });
+  const busy = Array.from(document.querySelectorAll('button, [role="button"]'))
+    .filter((el) => isVisible(el))
+    .some((el) => /stop answering|stop generating|stop|cancel/.test(
+      `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase()
+    ));
+  return JSON.stringify({ promptEmpty: promptText === "", userCount, busy });
 })()
 """.replace("__SELECTORS__", provider_selectors)
     while time.monotonic() < deadline:
@@ -1556,7 +1561,11 @@ def submit_prompt(
                 user_turn_added = int(
                     confirmation.get("userCount") or 0
                 ) > initial_user_count
-                if user_turn_added or (
+                # ChatGPT's current DOM can keep its user message outside the
+                # historical author-role selector. A visible Stop control is a
+                # stronger submission signal than that selector and prevents a
+                # duplicate resend while generation is already active.
+                if user_turn_added or confirmation.get("busy") or (
                     provider != "chatgpt" and confirmation.get("promptEmpty")
                 ):
                     return

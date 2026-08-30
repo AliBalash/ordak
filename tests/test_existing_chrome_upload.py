@@ -158,3 +158,25 @@ def test_insert_prompt_fallback_avoids_trusted_html_innerhtml(monkeypatch) -> No
     )
 
     assert any("target.replaceChildren();" in script for script in scripts)
+
+
+def test_chatgpt_submit_accepts_busy_state_without_duplicate_retry(monkeypatch) -> None:
+    from app.automation.existing_chrome import submit_prompt
+
+    calls = {"submit": 0, "confirm": 0}
+
+    def fake_execute(tab, javascript):
+        if "[data-message-author-role=\"user\"]" in javascript and "const busy = Array.from" not in javascript:
+            return "0"
+        if "const busy = Array.from" in javascript:
+            calls["confirm"] += 1
+            return '{"promptEmpty":false,"userCount":0,"busy":true}'
+        if "const sendButton" in javascript:
+            calls["submit"] += 1
+            return "clicked"
+        raise AssertionError(javascript[:100])
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+    submit_prompt(ChromeTabRef(window_id=1, tab_id=2), provider="chatgpt")
+    assert calls == {"submit": 1, "confirm": 1}
