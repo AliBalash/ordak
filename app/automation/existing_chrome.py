@@ -1204,7 +1204,10 @@ def upload_local_file(
   const uploadLooksAttached = () => {{
     const body = document.body?.innerText || "";
     const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
-    if (fileInputs.some((input) => input.files && input.files.length > 0)) return true;
+    // A synthetic FileList only proves that the hidden input was assigned; it
+    // does not prove ChatGPT accepted/uploaded the file.  Require a real UI
+    // preview for ChatGPT before declaring the attachment ready.
+    if (provider !== "chatgpt" && fileInputs.some((input) => input.files && input.files.length > 0)) return true;
     if (body.includes(fileName)) return true;
     if (document.querySelector('img[src^="blob:"]')) return true;
     if (document.querySelector('[data-test-id*="upload" i], [data-testid*="upload" i], [data-test-id*="attachment" i], [data-testid*="attachment" i]')) return true;
@@ -1244,6 +1247,14 @@ def upload_local_file(
         if (!dropped) throw new Error("Could not find an upload target in the current Chrome tab.");
       }}
       await wait(1500);
+      if (provider === "chatgpt" && !uploadLooksAttached()) {{
+        dispatchPaste(file);
+        await wait(1200);
+      }}
+      if (provider === "chatgpt" && !uploadLooksAttached()) {{
+        await dispatchDrop(file);
+        await wait(1200);
+      }}
       window.__codexUploadStatus = uploadLooksAttached() ? "attached" : "awaiting-ack";
       window.__codexUploadChunks = [];
     }} catch (error) {{
