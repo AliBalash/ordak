@@ -2419,10 +2419,15 @@ def wait_for_response_stable(
         busy = bool(state.get("busy"))
         generated_images = int(state.get("generatedImages") or 0)
         now = time.monotonic()
-        if bool(state.get("providerError")):
-            if observation_callback is not None:
-                observation_callback("ChatGPT observer: PROVIDER_ERROR detected in the visible page.")
-            raise TimeoutError("__ORD_PROVIDER_ERROR__")
+        # A visible provider error is frequently a transient ChatGPT SPA or
+        # network state.  Do not stop the generation immediately: treat it as
+        # a recovery trigger, reload the *same* conversation below, and first
+        # reconcile whether the server completed an image in the meantime.
+        # This keeps a successful generation from being duplicated while still
+        # allowing the caller's bounded resend after a confirmed idle result.
+        provider_error = bool(state.get("providerError"))
+        if provider_error and observation_callback is not None:
+            observation_callback("ChatGPT observer: PROVIDER_ERROR detected; reconciling the same conversation.")
         if reconciled_after_refresh and not busy and not current and generated_images == 0:
             # The exact conversation has been reloaded, its sidebar/composer
             # is ready, and there is no server-side result to reconcile.  The
@@ -2469,6 +2474,8 @@ def wait_for_response_stable(
             and stall_refresh_seconds > 0
             and refresh_count < max_stall_refreshes
             and (
+                provider_error
+                or
                 (not busy and now - last_meaningful_progress >= stall_refresh_seconds)
                 or (busy and no_progress_seconds >= active_no_progress_refresh_seconds)
             )
