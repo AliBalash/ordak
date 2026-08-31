@@ -1878,7 +1878,7 @@ def inspect_generated_image_state(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const collectAssistantRoots = () => {{
@@ -2077,7 +2077,7 @@ def export_generated_images(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const readAsDataUrl = (blob) => new Promise((resolve, reject) => {{
@@ -2352,7 +2352,7 @@ def wait_for_response_stable(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").trim();
