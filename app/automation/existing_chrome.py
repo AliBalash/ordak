@@ -2298,13 +2298,17 @@ def wait_for_response_stable(
     active_no_progress_refresh_seconds = (
         active_no_progress_refresh_seconds
         if active_no_progress_refresh_seconds is not None
-        else max(stall_refresh_seconds * 3, 180)
+        # An unchanged Stop button and reference-thumbnail previews do not
+        # mean that ChatGPT is making progress.  Reconcile a frozen active UI
+        # promptly, while leaving enough time for a normal image render.
+        else max(stall_refresh_seconds, 90)
     )
     last_progress_signature = ""
     last_text = ""
     last_generated_images = 0
     refresh_count = 0
     reconciled_after_refresh = False
+    reconciled_at: float | None = None
     last_observation = ""
     last_observation_at = 0.0
     payload = json.dumps(excluded_text, ensure_ascii=False)
@@ -2384,11 +2388,24 @@ def wait_for_response_stable(
     && !latestTransient
       ? latestText
       : "";
-  const allGeneratedImageCandidates = Array.from((latestAssistantRoot || document).querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
+  const imageScope = latestAssistantRoot || document;
+  const allGeneratedImageCandidates = Array.from(imageScope.querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
     .filter((img) => isVisible(img) && img.naturalWidth >= 96 && img.naturalHeight >= 96)
     .filter((img) => !img.closest('[data-message-author-role="user"]'));
   const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
-  const generatedImages = (generatedHintCandidates.length ? generatedHintCandidates : allGeneratedImageCandidates).length;
+  const imageRootText = clean(latestAssistantRoot?.innerText || "").toLowerCase();
+  const imageDownloadAffordance = Array.from(imageScope.querySelectorAll('a, button, [role="button"], [role="menuitem"]'))
+    .filter((el) => isVisible(el))
+    .some((el) => /download|save image|open image/.test(`${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase()));
+  // ChatGPT keeps uploaded reference thumbnails in the composer.  They are
+  // ordinary <img> tags and used to be mistaken for a completed generation.
+  // Count images only when the visible turn has an output-specific marker.
+  const generatedMarker = imageDownloadAffordance
+    || /generated image|created with|open image|download image|image ready/.test(imageRootText)
+    || generatedHintCandidates.length > 0;
+  const generatedImages = generatedMarker
+    ? (generatedHintCandidates.length ? generatedHintCandidates : allGeneratedImageCandidates).length
+    : 0;
   const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisible(el));
   const busy = buttons.some((el) => {{
     const text = `${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase().trim();
@@ -2428,7 +2445,14 @@ def wait_for_response_stable(
         provider_error = bool(state.get("providerError"))
         if provider_error and observation_callback is not None:
             observation_callback("ChatGPT observer: PROVIDER_ERROR detected; reconciling the same conversation.")
-        if reconciled_after_refresh and not busy and not current and generated_images == 0:
+        if (
+            reconciled_after_refresh
+            and reconciled_at is not None
+            and now - reconciled_at >= max(20, stable_seconds * 3)
+            and not busy
+            and not current
+            and generated_images == 0
+        ):
             # The exact conversation has been reloaded, its sidebar/composer
             # is ready, and there is no server-side result to reconcile.  The
             # caller may now safely reattach references and resubmit once.
@@ -2521,6 +2545,7 @@ def wait_for_response_stable(
             last_generated_images = 0
             last_progress_signature = ""
             reconciled_after_refresh = True
+            reconciled_at = time.monotonic()
             continue
         stable_elapsed = time.monotonic() - stable_since
         if current and current != last_text:
