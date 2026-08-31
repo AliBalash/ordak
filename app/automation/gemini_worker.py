@@ -113,33 +113,49 @@ def _verify_chatgpt_project_tab(
     project_url = app_settings.chatgpt_project_url or ""
     if not project_url:
         return
-    info = get_tab_info(tab)
-    current_url = info.url if info is not None else ""
     configured = urlparse(project_url)
-    current = urlparse(current_url)
     configured_parts = [part for part in configured.path.split("/") if part]
-    current_parts = [part for part in current.path.split("/") if part]
     # ChatGPT may immediately restore a project conversation as
     # /g/<project-id>-<workspace>/c/<conversation-id>.  This remains inside
     # the configured project; only a generic /c/... route is unsafe here.
     project_slug = configured_parts[1] if len(configured_parts) >= 2 and configured_parts[0] == "g" else ""
-    project_scoped = (
-        current.scheme == configured.scheme
-        and current.netloc == configured.netloc
-        and len(current_parts) >= 2
-        and current_parts[0] == "g"
-        and project_slug
-        and (
-            current_parts[1] == project_slug
-            or current_parts[1].startswith(f"{project_slug}-")
+    # A DevTools-created tab initially reports an intermediate or generic
+    # ChatGPT route while the SPA is restoring the project workspace.  Do not
+    # mistake that transient state for a usable normal chat.  Reassert the
+    # exact configured project URL a bounded number of times, then fail closed
+    # without ever inserting a prompt outside the project.
+    deadline = time.monotonic() + min(app_settings.browser_timeout_ms, 45_000) / 1000
+    reload_attempts = 0
+    while time.monotonic() < deadline:
+        info = get_tab_info(tab)
+        current_url = info.url if info is not None else ""
+        current = urlparse(current_url)
+        current_parts = [part for part in current.path.split("/") if part]
+        project_scoped = (
+            current.scheme == configured.scheme
+            and current.netloc == configured.netloc
+            and len(current_parts) >= 2
+            and current_parts[0] == "g"
+            and project_slug
+            and (
+                current_parts[1] == project_slug
+                or current_parts[1].startswith(f"{project_slug}-")
+            )
         )
+        if project_scoped:
+            if runtime is not None:
+                runtime.append_log("Verified the configured ChatGPT Project URL before creating the new chat.")
+            return
+        if reload_attempts < 2:
+            reload_attempts += 1
+            try:
+                execute_javascript(tab, f"window.location.replace({project_url!r}); 'opening configured project'")
+            except RuntimeError:
+                pass
+        time.sleep(1.5)
+    raise GeminiAutomationError(
+        "ChatGPT did not open the configured project URL after bounded recovery; refusing to submit into a normal chat."
     )
-    if not project_scoped:
-        raise GeminiAutomationError(
-            "ChatGPT did not open the configured project URL; refusing to submit into a normal chat."
-        )
-    if runtime is not None:
-        runtime.append_log("Verified the configured ChatGPT Project URL before creating the new chat.")
 
 
 def _browser_platform_label(app_settings: Settings) -> str:
