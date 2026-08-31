@@ -1878,6 +1878,9 @@ def inspect_generated_image_state(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
+  const isUserUpload = (img) => /user uploaded image/i.test(
+    `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
+  );
   const collectAssistantRoots = () => {{
     const candidates = assistantRootSelectors
       .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
@@ -1907,7 +1910,7 @@ def inspect_generated_image_state(
   const assistantImages = generatedImageSelectors
     .flatMap((selector) => Array.from(scope.querySelectorAll(selector)))
     .filter((img) => isVisible(img) && (img.naturalWidth || img.width || 0) >= 96 && (img.naturalHeight || img.height || 0) >= 96)
-    .filter((img) => !img.closest('[data-message-author-role="user"]'));
+    .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img));
   const downloadAffordance = Array.from(scope.querySelectorAll('a, button, [role="button"], [role="menuitem"]'))
     .filter((el) => isVisible(el))
     .some((el) => /download|save image|open image/.test(`${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase()));
@@ -2074,6 +2077,9 @@ def export_generated_images(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
+  const isUserUpload = (img) => /user uploaded image/i.test(
+    `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
+  );
   const readAsDataUrl = (blob) => new Promise((resolve, reject) => {{
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ""));
@@ -2163,7 +2169,7 @@ def export_generated_images(
       const candidates = generatedImageSelectors
         .flatMap((selector) => Array.from(imageScope.querySelectorAll(selector)))
         .filter((img) => isVisible(img) && img.naturalWidth >= 160 && img.naturalHeight >= 160)
-        .filter((img) => !img.closest('[data-message-author-role="user"]'))
+        .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img))
         .map((img) => ({{
           img,
           src: img.currentSrc || img.src || "",
@@ -2301,7 +2307,7 @@ def wait_for_response_stable(
         # An unchanged Stop button and reference-thumbnail previews do not
         # mean that ChatGPT is making progress.  Reconcile a frozen active UI
         # promptly, while leaving enough time for a normal image render.
-        else max(stall_refresh_seconds, 90)
+        else max(stall_refresh_seconds * 2, 150)
     )
     last_progress_signature = ""
     last_text = ""
@@ -2346,6 +2352,9 @@ def wait_for_response_stable(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
+  const isUserUpload = (img) => /user uploaded image/i.test(
+    `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
+  );
   const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").trim();
   const assistantRootSelectors = {json.dumps(assistant_root_selectors, ensure_ascii=False)};
   const assistantRoots = assistantRootSelectors
@@ -2391,7 +2400,7 @@ def wait_for_response_stable(
   const imageScope = latestAssistantRoot || document;
   const allGeneratedImageCandidates = Array.from(imageScope.querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
     .filter((img) => isVisible(img) && img.naturalWidth >= 96 && img.naturalHeight >= 96)
-    .filter((img) => !img.closest('[data-message-author-role="user"]'));
+    .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img));
   const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
   const imageRootText = clean(latestAssistantRoot?.innerText || "").toLowerCase();
   const imageDownloadAffordance = Array.from(imageScope.querySelectorAll('a, button, [role="button"], [role="menuitem"]'))
