@@ -1902,14 +1902,14 @@ def inspect_generated_image_state(
     .reverse()
     .find((root) => generatedImageSelectors
       .flatMap((selector) => Array.from(root.querySelectorAll(selector)))
-      .some((img) => isVisible(img) && (img.naturalWidth || img.width || 0) >= 96 && (img.naturalHeight || img.height || 0) >= 96))
+      .some((img) => isVisible(img) && (img.naturalWidth || img.width || 0) >= 160 && (img.naturalHeight || img.height || 0) >= 160))
     || assistantRoots.at(-1)
     || null;
   const scope = latestAssistantRoot || document;
   const rootText = `${{latestAssistantRoot?.innerText || ""}}`.toLowerCase();
   const assistantImages = generatedImageSelectors
     .flatMap((selector) => Array.from(scope.querySelectorAll(selector)))
-    .filter((img) => isVisible(img) && (img.naturalWidth || img.width || 0) >= 96 && (img.naturalHeight || img.height || 0) >= 96)
+    .filter((img) => isVisible(img) && (img.naturalWidth || img.width || 0) >= 160 && (img.naturalHeight || img.height || 0) >= 160)
     .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img));
   const downloadAffordance = Array.from(scope.querySelectorAll('a, button, [role="button"], [role="menuitem"]'))
     .filter((el) => isVisible(el))
@@ -2399,7 +2399,7 @@ def wait_for_response_stable(
       : "";
   const imageScope = latestAssistantRoot || document;
   const allGeneratedImageCandidates = Array.from(imageScope.querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
-    .filter((img) => isVisible(img) && img.naturalWidth >= 96 && img.naturalHeight >= 96)
+    .filter((img) => isVisible(img) && img.naturalWidth >= 160 && img.naturalHeight >= 160)
     .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img));
   const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
   const imageRootText = clean(latestAssistantRoot?.innerText || "").toLowerCase();
