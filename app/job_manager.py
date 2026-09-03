@@ -33,6 +33,7 @@ from app.automation.gemini_worker import (
     WorkerRuntime,
     run_gemini_job,
 )
+from app.automation.flow_worker import run_flow_job
 from app.config import Settings, settings
 from app.database import SessionLocal
 from app.errors import ErrorCode, get_error_descriptor
@@ -86,6 +87,7 @@ class JobSnapshot:
     run_strategy: str | None
     uploads: list[str]
     output_images: list[str]
+    output_videos: list[str]
     answer: str | None
     status: str
     error_code: str | None
@@ -119,6 +121,7 @@ class JobSnapshot:
             retry_of_job_id=self.retry_of_job_id,
             uploads=self.uploads,
             output_images=self.output_images,
+            output_videos=self.output_videos,
             answer=self.answer,
             status=self.status,
             error_code=self.error_code,
@@ -316,6 +319,7 @@ class JobManager:
             screenshot_paths=_dumps_list([]),
             uploads_json=_dumps_list(uploads),
             output_images_json=_dumps_list([]),
+            output_videos_json=_dumps_list([]),
             metadata_json=_dumps_list([metadata]),
         )
         with SessionLocal() as session:
@@ -606,7 +610,7 @@ class JobManager:
         chrome_running = is_google_chrome_running()
         apple_events_allowed = self._probe_apple_events(chrome_running)
         provider_sessions: dict[str, DiagnosticsProviderState] = {}
-        for provider in ("gemini", "chatgpt"):
+        for provider in ("gemini", "chatgpt", "flow"):
             diagnostics = get_provider_adapter(provider).collect_diagnostics()
             provider_sessions[provider] = DiagnosticsProviderState(
                 logged_in=diagnostics.logged_in,
@@ -628,7 +632,7 @@ class JobManager:
         }
         last_success_by_provider: dict[str, str | None] = {}
         last_error_by_provider: dict[str, str | None] = {}
-        for provider in ("gemini", "chatgpt"):
+        for provider in ("gemini", "chatgpt", "flow"):
             provider_jobs = [job for job in jobs if job.provider == provider]
             success = [job for job in provider_jobs if job.status == "completed"]
             error = [job for job in provider_jobs if job.error_code]
@@ -644,6 +648,7 @@ class JobManager:
             project_url_configured={
                 "gemini": True,
                 "chatgpt": bool(self.settings.chatgpt_project_url),
+                "flow": True,
             },
             tab_binding_health=tab_binding_health,
             last_success_by_provider=last_success_by_provider,
@@ -693,6 +698,8 @@ class JobManager:
             if job.conversation_id in pinned_conversations or job.created_at >= recent_cutoff:
                 referenced_uploads.update(_loads_list(job.uploads_json))
                 referenced_outputs.update(_loads_list(job.output_images_json))
+                if hasattr(job, "output_videos_json"):
+                    referenced_outputs.update(_loads_list(job.output_videos_json))
         deleted_files = 0
         freed_bytes = 0
 
@@ -837,6 +844,7 @@ class JobManager:
                     append_log=lambda message, level="info": self._append_log(job_id, message, level),
                     attach_screenshot=lambda path: self._attach_screenshot(job_id, path),
                     attach_output_image=lambda path: self._attach_output_image(job_id, path),
+                    attach_output_video=lambda path: self._attach_output_video(job_id, path),
                     remember_conversation_state=lambda tab_info: self._remember_conversation_state(
                         snapshot.conversation_id, tab_info
                     ),
@@ -867,7 +875,11 @@ class JobManager:
                     ),
                 )
                 try:
-                    self.worker(job_id, job_request, runtime=runtime, app_settings=self.settings)
+                    # Dispatch to Flow worker for video generation
+                    if job_request.provider == "flow" and job_request.mode == "video_generate":
+                        run_flow_job(job_id, job_request, runtime=runtime, app_settings=self.settings)
+                    else:
+                        self.worker(job_id, job_request, runtime=runtime, app_settings=self.settings)
                 except GeminiAutomationError:
                     pass
                 except Exception as exc:
@@ -894,6 +906,32 @@ class JobManager:
             self.active_controls.pop(job_id, None)
             if self.active_job_id == job_id:
                 self.active_job_id = None
+
+
+    def _attach_output_video(self, job_id: str, path: Path | str, metadata: dict[str, Any] | None = None) -> None:
+        from app.artifacts import storage_relative_path
+
+        relative_path = storage_relative_path(Path(path), self.settings) if isinstance(path, Path) else str(path)
+        with SessionLocal() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            output_videos = _loads_list(job.output_videos_json)
+            output_videos.append(relative_path)
+            job.output_videos_json = _dumps_list(output_videos)
+            # also persist to metadata for backward compat
+            try:
+                metadata_rows = json.loads(job.metadata_json or "[]")
+                existing = metadata_rows[0] if isinstance(metadata_rows, list) and metadata_rows else {}
+            except json.JSONDecodeError:
+                existing = {}
+            existing["output_videos"] = output_videos
+            if metadata is not None:
+                existing.update(metadata)
+            # keep as list wrapper like other fields
+            job.metadata_json = _dumps_list([existing])
+            session.add(job)
+            session.commit()
 
     def _set_status(
         self,
@@ -1109,6 +1147,7 @@ class JobManager:
             "mode": "chat",
             "uploads": [],
             "output_images": [],
+            "output_videos": [],
             "agent_workspace": None,
             "agent_max_steps": None,
             "agent_command_timeout_seconds": None,
@@ -1120,6 +1159,7 @@ class JobManager:
             metadata.update(metadata_rows[0])
         uploads = _loads_list(job.uploads_json) or list(metadata.get("uploads", []))
         output_images = _loads_list(job.output_images_json) or list(metadata.get("output_images", []))
+        output_videos = _loads_list(getattr(job, "output_videos_json", None)) or list(metadata.get("output_videos", []))
         if session is None:
             with SessionLocal() as nested_session:
                 agent_step_count = nested_session.execute(
@@ -1152,6 +1192,7 @@ class JobManager:
             run_strategy=job.run_strategy,
             uploads=uploads,
             output_images=output_images,
+            output_videos=output_videos,
             answer=job.answer,
             status=job.status,
             error_code=job.error_code,

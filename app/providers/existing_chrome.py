@@ -347,4 +347,9 @@ class ChatGPTAdapter(ExistingChromeProviderAdapter):
 def get_provider_adapter(provider: str) -> ProviderAdapter:
     if provider == "chatgpt":
         return ChatGPTAdapter()
-    return GeminiAdapter()
+    if provider == "flow":
+        from app.providers.flow_adapter import FlowAdapter
+        return FlowAdapter()
+    if provider == "gemini":
+        return GeminiAdapter()
+    raise ValueError(f"Unsupported provider: {provider}")

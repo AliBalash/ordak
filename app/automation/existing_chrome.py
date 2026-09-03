@@ -22,12 +22,13 @@ from app.artifacts import slugify_filename
 from app.config import settings
 
 
-ProviderName = Literal["gemini", "chatgpt"]
+ProviderName = Literal["gemini", "chatgpt", "flow"]
 
 
 PROVIDER_LABELS: dict[ProviderName, str] = {
     "gemini": "Gemini",
     "chatgpt": "ChatGPT",
+    "flow": "Flow",
 }
 
 GENERATED_IMAGE_SELECTORS = [
@@ -41,6 +42,7 @@ GENERATED_IMAGE_SELECTORS = [
 X11_PROMPT_LABELS: dict[ProviderName, tuple[str, ...]] = {
     "gemini": ("Enter a prompt for Gemini",),
     "chatgpt": ("Message ChatGPT", "Send a message", "Ask anything"),
+    "flow": ("Describe your video", "Enter a prompt"),
 }
 
 TEXTUAL_ACCESSIBILITY_ROLES = {
@@ -67,6 +69,13 @@ PROMPT_SELECTORS: dict[ProviderName, list[str]] = {
         'div[contenteditable="true"][role="textbox"][aria-label*="ChatGPT"]',
         'textarea[placeholder*="Message"]',
         "textarea",
+    ],
+    "flow": [
+        'textarea[placeholder*="Describe"]',
+        '[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+        "textarea",
+        '[aria-label*="Prompt"]',
     ],
 }
 

@@ -128,6 +128,9 @@ class Settings:
     browser_output_dir: Path
     gemini_url: str
     gemini_response_timeout_ms: int
+    flow_url: str
+    flow_response_timeout_ms: int
+    flow_stable_response_seconds: int
     gemini_stable_response_seconds: int
     chatgpt_url: str
     chatgpt_project_url: str | None
@@ -188,28 +191,34 @@ class Settings:
     def provider_url(self, provider: str, mode: str | None = None) -> str:
         if provider == "chatgpt" and mode == "agent":
             return self.chatgpt_agent_url or self.chatgpt_url
-        return self.chatgpt_url if provider == "chatgpt" else self.gemini_url
+        if provider == "chatgpt":
+            return self.chatgpt_url
+        if provider == "flow":
+            return self.flow_url
+        return self.gemini_url
 
     def provider_new_chat_url(self, provider: str, mode: str | None = None) -> str:
         if provider == "chatgpt":
             if mode == "agent":
                 return self.chatgpt_agent_url or self.chatgpt_url
             return self.chatgpt_project_url or self.chatgpt_url
+        if provider == "flow":
+            return self.flow_url
         return self.gemini_url
 
     def provider_response_timeout_ms(self, provider: str) -> int:
-        return (
-            self.chatgpt_response_timeout_ms
-            if provider == "chatgpt"
-            else self.gemini_response_timeout_ms
-        )
+        if provider == "chatgpt":
+            return self.chatgpt_response_timeout_ms
+        if provider == "flow":
+            return self.flow_response_timeout_ms
+        return self.gemini_response_timeout_ms
 
     def provider_stable_response_seconds(self, provider: str) -> int:
-        return (
-            self.chatgpt_stable_response_seconds
-            if provider == "chatgpt"
-            else self.gemini_stable_response_seconds
-        )
+        if provider == "chatgpt":
+            return self.chatgpt_stable_response_seconds
+        if provider == "flow":
+            return self.flow_stable_response_seconds
+        return self.gemini_stable_response_seconds
 
 
 def load_settings() -> Settings:
@@ -287,6 +296,9 @@ def load_settings() -> Settings:
         gemini_response_timeout_ms=_as_int(
             os.getenv("GEMINI_RESPONSE_TIMEOUT_MS"), 240_000
         ),
+        flow_url=os.getenv("FLOW_URL", "https://labs.google/fx/tools/flow"),
+        flow_response_timeout_ms=_as_int(os.getenv("FLOW_RESPONSE_TIMEOUT_MS"), 240_000),
+        flow_stable_response_seconds=_as_int(os.getenv("FLOW_STABLE_RESPONSE_SECONDS"), 4),
         gemini_stable_response_seconds=_as_int(
             os.getenv("GEMINI_STABLE_RESPONSE_SECONDS"), 4
         ),

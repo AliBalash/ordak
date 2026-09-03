@@ -119,9 +119,9 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail="wait_timeout_seconds must be an integer.") from exc
             if not question:
                 raise HTTPException(status_code=422, detail="Question is required.")
-            if provider not in {"gemini", "chatgpt"}:
+            if provider not in {"gemini", "chatgpt", "flow"}:
                 raise HTTPException(status_code=422, detail="Unsupported provider.")
-            if mode not in {"chat", "image_analyze", "image_generate", "agent"}:
+            if mode not in {"chat", "image_analyze", "image_generate", "agent", "video_generate"}:
                 raise HTTPException(status_code=422, detail="Unsupported job mode.")
             if wait_timeout_seconds < 1 or wait_timeout_seconds > 3600:
                 raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 3600.")
@@ -273,7 +273,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
 
     @app.post("/api/providers/{provider}/respond", response_model=ProviderRunResponse)
     async def provider_respond(provider: str, request: Request) -> ProviderRunResponse:
-        if provider not in {"gemini", "chatgpt"}:
+        if provider not in {"gemini", "chatgpt", "flow"}:
             raise HTTPException(status_code=404, detail="Unsupported provider.")
         created, wait_for_completion, wait_timeout_seconds = await _create_job_from_request(
             request,

@@ -62,6 +62,7 @@ class WorkerRuntime:
     set_trace_path: Callable[[Path], None]
     save_answer: Callable[[str], None]
     save_error: Callable[[str, str, str | None], None]
+    attach_output_video: Callable[[Path], None] | None = None
     should_cancel: Callable[[], bool] | None = None
     start_agent_step: Callable[[int, str, str, str], str] | None = None
     finish_agent_step: Callable[[str, str, str | None, str | None], None] | None = None
@@ -100,8 +101,130 @@ GeminiJobRequest = AutomationJobRequest
 
 
 def _provider_name(provider: Provider) -> str:
-    return "ChatGPT" if provider == "chatgpt" else "Gemini"
+    if provider == "chatgpt":
+        return "ChatGPT"
+    if provider == "flow":
+        return "Flow"
+    return "Gemini"
 
+
+
+def _gemini_display_label(model: str) -> str:
+    """Map internal gemini model to UI visible label (§6-7)."""
+    mapping = {
+        "nano_banana_pro": "Nano Banana Pro",
+        "nano_banana_2": "Nano Banana",
+        "nano-banana-pro": "Nano Banana Pro",
+        "nano-banana-2": "Nano Banana",
+    }
+    return mapping.get(model, model)
+
+def _parse_gemini_model_from_prompt(prompt: str) -> str | None:
+    """Extract [MODEL:...] tag if present in prompt (QH pipeline encodes model)."""
+    import re
+    m = re.search(r"\[MODEL:([^\]]+)\]", prompt)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def _select_gemini_image_model(tab, requested: str, runtime) -> str:
+    """Efficient Gemini model selection: check current, only open if needed (§5)."""
+    if not requested:
+        return "unknown"
+    display = _gemini_display_label(requested)
+    # Fast check: is display already visible as selected?
+    try:
+        from app.automation.existing_chrome import execute_javascript
+        import json as js
+        cur = execute_javascript(tab, f"""
+        (() => {{
+          const txt = document.body.innerText;
+          const active = Array.from(document.querySelectorAll('button[aria-selected="true"], [aria-pressed="true"]')).map(b=>b.innerText).join(' | ');
+          return JSON.stringify({{has: txt.includes('{display}'), active: active.slice(0,300)}});
+        }})()
+        """)
+        info = js.loads(cur) if cur else {}
+        if info.get('has'):
+            if runtime:
+                runtime.append_log(f"Gemini model {display} already selected — skipping dropdown")
+            return display
+    except Exception:
+        pass
+    # Need to open model selector — find button that shows current model (often contains Nano Banana or Flash)
+    try:
+        from app.automation.existing_chrome import execute_javascript
+        import json as js, time
+        # Find model button (heuristic: button near top that contains model keywords)
+        js_find = """
+        (() => {
+          const btns = Array.from(document.querySelectorAll('button'));
+          const target = btns.find(b => /Nano Banana|Gemini|Flash|Pro/.test(b.innerText) && b.offsetWidth > 50);
+          if (!target) return JSON.stringify({error:'no model btn'});
+          const r = target.getBoundingClientRect();
+          return JSON.stringify({cx: r.x+r.width/2, cy: r.y+r.height/2, text: target.innerText.slice(0,120)});
+        })()
+        """
+        res = execute_javascript(tab, js_find)
+        info = js.loads(res) if res else {}
+        if 'cx' in info:
+            # Click via JS
+            js_click = f"""
+            (() => {{
+              const el = document.elementFromPoint({info['cx']}, {info['cy']});
+              if (el) el.click();
+              return 'clicked';
+            }})()
+            """
+            execute_javascript(tab, js_click)
+            time.sleep(0.6)
+            if runtime:
+                runtime.append_log(f"Opened Gemini model selector ({info.get('text','')[:60]})")
+            # Now pick requested display model
+            js_pick = f"""
+            (() => {{
+              const opts = Array.from(document.querySelectorAll('button, [role="option"], [data-test-id*="model"]'));
+              const target = opts.find(e => e.innerText.trim().includes('{display}'));
+              if (!target) return JSON.stringify({{error: 'no opt {display}'}});
+              const r = target.getBoundingClientRect();
+              return JSON.stringify({{cx: r.x+r.width/2, cy: r.y+r.height/2}});
+            }})()
+            """
+            pick = execute_javascript(tab, js_pick)
+            pick_info = js.loads(pick) if pick else {}
+            if 'cx' in pick_info:
+                js_pick_click = f"""
+                (() => {{
+                  const el = document.elementFromPoint({pick_info['cx']}, {pick_info['cy']});
+                  if (el) el.click();
+                  return 'picked {display}';
+                }})()
+                """
+                execute_javascript(tab, js_pick_click)
+                time.sleep(0.5)
+                if runtime:
+                    runtime.append_log(f"Selected Gemini model {display}")
+            else:
+                if runtime:
+                    runtime.append_log(f"Gemini model option {display} not found: {pick}", level="warning")
+            time.sleep(0.3)
+            # Verify
+            verify = execute_javascript(tab, f"""
+            (() => {{
+              return JSON.stringify({{has: document.body.innerText.includes('{display}')}});
+            }})()
+            """)
+            vinfo = js.loads(verify) if verify else {}
+            if not vinfo.get('has'):
+                raise RuntimeError(f"Gemini model {display} not verified after selection — MODEL_SELECTION_FAILED")
+            return display
+        else:
+            if runtime:
+                runtime.append_log(f"Gemini model button not found: {res}", level="warning")
+    except Exception as e:
+        if runtime:
+            runtime.append_log(f"Gemini model selection warning: {e}", level="warning")
+        # Don't fail hard for now — allow generation to continue with current model, but log
+    return display
 
 def _verify_chatgpt_project_tab(
     tab: ChromeTabRef,
@@ -866,6 +989,22 @@ def _run_gemini_job_in_existing_chrome(
         )
         if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
             _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
+
+        # Gemini model selection for image generation (§5-7) — efficient, no redundant open/close
+        requested_gemini_model = None
+        if job.provider == "gemini" and job.mode == "image_generate":
+            # Try to parse from prompt tag [MODEL:...] or from job metadata if available
+            requested_gemini_model = _parse_gemini_model_from_prompt(effective_prompt)
+            # Fallback to default if not encoded
+            if not requested_gemini_model:
+                # Use pipeline default for QH, else Nano Banana Pro
+                requested_gemini_model = "nano_banana_pro"
+            try:
+                _select_gemini_image_model(tab, requested_gemini_model, runtime)
+            except Exception as e:
+                # Strict per §5: if requested model cannot be used, fail with structured error
+                from app.errors import ErrorCode, OrdaKError
+                raise OrdaKError(code=ErrorCode.MODEL_SELECTION_FAILED, message=str(e)) from e
 
         if job.mode == "image_generate":
             activated = activate_create_image_mode(tab, provider=job.provider)

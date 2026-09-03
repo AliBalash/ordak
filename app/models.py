@@ -79,6 +79,7 @@ class Job(Base):
     logs: Mapped[str | None] = mapped_column(Text, nullable=True)
     uploads_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_images_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_videos_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     conversation: Mapped[Conversation | None] = relationship(back_populates="jobs")

@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-Provider = Literal["gemini", "chatgpt"]
+Provider = Literal["gemini", "chatgpt", "flow"]
 
 
 JobStatus = Literal[
@@ -35,7 +35,7 @@ JobStatus = Literal[
     "manual_verification_required",
 ]
 
-JobMode = Literal["chat", "image_analyze", "image_generate", "agent"]
+JobMode = Literal["chat", "image_analyze", "image_generate", "agent", "video_generate"]
 RetryStrategy = Literal["same_tab", "new_tab_same_conversation", "new_chat"]
 ResumeStrategy = Literal["same_tab", "new_tab_same_conversation"]
 ExecutionBackend = Literal["host", "docker", "podman"]
@@ -92,6 +92,7 @@ class JobResponse(BaseModel):
     retry_of_job_id: str | None = None
     uploads: list[str] = Field(default_factory=list)
     output_images: list[str] = Field(default_factory=list)
+    output_videos: list[str] = Field(default_factory=list)
     answer: str | None
     status: str
     error_code: str | None = None
@@ -138,6 +139,7 @@ class ProviderRunResponse(BaseModel):
     recoverable: bool = False
     uploads: list[ArtifactLinkResponse] = Field(default_factory=list)
     output_images: list[ArtifactLinkResponse] = Field(default_factory=list)
+    output_videos: list[ArtifactLinkResponse] = Field(default_factory=list)
     screenshots: list[ArtifactLinkResponse] = Field(default_factory=list)
     trace_url: str | None = None
     logs: list[LogEntry] = Field(default_factory=list)

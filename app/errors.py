@@ -31,6 +31,25 @@ class ErrorCode(StrEnum):
     AGENT_COMMAND_TIMEOUT = "agent_command_timeout"
     AGENT_EXECUTION_BACKEND_UNAVAILABLE = "agent_execution_backend_unavailable"
     AGENT_RESULT_TOO_LARGE = "agent_result_too_large"
+    # Strict model contract (master_prompt §5, §18)
+    MODEL_NOT_AVAILABLE = "model_not_available"
+    MODEL_SELECTION_FAILED = "model_selection_failed"
+    MODEL_FEATURE_INCOMPATIBLE = "model_feature_incompatible"
+    # Google Flow video provider (master_prompt §27)
+    FLOW_LOGIN_REQUIRED = "flow_login_required"
+    FLOW_MANUAL_VERIFICATION_REQUIRED = "flow_manual_verification_required"
+    FLOW_UPLOAD_FAILED = "flow_upload_failed"
+    FLOW_FRAME_UPLOAD_FAILED = "flow_frame_upload_failed"
+    FLOW_GENERATION_TIMEOUT = "flow_generation_timeout"
+    FLOW_CREDITS_EXHAUSTED = "flow_credits_exhausted"
+    FLOW_UI_CHANGED = "flow_ui_changed"
+    FLOW_TAB_LOST = "flow_tab_lost"
+    FLOW_RESULT_NOT_FOUND = "flow_result_not_found"
+    FLOW_DOWNLOAD_FAILED = "flow_download_failed"
+    FLOW_POLICY_VIOLATION = "flow_policy_violation"
+    FLOW_RECONCILIATION_REQUIRED = "flow_reconciliation_required"
+    FLOW_REFERENCE_POLICY_VIOLATION = "flow_reference_policy_violation"
+    INVALID_VIDEO_OUTPUT = "invalid_video_output"
 
 
 @dataclass(slots=True, frozen=True)
@@ -223,6 +242,125 @@ ERROR_DESCRIPTORS: dict[ErrorCode, ErrorDescriptor] = {
         title="Agent result too large",
         message="The tool result exceeded the configured size limits.",
         suggested_action="Retry with smaller reads or narrower commands.",
+        recoverable=True,
+    ),
+    ErrorCode.MODEL_NOT_AVAILABLE: ErrorDescriptor(
+        code=ErrorCode.MODEL_NOT_AVAILABLE,
+        title="Requested model not available",
+        message="The requested generation model is not offered by the provider UI right now.",
+        suggested_action="Wait for the model to become available or relaunch with a model the UI exposes. Never substitute another model.",
+        recoverable=True,
+    ),
+    ErrorCode.MODEL_SELECTION_FAILED: ErrorDescriptor(
+        code=ErrorCode.MODEL_SELECTION_FAILED,
+        title="Model selection failed",
+        message="Ordak could not select and positively verify the requested model in the provider UI.",
+        suggested_action="Inspect the provider tab via VNC, then resume. Generation is refused until the requested model is verified.",
+        recoverable=True,
+    ),
+    ErrorCode.MODEL_FEATURE_INCOMPATIBLE: ErrorDescriptor(
+        code=ErrorCode.MODEL_FEATURE_INCOMPATIBLE,
+        title="Model feature incompatible",
+        message="The selected model cannot perform the requested operation (duration, aspect ratio, resolution or frame inputs).",
+        suggested_action="Relaunch with a compatible model or adjust the request. Ordak will not silently switch models.",
+        recoverable=False,
+    ),
+    ErrorCode.FLOW_LOGIN_REQUIRED: ErrorDescriptor(
+        code=ErrorCode.FLOW_LOGIN_REQUIRED,
+        title="Google Flow login required",
+        message="The Google Flow session is not logged in.",
+        suggested_action="Log in to Google Flow through noVNC, then resume the job.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_MANUAL_VERIFICATION_REQUIRED: ErrorDescriptor(
+        code=ErrorCode.FLOW_MANUAL_VERIFICATION_REQUIRED,
+        title="Google Flow manual verification required",
+        message="Google Flow is asking for a security or account verification step.",
+        suggested_action="Complete the verification through noVNC, then resume. Ordak never bypasses verification.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_UPLOAD_FAILED: ErrorDescriptor(
+        code=ErrorCode.FLOW_UPLOAD_FAILED,
+        title="Flow reference upload failed",
+        message="A Flow reference upload did not complete or could not be verified.",
+        suggested_action="Resume the job; Ordak re-verifies attachments before generating.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_FRAME_UPLOAD_FAILED: ErrorDescriptor(
+        code=ErrorCode.FLOW_FRAME_UPLOAD_FAILED,
+        title="Flow frame upload failed",
+        message="The first-frame or last-frame image could not be attached through the Flow frame controls.",
+        suggested_action="Inspect the Flow frame controls via VNC, then resume.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_GENERATION_TIMEOUT: ErrorDescriptor(
+        code=ErrorCode.FLOW_GENERATION_TIMEOUT,
+        title="Flow generation timeout",
+        message="Google Flow did not finish the generation before the timeout.",
+        suggested_action="Resume the job; Ordak reconciles the existing Flow generation instead of pressing Generate again.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_CREDITS_EXHAUSTED: ErrorDescriptor(
+        code=ErrorCode.FLOW_CREDITS_EXHAUSTED,
+        title="Flow credits exhausted",
+        message="Google Flow reports that generation credits are exhausted.",
+        suggested_action="Top up credits or wait for the quota reset, then resume. Ordak will not hammer Generate.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_UI_CHANGED: ErrorDescriptor(
+        code=ErrorCode.FLOW_UI_CHANGED,
+        title="Flow UI changed",
+        message="The Google Flow layout no longer matches the controls Ordak expects.",
+        suggested_action="Capture diagnostics, update the Flow selectors, then retry.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_TAB_LOST: ErrorDescriptor(
+        code=ErrorCode.FLOW_TAB_LOST,
+        title="Flow tab lost",
+        message="The Google Flow workspace tab is no longer available.",
+        suggested_action="Resume the job; Ordak reopens the same Flow workspace and reconciles before generating.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_RESULT_NOT_FOUND: ErrorDescriptor(
+        code=ErrorCode.FLOW_RESULT_NOT_FOUND,
+        title="Flow result not found",
+        message="Ordak could not locate a generated clip matching this job's submission fingerprint.",
+        suggested_action="Inspect the Flow workspace via VNC, then resume so Ordak can reconcile the existing generation.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_DOWNLOAD_FAILED: ErrorDescriptor(
+        code=ErrorCode.FLOW_DOWNLOAD_FAILED,
+        title="Flow download failed",
+        message="The generated Flow clip could not be downloaded into the job output directory.",
+        suggested_action="Resume the job; Ordak re-downloads the existing generation without spending new credits.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_POLICY_VIOLATION: ErrorDescriptor(
+        code=ErrorCode.FLOW_POLICY_VIOLATION,
+        title="Flow rejected the prompt",
+        message="Google Flow rejected the prompt for policy reasons.",
+        suggested_action="Rewrite the clip prompt, then retry. No other provider is used as a fallback.",
+        recoverable=False,
+    ),
+    ErrorCode.FLOW_RECONCILIATION_REQUIRED: ErrorDescriptor(
+        code=ErrorCode.FLOW_RECONCILIATION_REQUIRED,
+        title="Flow reconciliation required",
+        message="A previous Flow submission may already have consumed credits; Ordak refuses a blind duplicate Generate.",
+        suggested_action="Resume the job so Ordak can inspect the Flow workspace and recover the matching generation.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_REFERENCE_POLICY_VIOLATION: ErrorDescriptor(
+        code=ErrorCode.FLOW_REFERENCE_POLICY_VIOLATION,
+        title="Flow reference policy violation",
+        message="A forbidden style-sheet reference was about to be uploaded to Google Flow.",
+        suggested_action="Fix the job builder: Flow may only receive the canonical character/book design sheet plus first/last frame inputs.",
+        recoverable=False,
+    ),
+    ErrorCode.INVALID_VIDEO_OUTPUT: ErrorDescriptor(
+        code=ErrorCode.INVALID_VIDEO_OUTPUT,
+        title="Invalid video output",
+        message="The downloaded video artifact failed ffprobe validation.",
+        suggested_action="Resume the job so Ordak re-downloads and re-validates the generation.",
         recoverable=True,
     ),
 }
