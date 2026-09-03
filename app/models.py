@@ -80,6 +80,9 @@ class Job(Base):
     uploads_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_images_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_videos_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    references_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_receipt_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     conversation: Mapped[Conversation | None] = relationship(back_populates="jobs")

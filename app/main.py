@@ -13,12 +13,14 @@ from app.artifacts import slugify_filename
 from app.config import settings
 from app.database import init_db
 from app.job_manager import JobManager
+from app.errors import OrdaKError
 from app.schemas import (
     AgentStepListResponse,
     CleanupResponse,
     ConversationListResponse,
     ConversationResponse,
     DiagnosticsResponse,
+    GenerationOptions,
     HealthResponse,
     ArtifactLinkResponse,
     JobCreateRequest,
@@ -28,6 +30,7 @@ from app.schemas import (
     ProfileOpenResponse,
     ProviderRunRequest,
     ProviderRunResponse,
+    ReferenceSpec,
     ResumeJobRequest,
     RetryJobRequest,
     StorageDiagnosticsResponse,
@@ -43,6 +46,34 @@ def _as_form_bool(value: object) -> bool:
 
 def _absolute_url(request: Request, relative_path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}/{relative_path.lstrip('/')}"
+
+
+def _generation_from_form(form: object) -> GenerationOptions | None:
+    """Read the explicit generation contract out of a multipart form (§5, §18-21)."""
+
+    def text(name: str) -> str | None:
+        value = form.get(name)  # type: ignore[union-attr]
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    duration_raw = text("duration_seconds")
+    duration: int | None = None
+    if duration_raw is not None:
+        try:
+            duration = int(float(duration_raw))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="duration_seconds must be a number.") from exc
+
+    options = GenerationOptions(
+        model=text("model"),
+        quality=text("quality"),
+        aspect_ratio=text("aspect_ratio"),
+        duration_seconds=duration,
+        resolution=text("resolution"),
+    )
+    return None if options.is_empty() else options
 
 
 def _validate_agent_request(
@@ -127,6 +158,16 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 3600.")
             pending_job_id = str(uuid.uuid4())
             upload_items = [item for item in form.getlist("image") if getattr(item, "filename", None)]
+            role_items = [str(value).strip() for value in form.getlist("role")]
+            if role_items and len(role_items) != len(upload_items):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Received {len(role_items)} role field(s) for {len(upload_items)} upload(s); "
+                        "send exactly one role per image, in the same order."
+                    ),
+                )
+            generation = _generation_from_form(form)
             _validate_agent_request(
                 mode=mode,
                 provider=provider,
@@ -140,6 +181,14 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 except ValueError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
                 uploads.append(saved_upload)
+            references = [
+                ReferenceSpec(
+                    role=role_items[index] if index < len(role_items) else "unspecified",
+                    path=saved,
+                    filename=getattr(upload_items[index], "filename", None),
+                )
+                for index, saved in enumerate(uploads)
+            ]
             try:
                 created = await request.app.state.job_manager.create_job(
                     question,
@@ -149,8 +198,12 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     conversation_id=conversation_id,
                     start_new_chat=start_new_chat,
                     uploads=uploads,
+                    references=references,
+                    generation=generation,
                 )
                 return created, wait_for_completion, wait_timeout_seconds
+            except OrdaKError as exc:
+                raise HTTPException(status_code=422, detail=exc.message) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -175,6 +228,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     start_new_chat=payload.start_new_chat,
                     uploads=[],
                     agent_options=payload.agent,
+                    generation=payload.generation,
                 )
                 return created, wait_for_completion, wait_timeout_seconds
             except ValueError as exc:
@@ -197,6 +251,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 start_new_chat=payload.start_new_chat,
                 uploads=[],
                 agent_options=payload.agent,
+                generation=payload.generation,
             )
             return created, payload.wait_for_completion, payload.wait_timeout_seconds
         except ValueError as exc:
@@ -236,7 +291,11 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
             suggested_action=job.suggested_action,
             recoverable=job.recoverable,
             uploads=[_artifact_link(request, path) for path in job.uploads],
+            references=job.references,
+            generation=job.generation,
+            generation_receipt=job.generation_receipt,
             output_images=[_artifact_link(request, path) for path in job.output_images],
+            output_videos=[_artifact_link(request, path) for path in job.output_videos],
             screenshots=[_artifact_link(request, path) for path in job.screenshots],
             trace_url=_absolute_url(request, job.trace_path) if job.trace_path else None,
             logs=job.logs,

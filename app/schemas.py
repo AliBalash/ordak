@@ -55,6 +55,75 @@ class AgentOptions(BaseModel):
     network_enabled: bool | None = None
 
 
+#: Reference roles are validated by app/flow_policy.py, not by the type system, so a
+#: forbidden role produces a clean policy rejection instead of a schema crash.
+KNOWN_REFERENCE_ROLES = (
+    "character_sheet",
+    "book_design_sheet",
+    "first_frame",
+    "last_frame",
+    "style_reference",
+    "world_keyframe",
+    "previous_beat",
+    "unspecified",
+)
+
+
+class GenerationOptions(BaseModel):
+    """Explicit generation contract for a job (master_prompt §5, §18-21).
+
+    The caller states exactly what it wants; the worker must select it in the live UI,
+    verify it, and refuse to generate when verification fails. Nothing is inferred and
+    nothing is silently substituted.
+    """
+
+    model: str | None = Field(default=None, max_length=120)
+    quality: str | None = Field(default=None, max_length=40)
+    aspect_ratio: str | None = Field(default=None, max_length=20)
+    duration_seconds: int | None = Field(default=None, ge=1, le=120)
+    resolution: str | None = Field(default=None, max_length=20)
+
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.model,
+                self.quality,
+                self.aspect_ratio,
+                self.duration_seconds,
+                self.resolution,
+            )
+        )
+
+
+class ReferenceSpec(BaseModel):
+    """A single uploaded reference and the role it plays in the job."""
+
+    role: str = Field(default="unspecified", max_length=60)
+    path: str
+    filename: str | None = None
+
+
+class GenerationReceipt(BaseModel):
+    """What the worker actually observed in the provider UI."""
+
+    provider: Provider
+    requested_model: str | None = None
+    actual_model_label: str | None = None
+    model_verified: bool = False
+    pro_regeneration_used: bool = False
+    requested_quality: str | None = None
+    requested_aspect_ratio: str | None = None
+    actual_aspect_ratio: str | None = None
+    requested_duration_seconds: int | None = None
+    actual_duration_seconds: int | None = None
+    requested_resolution: str | None = None
+    actual_resolution: str | None = None
+    workspace_url: str | None = None
+    submission_fingerprint: str | None = None
+    reference_roles: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class JobCreateRequest(BaseModel):
     question: str = Field(min_length=1, max_length=20_000)
     provider: Provider = "gemini"
@@ -62,6 +131,7 @@ class JobCreateRequest(BaseModel):
     conversation_id: str | None = None
     start_new_chat: bool = False
     agent: AgentOptions | None = None
+    generation: GenerationOptions | None = None
 
 
 class ProviderRunRequest(BaseModel):
@@ -72,6 +142,8 @@ class ProviderRunRequest(BaseModel):
     wait_for_completion: bool = True
     wait_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     agent: AgentOptions | None = None
+    generation: GenerationOptions | None = None
+
 
 
 class JobCreateResponse(BaseModel):
@@ -91,6 +163,9 @@ class JobResponse(BaseModel):
     start_new_chat: bool = False
     retry_of_job_id: str | None = None
     uploads: list[str] = Field(default_factory=list)
+    references: list[ReferenceSpec] = Field(default_factory=list)
+    generation: GenerationOptions | None = None
+    generation_receipt: GenerationReceipt | None = None
     output_images: list[str] = Field(default_factory=list)
     output_videos: list[str] = Field(default_factory=list)
     answer: str | None
@@ -138,6 +213,9 @@ class ProviderRunResponse(BaseModel):
     suggested_action: str | None = None
     recoverable: bool = False
     uploads: list[ArtifactLinkResponse] = Field(default_factory=list)
+    references: list[ReferenceSpec] = Field(default_factory=list)
+    generation: GenerationOptions | None = None
+    generation_receipt: GenerationReceipt | None = None
     output_images: list[ArtifactLinkResponse] = Field(default_factory=list)
     output_videos: list[ArtifactLinkResponse] = Field(default_factory=list)
     screenshots: list[ArtifactLinkResponse] = Field(default_factory=list)

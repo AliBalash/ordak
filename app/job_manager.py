@@ -47,11 +47,14 @@ from app.schemas import (
     ConversationSummary,
     DiagnosticsProviderState,
     DiagnosticsResponse,
+    GenerationOptions,
+    GenerationReceipt,
     JobCreateResponse,
     JobMode,
     JobResponse,
     LogEntry,
     Provider,
+    ReferenceSpec,
     StorageDiagnosticsResponse,
 )
 
@@ -74,6 +77,22 @@ def _dumps_list(raw_value: list[Any]) -> str:
     return json.dumps(raw_value, ensure_ascii=False)
 
 
+def _loads_obj(raw_value: str | None) -> dict[str, Any] | None:
+    if not raw_value:
+        return None
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _dumps_obj(raw_value: dict[str, Any] | None) -> str | None:
+    if raw_value is None:
+        return None
+    return json.dumps(raw_value, ensure_ascii=False)
+
+
 @dataclass(slots=True)
 class JobSnapshot:
     job_id: str
@@ -86,6 +105,9 @@ class JobSnapshot:
     retry_of_job_id: str | None
     run_strategy: str | None
     uploads: list[str]
+    references: list[dict[str, Any]]
+    generation: dict[str, Any] | None
+    generation_receipt: dict[str, Any] | None
     output_images: list[str]
     output_videos: list[str]
     answer: str | None
@@ -120,6 +142,15 @@ class JobSnapshot:
             start_new_chat=self.start_new_chat,
             retry_of_job_id=self.retry_of_job_id,
             uploads=self.uploads,
+            references=[ReferenceSpec.model_validate(item) for item in self.references],
+            generation=(
+                GenerationOptions.model_validate(self.generation) if self.generation else None
+            ),
+            generation_receipt=(
+                GenerationReceipt.model_validate(self.generation_receipt)
+                if self.generation_receipt
+                else None
+            ),
             output_images=self.output_images,
             output_videos=self.output_videos,
             answer=self.answer,
@@ -204,8 +235,27 @@ class JobManager:
         retry_of_job_id: str | None = None,
         run_strategy: str | None = None,
         agent_options: AgentOptions | None = None,
+        references: list[ReferenceSpec] | None = None,
+        generation: GenerationOptions | None = None,
     ) -> JobCreateResponse:
         uploads = uploads or []
+        references = references or []
+        if generation is not None and generation.is_empty():
+            generation = None
+        if references and len(references) != len(uploads):
+            raise ValueError(
+                f"references ({len(references)}) must describe every upload ({len(uploads)})."
+            )
+        if provider == "flow":
+            from app.flow_policy import validate_references as validate_flow_references
+
+            if uploads and not references:
+                raise ValueError(
+                    "Flow jobs must declare an explicit role for every reference upload."
+                )
+            validate_flow_references(
+                [(ref.role, ref.path) for ref in references]
+            )
         resolved_agent_workspace: str | None = None
         resolved_agent_max_steps: int | None = None
         resolved_agent_command_timeout_seconds: int | None = None
@@ -318,6 +368,8 @@ class JobManager:
             ),
             screenshot_paths=_dumps_list([]),
             uploads_json=_dumps_list(uploads),
+            references_json=_dumps_list([ref.model_dump() for ref in references]),
+            generation_json=_dumps_obj(generation.model_dump() if generation else None),
             output_images_json=_dumps_list([]),
             output_videos_json=_dumps_list([]),
             metadata_json=_dumps_list([metadata]),
@@ -815,6 +867,19 @@ class JobManager:
                     upload_paths=[
                         storage_absolute_path(path, self.settings) for path in snapshot.uploads
                     ],
+                    generation=(
+                        GenerationOptions.model_validate(snapshot.generation)
+                        if snapshot.generation
+                        else None
+                    ),
+                    references=[
+                        (
+                            str(item.get("role") or "unspecified"),
+                            storage_absolute_path(str(item.get("path")), self.settings),
+                        )
+                        for item in snapshot.references
+                        if item.get("path")
+                    ],
                     run_strategy=snapshot.run_strategy,
                     agent_config=(
                         AgentResolvedConfig(
@@ -845,6 +910,9 @@ class JobManager:
                     attach_screenshot=lambda path: self._attach_screenshot(job_id, path),
                     attach_output_image=lambda path: self._attach_output_image(job_id, path),
                     attach_output_video=lambda path: self._attach_output_video(job_id, path),
+                    attach_generation_receipt=lambda receipt: self._attach_generation_receipt(
+                        job_id, receipt
+                    ),
                     remember_conversation_state=lambda tab_info: self._remember_conversation_state(
                         snapshot.conversation_id, tab_info
                     ),
@@ -930,6 +998,26 @@ class JobManager:
                 existing.update(metadata)
             # keep as list wrapper like other fields
             job.metadata_json = _dumps_list([existing])
+            session.add(job)
+            session.commit()
+
+    def _attach_generation_receipt(self, job_id: str, receipt: Any) -> None:
+        """Persist what the worker actually observed in the provider UI (§8, §23)."""
+        if receipt is None:
+            return
+        if hasattr(receipt, "model_dump"):
+            payload = receipt.model_dump()
+        elif isinstance(receipt, dict):
+            payload = dict(receipt)
+        else:
+            return
+        with SessionLocal() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            existing = _loads_obj(job.generation_receipt_json) or {}
+            existing.update({k: v for k, v in payload.items() if v is not None})
+            job.generation_receipt_json = _dumps_obj(existing)
             session.add(job)
             session.commit()
 
@@ -1191,6 +1279,9 @@ class JobManager:
             retry_of_job_id=job.retry_of_job_id,
             run_strategy=job.run_strategy,
             uploads=uploads,
+            references=_loads_list(getattr(job, "references_json", None)),
+            generation=_loads_obj(getattr(job, "generation_json", None)),
+            generation_receipt=_loads_obj(getattr(job, "generation_receipt_json", None)),
             output_images=output_images,
             output_videos=output_videos,
             answer=job.answer,

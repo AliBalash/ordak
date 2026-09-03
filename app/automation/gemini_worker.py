@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import mimetypes
 from pathlib import Path
 import time
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 import uuid
 
@@ -26,7 +26,7 @@ from app.automation.existing_chrome import (
 from app.config import Settings, settings
 from app.errors import ErrorCode, JobCancelled, OrdaKError
 from app.providers import get_provider_adapter
-from app.schemas import JobMode, Provider
+from app.schemas import GenerationOptions, JobMode, Provider
 
 
 class GeminiAutomationError(RuntimeError):
@@ -63,6 +63,7 @@ class WorkerRuntime:
     save_answer: Callable[[str], None]
     save_error: Callable[[str, str, str | None], None]
     attach_output_video: Callable[[Path], None] | None = None
+    attach_generation_receipt: Callable[[Any], None] | None = None
     should_cancel: Callable[[], bool] | None = None
     start_agent_step: Callable[[int, str, str, str], str] | None = None
     finish_agent_step: Callable[[str, str, str | None, str | None], None] | None = None
@@ -91,10 +92,23 @@ class AutomationJobRequest:
     upload_paths: list[Path] | None = None
     run_strategy: str | None = None
     agent_config: AgentResolvedConfig | None = None
+    #: Explicit generation contract (model/aspect/duration/resolution/quality).
+    generation: GenerationOptions | None = None
+    #: ``(role, path)`` pairs describing what each upload is for.
+    references: list[tuple[str, Path]] | None = None
 
     @property
     def uploads(self) -> list[Path]:
         return list(self.upload_paths or [])
+
+    @property
+    def reference_map(self) -> dict[str, Path]:
+        """``{role: path}`` for callers that need a specific role (e.g. Flow frames)."""
+        return {role: path for role, path in (self.references or [])}
+
+    @property
+    def requested_model(self) -> str | None:
+        return self.generation.model if self.generation else None
 
 
 GeminiJobRequest = AutomationJobRequest
@@ -109,122 +123,208 @@ def _provider_name(provider: Provider) -> str:
 
 
 
-def _gemini_display_label(model: str) -> str:
-    """Map internal gemini model to UI visible label (§6-7)."""
-    mapping = {
-        "nano_banana_pro": "Nano Banana Pro",
-        "nano_banana_2": "Nano Banana",
-        "nano-banana-pro": "Nano Banana Pro",
-        "nano-banana-2": "Nano Banana",
-    }
-    return mapping.get(model, model)
+GEMINI_MODEL_LABELS = {
+    "nano_banana_pro": "Nano Banana Pro",
+    "nano_banana_2": "Nano Banana 2",
+}
 
-def _parse_gemini_model_from_prompt(prompt: str) -> str | None:
-    """Extract [MODEL:...] tag if present in prompt (QH pipeline encodes model)."""
-    import re
-    m = re.search(r"\[MODEL:([^\]]+)\]", prompt)
-    if m:
-        return m.group(1).strip()
+#: Substrings that identify a model in a UI label after normalization.
+GEMINI_MODEL_MATCHERS = {
+    "nano_banana_pro": ("nano banana pro", "nanobananapro"),
+    "nano_banana_2": ("nano banana 2", "nano banana2", "nanobanana2"),
+}
+
+
+def _gemini_display_label(model: str) -> str:
+    """Map an internal Gemini model id to its visible UI label (§6-7)."""
+    key = str(model or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return GEMINI_MODEL_LABELS.get(key, str(model))
+
+
+def _normalize_ui_label(label: str) -> str:
+    return " ".join(str(label or "").strip().lower().split())
+
+
+def _identify_gemini_model(label: str) -> str | None:
+    """Reverse-map an observed UI label to an internal model id.
+
+    'Nano Banana Pro' must never be read as 'nano_banana_2' and vice versa, so the Pro
+    matcher is checked first and the plain matcher only accepts labels without 'pro'.
+    """
+    normalized = _normalize_ui_label(label)
+    if not normalized:
+        return None
+    for needle in GEMINI_MODEL_MATCHERS["nano_banana_pro"]:
+        if needle in normalized:
+            return "nano_banana_pro"
+    if "pro" in normalized:
+        return None
+    for needle in GEMINI_MODEL_MATCHERS["nano_banana_2"]:
+        if needle in normalized:
+            return "nano_banana_2"
+    if "nano banana" in normalized:
+        return "nano_banana_2"
     return None
 
-def _select_gemini_image_model(tab, requested: str, runtime) -> str:
-    """Efficient Gemini model selection: check current, only open if needed (§5)."""
-    if not requested:
-        return "unknown"
-    display = _gemini_display_label(requested)
-    # Fast check: is display already visible as selected?
+
+def _read_gemini_selected_model(tab) -> dict[str, str]:
+    """Read the model the Gemini UI reports as *currently selected*.
+
+    Only the model control's own label is trusted — never ``document.body.innerText``,
+    which also matches the names listed inside a closed dropdown.
+    """
+    from app.automation.existing_chrome import execute_javascript
+    import json as js
+
+    script = """
+    (() => {
+      const seen = [];
+      const push = (source, el) => {
+        if (!el) return;
+        const text = (el.getAttribute('aria-label') || el.innerText || '').trim();
+        if (text) seen.push({source, text: text.slice(0, 160)});
+      };
+      // 1. explicit model-picker test ids / data attributes
+      document.querySelectorAll(
+        '[data-test-id*="model"], [data-testid*="model"], [class*="model-selector"], [class*="modelSelector"]'
+      ).forEach(el => push('model-control', el));
+      // 2. a combobox/menu button whose accessible name mentions the model
+      document.querySelectorAll(
+        'button[aria-haspopup], [role="combobox"], button[aria-expanded]'
+      ).forEach(el => {
+        const text = (el.getAttribute('aria-label') || el.innerText || '');
+        if (/nano\\s*banana|flash|pro\\b/i.test(text)) push('popup-button', el);
+      });
+      // 3. an explicitly selected option, when a dropdown is open
+      document.querySelectorAll(
+        '[role="option"][aria-selected="true"], [role="menuitemradio"][aria-checked="true"]'
+      ).forEach(el => push('selected-option', el));
+      return JSON.stringify({candidates: seen});
+    })()
+    """
     try:
-        from app.automation.existing_chrome import execute_javascript
-        import json as js
-        cur = execute_javascript(tab, f"""
-        (() => {{
-          const txt = document.body.innerText;
-          const active = Array.from(document.querySelectorAll('button[aria-selected="true"], [aria-pressed="true"]')).map(b=>b.innerText).join(' | ');
-          return JSON.stringify({{has: txt.includes('{display}'), active: active.slice(0,300)}});
-        }})()
-        """)
-        info = js.loads(cur) if cur else {}
-        if info.get('has'):
-            if runtime:
-                runtime.append_log(f"Gemini model {display} already selected — skipping dropdown")
-            return display
+        raw = execute_javascript(tab, script)
+        payload = js.loads(raw) if raw else {}
     except Exception:
-        pass
-    # Need to open model selector — find button that shows current model (often contains Nano Banana or Flash)
+        payload = {}
+    for candidate in payload.get("candidates") or []:
+        text = str(candidate.get("text") or "")
+        if _identify_gemini_model(text):
+            return {"label": text, "source": str(candidate.get("source") or "")}
+    candidates = payload.get("candidates") or []
+    if candidates:
+        first = candidates[0]
+        return {"label": str(first.get("text") or ""), "source": str(first.get("source") or "")}
+    return {"label": "", "source": ""}
+
+
+def _click_element_by_text(tab, selectors: str, needle: str) -> bool:
+    """Click the first visible element matching ``selectors`` whose text contains ``needle``."""
+    from app.automation.existing_chrome import execute_javascript
+    import json as js
+
+    script = """
+    (() => {
+      const needle = %s;
+      const nodes = Array.from(document.querySelectorAll(%s));
+      const match = nodes.find(el => {
+        const text = ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).toLowerCase();
+        if (!text.includes(needle)) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      if (!match) return JSON.stringify({clicked: false});
+      match.scrollIntoView({block: 'center'});
+      match.click();
+      return JSON.stringify({clicked: true, text: (match.innerText || '').slice(0, 120)});
+    })()
+    """ % (js.dumps(needle.lower()), js.dumps(selectors))
     try:
-        from app.automation.existing_chrome import execute_javascript
-        import json as js, time
-        # Find model button (heuristic: button near top that contains model keywords)
-        js_find = """
-        (() => {
-          const btns = Array.from(document.querySelectorAll('button'));
-          const target = btns.find(b => /Nano Banana|Gemini|Flash|Pro/.test(b.innerText) && b.offsetWidth > 50);
-          if (!target) return JSON.stringify({error:'no model btn'});
-          const r = target.getBoundingClientRect();
-          return JSON.stringify({cx: r.x+r.width/2, cy: r.y+r.height/2, text: target.innerText.slice(0,120)});
-        })()
-        """
-        res = execute_javascript(tab, js_find)
-        info = js.loads(res) if res else {}
-        if 'cx' in info:
-            # Click via JS
-            js_click = f"""
-            (() => {{
-              const el = document.elementFromPoint({info['cx']}, {info['cy']});
-              if (el) el.click();
-              return 'clicked';
-            }})()
-            """
-            execute_javascript(tab, js_click)
-            time.sleep(0.6)
-            if runtime:
-                runtime.append_log(f"Opened Gemini model selector ({info.get('text','')[:60]})")
-            # Now pick requested display model
-            js_pick = f"""
-            (() => {{
-              const opts = Array.from(document.querySelectorAll('button, [role="option"], [data-test-id*="model"]'));
-              const target = opts.find(e => e.innerText.trim().includes('{display}'));
-              if (!target) return JSON.stringify({{error: 'no opt {display}'}});
-              const r = target.getBoundingClientRect();
-              return JSON.stringify({{cx: r.x+r.width/2, cy: r.y+r.height/2}});
-            }})()
-            """
-            pick = execute_javascript(tab, js_pick)
-            pick_info = js.loads(pick) if pick else {}
-            if 'cx' in pick_info:
-                js_pick_click = f"""
-                (() => {{
-                  const el = document.elementFromPoint({pick_info['cx']}, {pick_info['cy']});
-                  if (el) el.click();
-                  return 'picked {display}';
-                }})()
-                """
-                execute_javascript(tab, js_pick_click)
-                time.sleep(0.5)
-                if runtime:
-                    runtime.append_log(f"Selected Gemini model {display}")
-            else:
-                if runtime:
-                    runtime.append_log(f"Gemini model option {display} not found: {pick}", level="warning")
-            time.sleep(0.3)
-            # Verify
-            verify = execute_javascript(tab, f"""
-            (() => {{
-              return JSON.stringify({{has: document.body.innerText.includes('{display}')}});
-            }})()
-            """)
-            vinfo = js.loads(verify) if verify else {}
-            if not vinfo.get('has'):
-                raise RuntimeError(f"Gemini model {display} not verified after selection — MODEL_SELECTION_FAILED")
-            return display
-        else:
-            if runtime:
-                runtime.append_log(f"Gemini model button not found: {res}", level="warning")
-    except Exception as e:
-        if runtime:
-            runtime.append_log(f"Gemini model selection warning: {e}", level="warning")
-        # Don't fail hard for now — allow generation to continue with current model, but log
-    return display
+        raw = execute_javascript(tab, script)
+        payload = js.loads(raw) if raw else {}
+        return bool(payload.get("clicked"))
+    except Exception:
+        return False
+
+
+def _select_gemini_image_model(tab, requested: str, runtime) -> str:
+    """Select and positively verify the requested Gemini image model (§5-7).
+
+    Never returns on an unverified model: it raises ``OrdaKError`` with
+    ``MODEL_SELECTION_FAILED`` / ``MODEL_NOT_AVAILABLE`` so no paid generation runs
+    against the wrong model.
+    """
+    requested_key = str(requested or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if requested_key not in GEMINI_MODEL_LABELS:
+        raise OrdaKError(
+            code=ErrorCode.MODEL_NOT_AVAILABLE,
+            message=f"Unknown Gemini image model {requested!r}.",
+            technical_details=f"Allowed: {sorted(GEMINI_MODEL_LABELS)}",
+        )
+    display = GEMINI_MODEL_LABELS[requested_key]
+
+    observed = _read_gemini_selected_model(tab)
+    if _identify_gemini_model(observed["label"]) == requested_key:
+        if runtime is not None:
+            runtime.append_log(
+                f"Gemini model already selected: {observed['label']!r} ({observed['source']})"
+            )
+        return observed["label"]
+
+    if runtime is not None:
+        runtime.append_log(
+            f"Gemini model is {observed['label']!r}; selecting {display!r}"
+        )
+
+    opened = _click_element_by_text(
+        tab,
+        '[data-test-id*="model"], [data-testid*="model"], button[aria-haspopup], [role="combobox"], button[aria-expanded]',
+        "nano banana",
+    )
+    if not opened:
+        opened = _click_element_by_text(
+            tab,
+            '[data-test-id*="model"], [data-testid*="model"], button[aria-haspopup], [role="combobox"]',
+            "model",
+        )
+    if not opened:
+        raise OrdaKError(
+            code=ErrorCode.MODEL_SELECTION_FAILED,
+            message="Could not open the Gemini model selector.",
+            technical_details=f"observed control label: {observed['label']!r}",
+        )
+    time.sleep(0.8)
+
+    picked = _click_element_by_text(
+        tab,
+        '[role="option"], [role="menuitem"], [role="menuitemradio"], button, li',
+        display.lower(),
+    )
+    if not picked:
+        raise OrdaKError(
+            code=ErrorCode.MODEL_NOT_AVAILABLE,
+            message=f"Gemini does not currently offer {display!r}.",
+            technical_details="The model selector opened but the requested option was absent.",
+        )
+    time.sleep(1.0)
+
+    # Post-selection verification: the control itself must now report the requested model.
+    for attempt in range(4):
+        verified = _read_gemini_selected_model(tab)
+        if _identify_gemini_model(verified["label"]) == requested_key:
+            if runtime is not None:
+                runtime.append_log(
+                    f"Gemini model verified: {verified['label']!r} ({verified['source']})"
+                )
+            return verified["label"]
+        time.sleep(0.7)
+
+    raise OrdaKError(
+        code=ErrorCode.MODEL_SELECTION_FAILED,
+        message=f"Selected {display!r} but the Gemini UI does not confirm it.",
+        technical_details=f"last observed label: {verified['label']!r}",
+    )
+
 
 def _verify_chatgpt_project_tab(
     tab: ChromeTabRef,
@@ -990,21 +1090,19 @@ def _run_gemini_job_in_existing_chrome(
         if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
             _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
 
-        # Gemini model selection for image generation (§5-7) — efficient, no redundant open/close
-        requested_gemini_model = None
+        # Gemini image model selection (§5-7). The model comes from the explicit
+        # generation contract on the job — never inferred, never parsed out of the prompt.
         if job.provider == "gemini" and job.mode == "image_generate":
-            # Try to parse from prompt tag [MODEL:...] or from job metadata if available
-            requested_gemini_model = _parse_gemini_model_from_prompt(effective_prompt)
-            # Fallback to default if not encoded
-            if not requested_gemini_model:
-                # Use pipeline default for QH, else Nano Banana Pro
-                requested_gemini_model = "nano_banana_pro"
-            try:
-                _select_gemini_image_model(tab, requested_gemini_model, runtime)
-            except Exception as e:
-                # Strict per §5: if requested model cannot be used, fail with structured error
-                from app.errors import ErrorCode, OrdaKError
-                raise OrdaKError(code=ErrorCode.MODEL_SELECTION_FAILED, message=str(e)) from e
+            requested_gemini_model = (job.requested_model or "").strip() or None
+            if requested_gemini_model is None:
+                raise OrdaKError(
+                    code=ErrorCode.MODEL_SELECTION_FAILED,
+                    message=(
+                        "Gemini image jobs must declare generation.model explicitly "
+                        "(nano_banana_pro or nano_banana_2)."
+                    ),
+                )
+            _select_gemini_image_model(tab, requested_gemini_model, runtime)
 
         if job.mode == "image_generate":
             activated = activate_create_image_mode(tab, provider=job.provider)
