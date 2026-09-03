@@ -2636,3 +2636,115 @@ def read_latest_response_text(
     provider: ProviderName = "gemini",
 ) -> str:
     return read_latest_response_baseline(tab, provider=provider).text
+
+
+def _linux_cdp_commands(tab: ChromeTabRef, commands: list[dict[str, Any]]) -> None:
+    """Send a sequence of CDP commands to a tab and drain their replies.
+
+    Radix/React controls ignore a synthetic ``element.click()`` because they listen for
+    trusted pointer events, so real Flow interactions must go through CDP Input.
+    """
+    info = _linux_find_tab(tab)
+    if info is None or not info.websocket_debugger_url:
+        raise _linux_error("Could not find the requested Google Chrome tab.")
+    with websocket_connect(
+        info.websocket_debugger_url,
+        proxy=None,
+        open_timeout=5,
+        close_timeout=2,
+    ) as websocket:
+        for index, command in enumerate(commands, start=1):
+            websocket.send(json.dumps({"id": index, **command}))
+            while True:
+                message = json.loads(websocket.recv())
+                if message.get("id") == index:
+                    break
+
+
+def dispatch_mouse_click(tab: ChromeTabRef, x: float, y: float) -> None:
+    """Dispatch a trusted left click at viewport coordinates ``(x, y)``."""
+    if _is_mac_backend():
+        execute_javascript(tab, f"document.elementFromPoint({x}, {y})?.click()")
+        return
+    _linux_cdp_commands(
+        tab,
+        [
+            {
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
+                    "button": "none",
+                    "buttons": 0,
+                },
+            },
+            {
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 1,
+                    "clickCount": 1,
+                },
+            },
+            {
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                },
+            },
+        ],
+    )
+
+
+def dispatch_key(
+    tab: ChromeTabRef,
+    key: str,
+    *,
+    code: str | None = None,
+    key_code: int | None = None,
+    modifiers: int = 0,
+) -> None:
+    """Dispatch a trusted key press/release pair."""
+    if _is_mac_backend():
+        execute_javascript(
+            tab,
+            "document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', "
+            f"{{key: {json.dumps(key)}, bubbles: true}}))",
+        )
+        return
+    params: dict[str, Any] = {"key": key, "modifiers": modifiers}
+    if code:
+        params["code"] = code
+    if key_code is not None:
+        params["windowsVirtualKeyCode"] = key_code
+        params["nativeVirtualKeyCode"] = key_code
+    _linux_cdp_commands(
+        tab,
+        [
+            {"method": "Input.dispatchKeyEvent", "params": {"type": "keyDown", **params}},
+            {"method": "Input.dispatchKeyEvent", "params": {"type": "keyUp", **params}},
+        ],
+    )
+
+
+def insert_text(tab: ChromeTabRef, text: str) -> None:
+    """Insert text into the focused editor as if typed (works with contenteditable)."""
+    if _is_mac_backend():
+        execute_javascript(
+            tab,
+            "document.execCommand('insertText', false, " + json.dumps(text) + ")",
+        )
+        return
+    _linux_cdp_commands(
+        tab,
+        [{"method": "Input.insertText", "params": {"text": text}}],
+    )
