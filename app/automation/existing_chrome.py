@@ -10,8 +10,9 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, ProxyHandler, build_opener
@@ -2748,3 +2749,151 @@ def insert_text(tab: ChromeTabRef, text: str) -> None:
         tab,
         [{"method": "Input.insertText", "params": {"text": text}}],
     )
+
+
+def _linux_cdp_call(
+    tab: ChromeTabRef,
+    commands: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Send CDP commands and return each reply's ``result`` in order.
+
+    ``_linux_cdp_commands`` drains replies and discards them; frame uploads and download
+    routing need the payload back (node ids, guids), so this variant keeps them.
+    """
+    info = _linux_find_tab(tab)
+    if info is None or not info.websocket_debugger_url:
+        raise _linux_error("Could not find the requested Google Chrome tab.")
+    results: list[dict[str, Any]] = []
+    with websocket_connect(
+        info.websocket_debugger_url,
+        proxy=None,
+        open_timeout=5,
+        close_timeout=2,
+    ) as websocket:
+        for index, command in enumerate(commands, start=1):
+            websocket.send(json.dumps({"id": index, **command}))
+            while True:
+                message = json.loads(websocket.recv())
+                if message.get("id") != index:
+                    continue
+                if message.get("error"):
+                    raise _linux_error(
+                        str(message["error"].get("message") or "Chrome DevTools call failed.")
+                    )
+                results.append(message.get("result") or {})
+                break
+    return results
+
+
+def set_file_input_files(
+    tab: ChromeTabRef,
+    selector: str,
+    file_paths: Sequence[Path],
+) -> None:
+    """Attach real files to a hidden ``<input type=file>`` through CDP's trusted path.
+
+    Providers that open a native file chooser (Google Flow's asset picker, ChatGPT's
+    composer) cannot be driven by a synthetic ``DataTransfer``; ``DOM.setFileInputFiles``
+    is the only route that produces a genuine upload.
+    """
+    if _is_mac_backend():
+        raise _linux_error("set_file_input_files requires the Linux/CDP backend.")
+    resolved = [str(Path(path).resolve()) for path in file_paths]
+    for path in resolved:
+        if not Path(path).is_file():
+            raise _linux_error(f"Upload source is missing on disk: {path}")
+    info = _linux_find_tab(tab)
+    if info is None or not info.websocket_debugger_url:
+        raise _linux_error("Could not find the requested Google Chrome tab.")
+    # DOM node ids are scoped to one DevTools session, so the lookup and the attach have to
+    # share a single connection — reconnecting between them invalidates the node.
+    with websocket_connect(
+        info.websocket_debugger_url,
+        proxy=None,
+        open_timeout=5,
+        close_timeout=2,
+    ) as websocket:
+        request_id = 0
+
+        def call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            nonlocal request_id
+            request_id += 1
+            websocket.send(json.dumps({"id": request_id, "method": method, "params": params}))
+            while True:
+                message = json.loads(websocket.recv())
+                if message.get("id") != request_id:
+                    continue
+                if message.get("error"):
+                    raise _linux_error(
+                        str(message["error"].get("message") or "Chrome DevTools call failed.")
+                    )
+                return message.get("result") or {}
+
+        document = call("DOM.getDocument", {"depth": 1})
+        root_id = int((document.get("root") or {}).get("nodeId") or 0)
+        if not root_id:
+            raise _linux_error("Chrome did not return a document root for the upload target.")
+        found = call("DOM.querySelector", {"nodeId": root_id, "selector": selector})
+        node_id = int(found.get("nodeId") or 0)
+        if not node_id:
+            raise _linux_error(f"No file input matched {selector!r} in the current tab.")
+        call("DOM.setFileInputFiles", {"files": resolved, "nodeId": node_id})
+
+
+@contextmanager
+def download_to(tab: ChromeTabRef, download_path: Path | str):
+    """Route this browser's downloads into ``download_path`` for the duration of the block.
+
+    Two details make this work where a fire-and-forget call does not:
+
+    * ``Browser.setDownloadBehavior`` is a *browser*-domain command. Sent on a page session
+      Chrome accepts it and then quietly keeps the profile's default directory, so it has to
+      go to the browser websocket endpoint.
+    * The override only lives as long as the DevTools session that set it. Closing the socket
+      restores the default, so the session must stay open across the click and the wait.
+
+    ``allowAndName`` writes each download as its own GUID inside ``download_path``. Combined
+    with a per-job directory that means the file found there is unambiguously this job's
+    download — no filename collisions, no modification-time guessing (§23).
+    """
+    target = Path(download_path)
+    target.mkdir(parents=True, exist_ok=True)
+    if _is_mac_backend():
+        yield target
+        return
+    endpoint = str(_linux_devtools_version().get("webSocketDebuggerUrl") or "")
+    if not endpoint:
+        raise _linux_error("Chrome DevTools did not expose a browser websocket endpoint.")
+    with websocket_connect(endpoint, proxy=None, open_timeout=5, close_timeout=2) as websocket:
+        websocket.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "Browser.setDownloadBehavior",
+                    "params": {
+                        "behavior": "allowAndName",
+                        "downloadPath": str(target),
+                        "eventsEnabled": True,
+                    },
+                }
+            )
+        )
+        while True:
+            message = json.loads(websocket.recv())
+            if message.get("id") != 1:
+                continue
+            if message.get("error"):
+                raise _linux_error(
+                    str(message["error"].get("message") or "Could not route Chrome downloads.")
+                )
+            break
+        yield target
+
+
+def set_download_behavior(tab: ChromeTabRef, download_path: Path | str) -> None:
+    """One-shot form of :func:`download_to`, for callers that only need the directory made.
+
+    The routing itself does not survive this call — use :func:`download_to` when a download
+    actually has to land somewhere specific.
+    """
+    Path(download_path).mkdir(parents=True, exist_ok=True)

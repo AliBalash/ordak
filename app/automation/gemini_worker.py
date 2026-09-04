@@ -969,14 +969,31 @@ def _raise_structured_error(exc: OrdaKError) -> None:
 
 
 def _map_login_error(provider: Provider, login_state: str) -> None:
+    """Turn a provider's login state into the structured code the pipeline pauses on (§26).
+
+    Flow gets its own codes so a paused video stage is distinguishable from a paused text
+    or image stage in the job record and in the Telegram log.
+    """
     if login_state == "login_required":
+        code = (
+            ErrorCode.FLOW_LOGIN_REQUIRED if provider == "flow" else ErrorCode.LOGIN_REQUIRED
+        )
         _raise_structured_error(
             OrdaKError(
-                code=ErrorCode.LOGIN_REQUIRED,
-                message=f"{_provider_name(provider)} login required in your regular Google Chrome session.",
+                code=code,
+                message=(
+                    f"{_provider_name(provider)} login required in your regular Google Chrome "
+                    "session."
+                ),
             )
         )
     if login_state == "manual_verification_required":
+        if provider == "flow":
+            raise GeminiAutomationError(
+                "Flow is asking for manual verification. Automation paused.",
+                status="manual_verification_required",
+                error_code=ErrorCode.FLOW_MANUAL_VERIFICATION_REQUIRED.value,
+            )
         raise ManualVerificationRequired()
 
 

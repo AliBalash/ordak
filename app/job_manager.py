@@ -36,7 +36,7 @@ from app.automation.gemini_worker import (
 from app.automation.flow_worker import run_flow_job
 from app.config import Settings, settings
 from app.database import SessionLocal
-from app.errors import ErrorCode, get_error_descriptor
+from app.errors import ErrorCode, OrdaKError, get_error_descriptor
 from app.models import AgentStep, Conversation, Job
 from app.providers import get_provider_adapter
 from app.schemas import (
@@ -950,6 +950,16 @@ class JobManager:
                         self.worker(job_id, job_request, runtime=runtime, app_settings=self.settings)
                 except GeminiAutomationError:
                     pass
+                except OrdaKError as exc:
+                    # A structured provider error must keep its code in the job record;
+                    # falling through to the generic handler would erase it.
+                    detail = (
+                        f"{exc.message} ({exc.technical_details})"
+                        if exc.technical_details
+                        else exc.message
+                    )
+                    self._save_error(job_id, detail, "failed", exc.code.value)
+                    self._append_log(job_id, f"[{exc.code.value}] {detail}", level="error")
                 except Exception as exc:
                     self._save_error(job_id, str(exc) or "Unexpected job failure.", "failed", None)
                     self._append_log(job_id, str(exc) or "Unexpected job failure.", level="error")
