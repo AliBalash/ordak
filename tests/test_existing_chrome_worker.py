@@ -10,6 +10,8 @@ from app.automation.existing_chrome import ChromeTabInfo, ChromeTabRef, Response
 from app.automation.gemini_worker import GeminiAutomationError, GeminiJobRequest, run_gemini_job
 from app.config import settings
 from app.providers.base import ImageExtractionResult, ProviderDiagnostics, RebindResult
+from app.schemas import GenerationOptions
+from imagefixtures import write_png
 
 
 @dataclass
@@ -499,12 +501,17 @@ def test_image_generate_job_collects_output_images(
     runtime = RuntimeSpy()
     adapter = FakeAdapter()
     local_settings = generic_worker_settings()
-    output_path = tmp_path / "generated.png"
-    output_path.write_bytes(b"fake-output")
+    output_path = write_png(tmp_path / "generated.png", 1080, 1920, seed=11)
     adapter.result = "__GENERATED_IMAGES__:2"
     adapter.image_paths = [output_path]
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+    # The model contract is mandatory for Gemini image jobs, and selection is a live-UI
+    # concern; this test is about collecting the output, so the confirmed label is stubbed.
+    monkeypatch.setattr(
+        "app.automation.gemini_worker._select_gemini_image_model",
+        lambda tab, requested, runtime: {"label": "Nano Banana 2", "source": "model-control"},
+    )
 
     answer = run_gemini_job(
         "job-existing-chrome-image-generate",
@@ -512,6 +519,7 @@ def test_image_generate_job_collects_output_images(
             question="پس زمینه را حذف کن.",
             mode="image_generate",
             start_new_chat=True,
+            generation=GenerationOptions(model="nano_banana_2", aspect_ratio="9:16"),
         ),
         runtime=runtime,
         app_settings=local_settings,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from app.agent.executor import AgentExecutor
 from app.agent.protocol import ApplyPatchAction, ExecAction, ReadFileAction, WriteFileAction
 from app.agent.types import AgentResolvedConfig
@@ -117,7 +119,7 @@ def test_executor_runs_host_command(tmp_path) -> None:
             id="step-exec",
             tool="exec",
             cwd=".",
-            argv=["python", "-c", "print('ok-from-agent')"],
+            argv=[sys.executable, "-c", "print('ok-from-agent')"],
             timeout_seconds=5,
         ),
         resolved_config=config,

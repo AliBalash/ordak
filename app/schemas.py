@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 Provider = Literal["gemini", "chatgpt", "flow"]
@@ -122,6 +122,25 @@ class GenerationReceipt(BaseModel):
     submission_fingerprint: str | None = None
     reference_roles: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _verified_requires_evidence(self) -> "GenerationReceipt":
+        """``model_verified`` is a claim about the UI, so it needs the observed label.
+
+        Without ``actual_model_label`` there is nothing to audit and a receipt could
+        assert a model that was never confirmed on screen (§8, §18).
+        """
+        if self.model_verified and not (self.actual_model_label or "").strip():
+            raise ValueError(
+                "model_verified=True requires actual_model_label as UI evidence."
+            )
+        if self.pro_regeneration_used and not any(
+            str(note).startswith("pro_distinction=") for note in self.notes
+        ):
+            raise ValueError(
+                "pro_regeneration_used=True requires a pro_distinction=<reason> note."
+            )
+        return self
 
 
 class JobCreateRequest(BaseModel):

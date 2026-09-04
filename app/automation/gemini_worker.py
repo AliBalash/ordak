@@ -11,6 +11,7 @@ import uuid
 from app.agent import run_agent_job
 from app.agent.executor import AgentExecutor
 from app.agent.types import AgentResolvedConfig
+from app.automation import gemini_pro, image_validation
 from app.automation.browser import ensure_linux_remote_debugging_session
 from app.automation.existing_chrome import (
     ChromeTabInfo,
@@ -26,7 +27,7 @@ from app.automation.existing_chrome import (
 from app.config import Settings, settings
 from app.errors import ErrorCode, JobCancelled, OrdaKError
 from app.providers import get_provider_adapter
-from app.schemas import GenerationOptions, JobMode, Provider
+from app.schemas import GenerationOptions, GenerationReceipt, JobMode, Provider
 
 
 class GeminiAutomationError(RuntimeError):
@@ -247,12 +248,13 @@ def _click_element_by_text(tab, selectors: str, needle: str) -> bool:
         return False
 
 
-def _select_gemini_image_model(tab, requested: str, runtime) -> str:
+def _select_gemini_image_model(tab, requested: str, runtime) -> dict[str, str]:
     """Select and positively verify the requested Gemini image model (§5-7).
 
-    Never returns on an unverified model: it raises ``OrdaKError`` with
-    ``MODEL_SELECTION_FAILED`` / ``MODEL_NOT_AVAILABLE`` so no paid generation runs
-    against the wrong model.
+    Returns the UI evidence (``{"label", "source"}``) that the receipt has to quote —
+    never a value invented here.  Never returns on an unverified model: it raises
+    ``OrdaKError`` with ``MODEL_SELECTION_FAILED`` / ``MODEL_NOT_AVAILABLE`` so no paid
+    generation runs against the wrong model.
     """
     requested_key = str(requested or "").strip().lower().replace("-", "_").replace(" ", "_")
     if requested_key not in GEMINI_MODEL_LABELS:
@@ -269,7 +271,7 @@ def _select_gemini_image_model(tab, requested: str, runtime) -> str:
             runtime.append_log(
                 f"Gemini model already selected: {observed['label']!r} ({observed['source']})"
             )
-        return observed["label"]
+        return dict(observed)
 
     if runtime is not None:
         runtime.append_log(
@@ -316,13 +318,162 @@ def _select_gemini_image_model(tab, requested: str, runtime) -> str:
                 runtime.append_log(
                     f"Gemini model verified: {verified['label']!r} ({verified['source']})"
                 )
-            return verified["label"]
+            return dict(verified)
         time.sleep(0.7)
 
     raise OrdaKError(
         code=ErrorCode.MODEL_SELECTION_FAILED,
         message=f"Selected {display!r} but the Gemini UI does not confirm it.",
         technical_details=f"last observed label: {verified['label']!r}",
+    )
+
+
+GEMINI_PRO_MODEL = "nano_banana_pro"
+
+
+def _normalize_gemini_model(model: str | None) -> str:
+    return str(model or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _run_gemini_pro_path(
+    tab,
+    *,
+    runtime: WorkerRuntime | None,
+    timeout_ms: int,
+) -> gemini_pro.ProOutcome:
+    """Take a Nano Banana 2 first result to a verified Pro result (§6).
+
+    Both failure modes are fatal by design: a missing affordance and an
+    indistinguishable result would otherwise let Nano Banana 2 be recorded as Pro.
+    """
+    from app.automation.existing_chrome import inspect_generated_image_state
+
+    def _log(message: str) -> None:
+        if runtime is not None:
+            runtime.append_log(message)
+
+    try:
+        outcome = gemini_pro.run_pro_regeneration(
+            tab,
+            timeout_ms=timeout_ms,
+            log=_log,
+            state_reader=lambda ref: inspect_generated_image_state(ref, provider="gemini"),
+        )
+    except gemini_pro.ProPathUnavailable as exc:
+        raise OrdaKError(
+            code=ErrorCode.MODEL_NOT_AVAILABLE,
+            message=(
+                "Nano Banana Pro was requested but Gemini offered no Pro regeneration for "
+                "this result, and a Nano Banana 2 image must never be accepted as Pro."
+            ),
+            technical_details=str(exc),
+        ) from exc
+    except gemini_pro.ProResultNotDistinct as exc:
+        raise OrdaKError(
+            code=ErrorCode.MODEL_NOT_AVAILABLE,
+            message=(
+                "The Pro regeneration produced no result that could be distinguished "
+                "from the initial Nano Banana 2 image."
+            ),
+            technical_details=str(exc),
+        ) from exc
+    return outcome
+
+
+def _reference_hashes(job: AutomationJobRequest) -> list[str]:
+    """SHA-256 of everything we uploaded, so a thumbnail can never pass as a result."""
+    hashes: list[str] = []
+    for path in job.uploads:
+        try:
+            hashes.append(image_validation.sha256_file(path))
+        except OSError:
+            continue
+    return hashes
+
+
+def _validate_gemini_images(
+    artifacts: list[Path],
+    *,
+    job: AutomationJobRequest,
+    model_label: str | None,
+    stale_hashes: list[str],
+    runtime: WorkerRuntime | None,
+) -> list[image_validation.ImageValidation]:
+    """Apply the §32 checks to every downloaded image before the job can succeed."""
+    reference_hashes = _reference_hashes(job)
+    roles = [role for role, _ in (job.references or [])]
+    accepted: list[image_validation.ImageValidation] = []
+    seen: list[str] = []
+    for artifact in artifacts:
+        try:
+            record = image_validation.validate_generated_image(
+                artifact,
+                provider="gemini",
+                model=model_label,
+                references=roles,
+                expected_aspect_ratio=(job.generation.aspect_ratio if job.generation else None),
+                reference_hashes=reference_hashes,
+                forbidden_hashes=seen,
+                stale_hashes=stale_hashes,
+            )
+        except image_validation.ImageValidationError as exc:
+            raise OrdaKError(
+                code=ErrorCode.RESULT_NOT_EXTRACTABLE,
+                message=f"The downloaded Gemini image was rejected ({exc.reason}): {exc.message}",
+                technical_details=f"path={artifact}",
+            ) from exc
+        seen.append(record.sha256)
+        accepted.append(record)
+        if runtime is not None:
+            runtime.append_log(
+                f"Image accepted: {artifact.name} {record.width}x{record.height} "
+                f"{record.image_format} {record.size_bytes}B sha256={record.sha256[:12]}"
+            )
+    return accepted
+
+
+def _build_gemini_receipt(
+    job: AutomationJobRequest,
+    *,
+    model_evidence: dict[str, str] | None,
+    pro_outcome: gemini_pro.ProOutcome | None,
+    validations: list[image_validation.ImageValidation],
+    workspace_url: str | None,
+) -> GenerationReceipt:
+    """Only observations go in here — labels from the UI, hashes from the files (§8)."""
+    requested = job.requested_model
+    observed_label = str((model_evidence or {}).get("label") or "").strip() or None
+    observed_source = str((model_evidence or {}).get("source") or "").strip()
+    verified = bool(
+        observed_label
+        and observed_source
+        and _identify_gemini_model(observed_label) == _normalize_gemini_model(requested)
+    )
+    notes: list[str] = []
+    if observed_source:
+        notes.append(f"model_label_source={observed_source}")
+    if pro_outcome is not None:
+        notes.extend(pro_outcome.notes)
+    for record in validations:
+        notes.append(
+            f"image={record.path.name} {record.width}x{record.height} sha256={record.sha256}"
+        )
+    aspect = None
+    if validations:
+        first = validations[0]
+        aspect = f"{first.width}:{first.height}"
+    return GenerationReceipt(
+        provider="gemini",
+        requested_model=requested,
+        actual_model_label=observed_label,
+        model_verified=verified,
+        pro_regeneration_used=bool(pro_outcome and pro_outcome.used),
+        requested_quality=(job.generation.quality if job.generation else None),
+        requested_aspect_ratio=(job.generation.aspect_ratio if job.generation else None),
+        actual_aspect_ratio=aspect,
+        workspace_url=workspace_url,
+        reference_roles=[role for role, _ in (job.references or [])],
+        notes=notes,
     )
 
 
@@ -1028,6 +1179,8 @@ def _run_gemini_job_in_existing_chrome(
     adapter = get_provider_adapter(job.provider)
     tab: ChromeTabRef | None = None
     effective_prompt = _effective_prompt(job)
+    model_evidence: dict[str, str] | None = None
+    pro_outcome: gemini_pro.ProOutcome | None = None
     try:
         if runtime is not None:
             runtime.update_status("checking_browser")
@@ -1119,7 +1272,7 @@ def _run_gemini_job_in_existing_chrome(
                         "(nano_banana_pro or nano_banana_2)."
                     ),
                 )
-            _select_gemini_image_model(tab, requested_gemini_model, runtime)
+            model_evidence = _select_gemini_image_model(tab, requested_gemini_model, runtime)
 
         if job.mode == "image_generate":
             activated = activate_create_image_mode(tab, provider=job.provider)
@@ -1239,6 +1392,27 @@ def _run_gemini_job_in_existing_chrome(
                 app_settings=resolved,
             )
         if answer.startswith("__GENERATED_IMAGES__:"):
+            # The Pro path runs before any download: Gemini answers with a Nano Banana 2
+            # image first, and only the regenerated Pro result may be accepted (§6).
+            if (
+                job.provider == "gemini"
+                and job.mode == "image_generate"
+                and _normalize_gemini_model(job.requested_model) == GEMINI_PRO_MODEL
+            ):
+                if runtime is not None:
+                    runtime.update_status("pro_regeneration")
+                    runtime.append_log(
+                        "Nano Banana Pro requested: invoking the Pro regeneration path on the first result."
+                    )
+                    _runtime_checkpoint(runtime)
+                try:
+                    pro_outcome = _run_gemini_pro_path(
+                        tab,
+                        runtime=runtime,
+                        timeout_ms=_provider_response_timeout_ms(resolved, job.provider),
+                    )
+                except OrdaKError as exc:
+                    _raise_structured_error(exc)
             tab = _refresh_linux_provider_tab_for_images(
                 resolved,
                 adapter,
@@ -1259,9 +1433,36 @@ def _run_gemini_job_in_existing_chrome(
                         message=f"Could not extract generated images from {_provider_name(job.provider)} UI.",
                     )
                 )
+            validations: list[image_validation.ImageValidation] = []
+            if job.provider == "gemini":
+                try:
+                    validations = _validate_gemini_images(
+                        list(extraction.artifacts),
+                        job=job,
+                        model_label=str((model_evidence or {}).get("label") or "") or None,
+                        stale_hashes=(
+                            [item.sha256 for item in pro_outcome.baseline if item.sha256]
+                            if pro_outcome is not None
+                            else []
+                        ),
+                        runtime=runtime,
+                    )
+                except OrdaKError as exc:
+                    _raise_structured_error(exc)
             if runtime is not None:
                 for output_path in extraction.artifacts:
                     runtime.attach_output_image(output_path)
+                attach_receipt = getattr(runtime, "attach_generation_receipt", None)
+                if job.provider == "gemini" and attach_receipt is not None:
+                    attach_receipt(
+                        _build_gemini_receipt(
+                            job,
+                            model_evidence=model_evidence,
+                            pro_outcome=pro_outcome,
+                            validations=validations,
+                            workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),
+                        )
+                    )
             answer = (
                 f"{_provider_name(job.provider)} generated image output in the current Chrome tab. "
                 f"Saved images: {len(extraction.artifacts)}."
