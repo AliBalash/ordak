@@ -168,6 +168,117 @@ def _identify_gemini_model(label: str) -> str | None:
     return None
 
 
+_IMAGE_TOOL_STATE_SCRIPT = """
+(() => {
+  const clean = s => String(s || '').replace(/\\s+/g, ' ').trim();
+  const buttons = Array.from(document.querySelectorAll('button,[role=button]'))
+      .filter(el => el.getClientRects().length);
+  const chip = buttons.find(el => /deselect images/i.test(el.getAttribute('aria-label') || ''));
+  const toolsButton = buttons.find(el => /upload & tools|upload and tools/i.test(el.getAttribute('aria-label') || ''));
+  const rect = el => {
+    const box = el.getBoundingClientRect();
+    return {x: box.x + box.width / 2, y: box.y + box.height / 2};
+  };
+  const attribution = Array.from(document.querySelectorAll('.subtitle-attribution, [class*=attribution]'))
+      .map(el => clean(el.textContent)).filter(Boolean);
+  return JSON.stringify({
+    imageToolActive: !!chip,
+    toolsButton: toolsButton ? rect(toolsButton) : null,
+    attribution: attribution,
+  });
+})()
+"""
+
+
+_MENU_ITEM_SCRIPT = """
+(() => {
+  const needle = %(needle)s;
+  const clean = s => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const item = Array.from(document.querySelectorAll(
+      '[role=menuitem],[role=menuitemradio],[role=option],'
+      + '.cdk-overlay-container button,.cdk-overlay-container [role=button],'
+      + '.mat-mdc-menu-panel button,[data-radix-popper-content-wrapper] button'
+    )).filter(el => el.getClientRects().length)
+      .find(el => clean(el.innerText) === needle || clean(el.getAttribute('aria-label') || '') === needle);
+  if (!item) return JSON.stringify({found: false});
+  item.scrollIntoView({block: 'center'});
+  const box = item.getBoundingClientRect();
+  return JSON.stringify({found: true, x: box.x + box.width / 2, y: box.y + box.height / 2});
+})()
+"""
+
+
+def _read_image_tool_state(tab) -> dict[str, object]:
+    from app.automation.existing_chrome import execute_javascript
+    import json as js
+
+    try:
+        raw = execute_javascript(tab, _IMAGE_TOOL_STATE_SCRIPT)
+        return js.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _click_menu_item(tab, label: str) -> bool:
+    """Click a menu entry by its exact visible text through trusted CDP input."""
+    from app.automation.existing_chrome import dispatch_mouse_click, execute_javascript
+    import json as js
+
+    try:
+        raw = execute_javascript(tab, _MENU_ITEM_SCRIPT % {"needle": js.dumps(label.lower())})
+        payload = js.loads(raw) if raw else {}
+    except Exception:
+        return False
+    if not payload.get("found"):
+        return False
+    dispatch_mouse_click(tab, float(payload["x"]), float(payload["y"]))
+    return True
+
+
+def _activate_gemini_image_tool(tab, runtime) -> dict[str, object]:
+    """Turn on Gemini's image tool and return the observed state.
+
+    Gemini has no image-model dropdown: image generation is the ``Create image``
+    entry of the ``Upload & tools`` menu, and the only place the UI names the image
+    model is the zero-state line ``Create with <model>.`` under the composer. That
+    line is the evidence the receipt quotes, so the tool has to be on before the
+    model is read.
+    """
+    from app.automation.existing_chrome import dispatch_key, dispatch_mouse_click
+
+    state = _read_image_tool_state(tab)
+    if state.get("imageToolActive"):
+        return state
+    # An overlay left open by an earlier step turns the tools button into a close
+    # button, so the menu is dismissed before the first attempt rather than toggled.
+    try:
+        dispatch_key(tab, key="Escape", code="Escape")
+        time.sleep(0.5)
+    except Exception:
+        pass
+    for attempt in range(3):
+        tools = state.get("toolsButton")
+        if isinstance(tools, dict):
+            dispatch_mouse_click(tab, float(tools["x"]), float(tools["y"]))
+            # The tools group renders after the upload rows, so a cold page needs a beat.
+            time.sleep(1.6 + 0.6 * attempt)
+            if _click_menu_item(tab, "Create image"):
+                time.sleep(1.5)
+        state = _read_image_tool_state(tab)
+        if state.get("imageToolActive"):
+            if runtime is not None:
+                runtime.append_log("Gemini image tool activated ('Create image').")
+            return state
+        time.sleep(0.6)
+    raise OrdaKError(
+        code=ErrorCode.PROVIDER_UI_CHANGED,
+        message="Could not turn on Gemini's image tool.",
+        technical_details=(
+            "No 'Deselect Images' chip appeared after using 'Upload & tools' → 'Create image'."
+        ),
+    )
+
+
 def _read_gemini_selected_model(tab) -> dict[str, str]:
     """Read the model the Gemini UI reports as *currently selected*.
 
@@ -249,11 +360,12 @@ def _click_element_by_text(tab, selectors: str, needle: str) -> bool:
 
 
 def _select_gemini_image_model(tab, requested: str, runtime) -> dict[str, str]:
-    """Select and positively verify the requested Gemini image model (§5-7).
+    """Turn on Gemini's image tool and verify which image model it will use (§5-7).
 
     Returns the UI evidence (``{"label", "source"}``) that the receipt has to quote —
-    never a value invented here.  Never returns on an unverified model: it raises
-    ``OrdaKError`` with ``MODEL_SELECTION_FAILED`` / ``MODEL_NOT_AVAILABLE`` so no paid
+    never a value invented here. The web UI offers no image-model picker: it names the
+    image model only in the composer's zero-state line ``Create with <model>.``, so a
+    requested model that the line does not name raises ``MODEL_NOT_AVAILABLE`` and no
     generation runs against the wrong model.
     """
     requested_key = str(requested or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -265,66 +377,33 @@ def _select_gemini_image_model(tab, requested: str, runtime) -> dict[str, str]:
         )
     display = GEMINI_MODEL_LABELS[requested_key]
 
-    observed = _read_gemini_selected_model(tab)
-    if _identify_gemini_model(observed["label"]) == requested_key:
-        if runtime is not None:
-            runtime.append_log(
-                f"Gemini model already selected: {observed['label']!r} ({observed['source']})"
-            )
-        return dict(observed)
+    state = _activate_gemini_image_tool(tab, runtime)
+    attributions = [str(line) for line in (state.get("attribution") or []) if str(line).strip()]
+    for line in attributions:
+        identified = _identify_gemini_model(line)
+        if identified == requested_key:
+            if runtime is not None:
+                runtime.append_log(f"Gemini image model confirmed by the UI: {line!r}")
+            return {"label": line, "source": "composer-attribution"}
 
-    if runtime is not None:
-        runtime.append_log(
-            f"Gemini model is {observed['label']!r}; selecting {display!r}"
-        )
-
-    opened = _click_element_by_text(
-        tab,
-        '[data-test-id*="model"], [data-testid*="model"], button[aria-haspopup], [role="combobox"], button[aria-expanded]',
-        "nano banana",
-    )
-    if not opened:
-        opened = _click_element_by_text(
-            tab,
-            '[data-test-id*="model"], [data-testid*="model"], button[aria-haspopup], [role="combobox"]',
-            "model",
-        )
-    if not opened:
-        raise OrdaKError(
-            code=ErrorCode.MODEL_SELECTION_FAILED,
-            message="Could not open the Gemini model selector.",
-            technical_details=f"observed control label: {observed['label']!r}",
-        )
-    time.sleep(0.8)
-
-    picked = _click_element_by_text(
-        tab,
-        '[role="option"], [role="menuitem"], [role="menuitemradio"], button, li',
-        display.lower(),
-    )
-    if not picked:
+    named = [line for line in attributions if _identify_gemini_model(line)]
+    if named:
         raise OrdaKError(
             code=ErrorCode.MODEL_NOT_AVAILABLE,
-            message=f"Gemini does not currently offer {display!r}.",
-            technical_details="The model selector opened but the requested option was absent.",
+            message=(
+                f"Gemini does not offer {display!r} for image generation right now; "
+                f"its image tool reports {named[0]!r}."
+            ),
+            technical_details=(
+                "The composer's own attribution line is the only place the web UI names "
+                "the image model, and it names a different one. Request that model "
+                "explicitly instead of letting a different one stand in for it."
+            ),
         )
-    time.sleep(1.0)
-
-    # Post-selection verification: the control itself must now report the requested model.
-    for attempt in range(4):
-        verified = _read_gemini_selected_model(tab)
-        if _identify_gemini_model(verified["label"]) == requested_key:
-            if runtime is not None:
-                runtime.append_log(
-                    f"Gemini model verified: {verified['label']!r} ({verified['source']})"
-                )
-            return dict(verified)
-        time.sleep(0.7)
-
     raise OrdaKError(
         code=ErrorCode.MODEL_SELECTION_FAILED,
-        message=f"Selected {display!r} but the Gemini UI does not confirm it.",
-        technical_details=f"last observed label: {verified['label']!r}",
+        message=f"Gemini's image tool is on but the UI does not name its model, so {display!r} cannot be verified.",
+        technical_details=f"attribution lines seen: {attributions!r}",
     )
 
 
@@ -593,14 +672,43 @@ def _provider_stable_seconds(app_settings: Settings, provider: Provider) -> int:
     return app_settings.provider_stable_response_seconds(provider)
 
 
+#: How a requested aspect ratio is described to a provider that has no such control.
+_ASPECT_FRAMING = {
+    "9:16": "a vertical 9:16 portrait frame (tall, phone-shaped, taller than it is wide)",
+    "16:9": "a horizontal 16:9 landscape frame (wide, taller than it is tall is wrong)",
+    "1:1": "a square 1:1 frame",
+    "4:5": "a vertical 4:5 portrait frame",
+    "3:4": "a vertical 3:4 portrait frame",
+    "4:3": "a horizontal 4:3 landscape frame",
+}
+
+
+def _aspect_ratio_instruction(job: AutomationJobRequest) -> str:
+    """Say the requested aspect ratio in the prompt, because the UI cannot.
+
+    Gemini's image composer offers no aspect-ratio control, and a result whose shape
+    does not match the contract is rejected by validation (§32). Asking in words is the
+    only lever the UI leaves, so the request is stated instead of hoped for.
+    """
+    requested = str((job.generation.aspect_ratio if job.generation else None) or "").strip()
+    if not requested:
+        return ""
+    described = _ASPECT_FRAMING.get(requested)
+    if described is None:
+        described = f"an aspect ratio of exactly {requested}"
+    return f"Compose the image in {described}. The output must have aspect ratio {requested}."
+
+
 def _effective_prompt(job: AutomationJobRequest) -> str:
+    aspect = _aspect_ratio_instruction(job)
+    suffix = f"\n\n{aspect}" if aspect else ""
     if job.mode == "image_generate" and job.uploads:
         return (
             "Using the uploaded reference image, generate or edit an image that matches this prompt:\n"
-            f"{job.question}"
+            f"{job.question}{suffix}"
         )
     if job.mode == "image_generate":
-        return f"Generate an image based on this prompt:\n{job.question}"
+        return f"Generate an image based on this prompt:\n{job.question}{suffix}"
     if job.mode == "image_analyze" and job.uploads:
         return f"Analyze the uploaded image and answer this request:\n{job.question}"
     return job.question
@@ -1274,7 +1382,11 @@ def _run_gemini_job_in_existing_chrome(
                 )
             model_evidence = _select_gemini_image_model(tab, requested_gemini_model, runtime)
 
-        if job.mode == "image_generate":
+        # Gemini's image tool is switched on by the model check above, which also reads
+        # the attribution the receipt quotes; clicking the tool again would toggle it off.
+        if job.mode == "image_generate" and not (
+            job.provider == "gemini" and model_evidence
+        ):
             activated = activate_create_image_mode(tab, provider=job.provider)
             if runtime is not None:
                 runtime.append_log(

@@ -948,8 +948,15 @@ class JobManager:
                         run_flow_job(job_id, job_request, runtime=runtime, app_settings=self.settings)
                     else:
                         self.worker(job_id, job_request, runtime=runtime, app_settings=self.settings)
-                except GeminiAutomationError:
-                    pass
+                except GeminiAutomationError as exc:
+                    # The worker records its own error before raising this. When it did
+                    # not get that far the job would otherwise end as "failed" with no
+                    # code and no message, which tells the operator nothing.
+                    snapshot = self.get_job_snapshot(job_id)
+                    if not snapshot.error_message:
+                        message = str(exc) or "Provider automation failed."
+                        self._save_error(job_id, message, exc.status or "failed", exc.error_code)
+                        self._append_log(job_id, message, level="error")
                 except OrdaKError as exc:
                     # A structured provider error must keep its code in the job record;
                     # falling through to the generic handler would erase it.
@@ -1486,6 +1493,8 @@ class JobManager:
         url = (tab.url or "").lower()
         if provider == "chatgpt":
             return "chatgpt.com" in url
+        if provider == "flow":
+            return "labs.google/fx/tools/flow" in url
         return "gemini.google.com" in url or "bard.google.com" in url
 
     def _probe_apple_events(self, chrome_running: bool) -> bool:

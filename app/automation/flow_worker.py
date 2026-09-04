@@ -125,6 +125,28 @@ def _current_url(tab: ChromeTabRef) -> str:
     return (info.url or "") if info is not None else ""
 
 
+#: How Flow announces a blocked location, in the URL and on the page.
+FLOW_REGION_BLOCK_URL_MARKERS = ("/unsupported-country", "flow.google.com/unsupported")
+FLOW_REGION_BLOCK_TEXT = "not available in your country"
+
+
+def _flow_region_blocked(tab: ChromeTabRef, url: str) -> bool:
+    """True when Flow has answered with its unsupported-country page."""
+    lowered = (url or "").lower()
+    if any(marker in lowered for marker in FLOW_REGION_BLOCK_URL_MARKERS):
+        return True
+    try:
+        from app.automation.existing_chrome import execute_javascript
+
+        text = execute_javascript(
+            tab,
+            "(() => (document.body ? document.body.innerText : '').slice(0, 4000))()",
+        )
+    except Exception:
+        return False
+    return FLOW_REGION_BLOCK_TEXT in str(text or "").lower()
+
+
 def _ensure_flow_project(
     tab: ChromeTabRef,
     runtime: WorkerRuntime | None,
@@ -136,6 +158,16 @@ def _ensure_flow_project(
     menu and no reference controls, so generating from it is impossible rather than wrong.
     """
     url = _current_url(tab)
+    # Flow is geo-restricted and answers a blocked location by redirecting the workspace to
+    # its unsupported-country page. Without naming that, the run fails later with "could not
+    # find the Flow input box", which sends the operator hunting for a DOM change that did
+    # not happen. Checked before anything is uploaded or generated, so it costs no credits.
+    if _flow_region_blocked(tab, url):
+        _flow_raise(
+            ErrorCode.FLOW_REGION_BLOCKED,
+            "Google Flow is not available in this country.",
+            f"observed url: {url!r}",
+        )
     if FLOW_PROJECT_URL_PREFIX in url:
         _log(runtime, f"Flow project ready: {url}")
         return url

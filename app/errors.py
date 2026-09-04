@@ -49,6 +49,7 @@ class ErrorCode(StrEnum):
     FLOW_POLICY_VIOLATION = "flow_policy_violation"
     FLOW_RECONCILIATION_REQUIRED = "flow_reconciliation_required"
     FLOW_REFERENCE_POLICY_VIOLATION = "flow_reference_policy_violation"
+    FLOW_REGION_BLOCKED = "flow_region_blocked"
     INVALID_VIDEO_OUTPUT = "invalid_video_output"
 
 
@@ -312,6 +313,20 @@ ERROR_DESCRIPTORS: dict[ErrorCode, ErrorDescriptor] = {
         title="Flow UI changed",
         message="The Google Flow layout no longer matches the controls Ordak expects.",
         suggested_action="Capture diagnostics, update the Flow selectors, then retry.",
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_REGION_BLOCKED: ErrorDescriptor(
+        code=ErrorCode.FLOW_REGION_BLOCKED,
+        title="Flow is not available in this country",
+        message=(
+            "Google Flow redirected the workspace to its unsupported-country page, so no "
+            "video can be generated from this host."
+        ),
+        suggested_action=(
+            "This is a restriction on the server's location, not a UI change and not a bug. "
+            "Run the video stages from a permitted location, or wait and resume: the check "
+            "runs before any credit is spent, so resuming costs nothing."
+        ),
         recoverable=True,
     ),
     ErrorCode.FLOW_TAB_LOST: ErrorDescriptor(

@@ -2639,15 +2639,29 @@ def read_latest_response_text(
     return read_latest_response_baseline(tab, provider=provider).text
 
 
+_BRING_TO_FRONT_SETTLE_SECONDS = 0.25
+"""Grace period after Page.bringToFront before Input events are accepted."""
+
+
 def _linux_cdp_commands(tab: ChromeTabRef, commands: list[dict[str, Any]]) -> None:
     """Send a sequence of CDP commands to a tab and drain their replies.
 
     Radix/React controls ignore a synthetic ``element.click()`` because they listen for
     trusted pointer events, so real Flow interactions must go through CDP Input.
+
+    ``Input.*`` events are delivered to the tab's render widget, and a widget that is
+    not the foreground tab of its window discards them: the command still answers with
+    an empty result, so the caller sees a successful click that the page never saw.
+    The pipeline drives ChatGPT, Gemini and Flow in one browser, so at most one of them
+    is ever in front. Any batch carrying input is therefore prefixed with
+    ``Page.bringToFront`` on the same connection.
     """
     info = _linux_find_tab(tab)
     if info is None or not info.websocket_debugger_url:
         raise _linux_error("Could not find the requested Google Chrome tab.")
+    needs_focus = any(str(command.get("method", "")).startswith("Input.") for command in commands)
+    if needs_focus:
+        commands = [{"method": "Page.bringToFront", "params": {}}, *commands]
     with websocket_connect(
         info.websocket_debugger_url,
         proxy=None,
@@ -2660,6 +2674,9 @@ def _linux_cdp_commands(tab: ChromeTabRef, commands: list[dict[str, Any]]) -> No
                 message = json.loads(websocket.recv())
                 if message.get("id") == index:
                     break
+            if needs_focus and index == 1:
+                # The widget needs a moment to become visible before it accepts input.
+                time.sleep(_BRING_TO_FRONT_SETTLE_SECONDS)
 
 
 def dispatch_mouse_click(tab: ChromeTabRef, x: float, y: float) -> None:

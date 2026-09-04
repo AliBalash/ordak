@@ -324,14 +324,25 @@ class ExistingChromeProviderAdapter:
         )
 
     def _matches_provider_url(self, url: str) -> bool:
-        host = urlparse(url).netloc.lower()
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
         if self.provider == "chatgpt":
             return "chatgpt.com" in host
+        if self.provider == "flow":
+            # Flow lives on labs.google/fx/tools/flow. Without this branch the
+            # gemini fallback below claims Gemini tabs as Flow tabs and hides
+            # the real Flow tab, so diagnostics reports a session that is not
+            # the one a Flow job would drive.
+            return "labs.google" in host and "/fx/tools/flow" in parsed.path.lower()
         return "gemini.google.com" in host or "bard.google.com" in host
 
     @property
     def default_url(self) -> str:
-        return "https://chatgpt.com/" if self.provider == "chatgpt" else "https://gemini.google.com/app"
+        if self.provider == "chatgpt":
+            return "https://chatgpt.com/"
+        if self.provider == "flow":
+            return "https://labs.google/fx/tools/flow"
+        return "https://gemini.google.com/app"
 
 
 class GeminiAdapter(ExistingChromeProviderAdapter):
