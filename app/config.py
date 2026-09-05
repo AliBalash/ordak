@@ -296,7 +296,7 @@ def load_settings() -> Settings:
         gemini_response_timeout_ms=_as_int(
             os.getenv("GEMINI_RESPONSE_TIMEOUT_MS"), 240_000
         ),
-        flow_url=os.getenv("FLOW_URL", "https://labs.google/fx/tools/flow"),
+        flow_url=os.getenv("FLOW_URL", "https://flow.google.com/"),
         flow_response_timeout_ms=_as_int(os.getenv("FLOW_RESPONSE_TIMEOUT_MS"), 240_000),
         flow_stable_response_seconds=_as_int(os.getenv("FLOW_STABLE_RESPONSE_SECONDS"), 4),
         gemini_stable_response_seconds=_as_int(

@@ -333,7 +333,12 @@ class ExistingChromeProviderAdapter:
             # gemini fallback below claims Gemini tabs as Flow tabs and hides
             # the real Flow tab, so diagnostics reports a session that is not
             # the one a Flow job would drive.
-            return "labs.google" in host and "/fx/tools/flow" in parsed.path.lower()
+            # Flow answers on both labs.google/fx/tools/flow and flow.google.com, and the
+            # former redirects to the latter, so a tab is Flow's on either host.
+            path = parsed.path.lower()
+            return ("flow.google.com" in host) or (
+                "labs.google" in host and "/fx/tools/flow" in path
+            )
         return "gemini.google.com" in host or "bard.google.com" in host
 
     @property
@@ -341,7 +346,7 @@ class ExistingChromeProviderAdapter:
         if self.provider == "chatgpt":
             return "https://chatgpt.com/"
         if self.provider == "flow":
-            return "https://labs.google/fx/tools/flow"
+            return "https://flow.google.com/"
         return "https://gemini.google.com/app"
 
 

@@ -148,30 +148,55 @@ class FlowCapabilities:
 # Browser primitives
 # ---------------------------------------------------------------------------
 
+#: The settings panel is Angular Material, not Radix: each option is a
+#: ``button[role=radio]`` inside a ``mat-button-toggle-group``, its selection carried by
+#: ``aria-checked``, and the option text is repeated on nested spans — so only the radio
+#: itself may be read or clicked. The panel also lives in a ``.cdk-overlay-pane`` rather
+#: than a popper wrapper, and it closes whenever the tab loses focus.
+_PANEL_SELECTORS = (
+    ".cdk-overlay-pane",
+    "[data-radix-popper-content-wrapper]",
+    "[role=dialog]",
+    "[role=menu]",
+)
+
 _READ_SETTINGS_JS = r"""
 (() => {
   const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
-  const wrap = document.querySelector('[data-radix-popper-content-wrapper]');
-  if (!wrap) return JSON.stringify({open: false});
-  const groups = Array.from(wrap.querySelectorAll('[role="tablist"]')).map(list => {
-    const options = Array.from(list.querySelectorAll('[role="tab"]')).map(tab => {
-      const words = clean(tab.innerText).split(' ');
-      return {
-        label: words[words.length - 1] || '',
-        raw: clean(tab.innerText),
-        active: tab.getAttribute('aria-selected') === 'true'
-             || tab.getAttribute('data-state') === 'active'
-      };
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  // Each option's text is an icon-font token followed by the label, e.g. "videocam video",
+  // "chrome_extension ingredients", "crop_9_16 9:16" — so the label is the last word, with
+  // the "info" affordance on the resolution row dropped.
+  const label = e => {
+    const words = clean(e.innerText).toLowerCase().replace(/\s*info$/, '').split(' ');
+    return words[words.length - 1] || '';
+  };
+  const panels = [...document.querySelectorAll(%(panels)s)].filter(vis);
+  // The settings panel is the smallest visible container that offers an aspect choice.
+  const panel = panels.map(e => ({e, size: clean(e.innerText).length}))
+      .filter(o => /9:16/.test(clean(o.e.innerText)))
+      .sort((a, b) => a.size - b.size)[0];
+  if (!panel) return JSON.stringify({open: false});
+  const wrap = panel.e;
+  const radios = [...wrap.querySelectorAll('button[role=radio],[role=radio]')].filter(vis);
+  const groups = [];
+  const byGroup = new Map();
+  for (const radio of radios) {
+    const holder = radio.closest('mat-button-toggle-group,[role=radiogroup]') || wrap;
+    if (!byGroup.has(holder)) byGroup.set(holder, []);
+    byGroup.get(holder).push({
+      label: label(radio),
+      raw: clean(radio.innerText),
+      active: radio.getAttribute('aria-checked') === 'true'
+           || radio.getAttribute('aria-pressed') === 'true'
+           || radio.getAttribute('data-state') === 'active',
     });
-    return options;
-  });
+  }
+  for (const options of byGroup.values()) if (options.length) groups.push(options);
   let modelLabel = null;
-  for (const button of Array.from(wrap.querySelectorAll('button'))) {
+  for (const button of [...wrap.querySelectorAll('button,[role=button]')].filter(vis)) {
     const text = clean(button.innerText);
-    if (/arrow_drop_down/.test(text)) {
-      modelLabel = clean(text.replace('arrow_drop_down', ''));
-      break;
-    }
+    if (/omni|veo/i.test(text)) { modelLabel = clean(text.replace('arrow_drop_down', '')); break; }
   }
   const credits = clean(wrap.innerText).match(/use\s+(\d+)\s+credits?/i);
   return JSON.stringify({
@@ -181,7 +206,8 @@ _READ_SETTINGS_JS = r"""
     credits: credits ? Number(credits[1]) : null
   });
 })()
-"""
+""" % {"panels": json.dumps(", ".join(_PANEL_SELECTORS))}
+
 
 _MODEL_OPTIONS_JS = r"""
 (() => {
@@ -298,25 +324,66 @@ def _classify_groups(raw_groups: list[list[dict[str, Any]]]) -> dict[str, dict[s
     return classified
 
 
-def open_settings_menu(tab, *, attempts: int = 3) -> None:
-    """Open the Flow generation-settings menu, or raise FLOW_UI_CHANGED."""
+#: How long a cold project page may take to render its composer before the settings
+#: trigger is treated as absent.
+_TRIGGER_WAIT_SECONDS = 45.0
+
+_TRIGGER_PRESENT_JS = r"""
+(() => {
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  return [...document.querySelectorAll('button,[role=button]')].filter(vis)
+    .some(b => /settings trigger/i.test(b.getAttribute('aria-label') || ''));
+})()
+"""
+
+
+def _trigger_present(tab) -> bool:
+    from app.automation.existing_chrome import execute_javascript
+
+    try:
+        return str(execute_javascript(tab, _TRIGGER_PRESENT_JS) or "").strip().lower() == "true"
+    except Exception:
+        return False
+
+
+def open_settings_menu(tab, *, attempts: int = 4) -> None:
+    """Open the Flow generation-settings panel, or raise FLOW_UI_CHANGED.
+
+    The trigger is the composer's summary button, which carries
+    ``aria-label="Settings trigger"`` and reads like ``Video · 720p · 8s crop_16_9 x1``.
+    Matching the label first keeps this working when the summary text changes with the
+    settings it is summarising; the text patterns stay as a fallback.
+    """
+    # A freshly navigated project renders its composer well after the document is ready, so
+    # the trigger is waited for rather than assumed. Clicking before it exists is what made
+    # this look like a changed UI on a cold page load.
+    trigger_deadline = time.monotonic() + _TRIGGER_WAIT_SECONDS
+    while time.monotonic() < trigger_deadline:
+        if _trigger_present(tab):
+            break
+        time.sleep(1.0)
+
     for attempt in range(attempts):
         state = _evaluate(tab, _READ_SETTINGS_JS) or {}
         if isinstance(state, dict) and state.get("open"):
             return
-        if not _click_by_text(tab, "button,[role=button]", "720p") and not _click_by_text(
-            tab, "button,[role=button]", " · "
-        ):
-            # Fall back to matching the media-type word in the summary button.
-            _click_by_text(tab, "button,[role=button]", "video ·")
-        time.sleep(0.9 + 0.4 * attempt)
+        opened = _click_by_text(tab, "button,[role=button]", "settings trigger")
+        if not opened:
+            for needle in ("720p", "360p", " · ", "video ·"):
+                if _click_by_text(tab, "button,[role=button]", needle):
+                    opened = True
+                    break
+        time.sleep(1.0 + 0.5 * attempt)
     state = _evaluate(tab, _READ_SETTINGS_JS) or {}
     if isinstance(state, dict) and state.get("open"):
         return
     raise OrdaKError(
         code=ErrorCode.FLOW_UI_CHANGED,
         message="Could not open the Flow generation-settings menu.",
-        technical_details="No [data-radix-popper-content-wrapper] with a tablist appeared.",
+        technical_details=(
+            "No visible settings panel offering an aspect choice appeared after clicking the "
+            "composer's settings trigger."
+        ),
     )
 
 
@@ -405,7 +472,10 @@ def _select_tab_option(tab, group: str, wanted: str, *, runtime=None) -> str:
             ),
             technical_details=f"available {group}: {available}",
         )
-    if not _click_by_text(tab, '[role="tab"]', wanted, exact=True):
+    # Only the radio itself may be clicked: the same text is repeated on nested spans
+    # (mat-button-toggle-label-content / toggle-label / toggle-text), and clicking one of
+    # those does not select the option.
+    if not _click_by_text(tab, 'button[role="radio"],[role="radio"],[role="tab"]', wanted, exact=True):
         raise OrdaKError(
             code=ErrorCode.FLOW_UI_CHANGED,
             message=f"Could not click the Flow {group} option {wanted!r}.",
@@ -510,6 +580,20 @@ class AppliedSettings:
         }
 
 
+def select_reference_mode(tab, reference_mode: str, *, runtime=None) -> str:
+    """Switch Frames/Ingredients on its own, verified from the control (§18-21).
+
+    A Frames clip needs both modes in one job: only Ingredients exposes an upload input, and
+    only Frames has the Start/End slots. So the mode changes between those two steps instead
+    of once per job, and each change is verified the same way ``apply_settings`` verifies it.
+    """
+    open_settings_menu(tab)
+    try:
+        return _select_tab_option(tab, "reference_mode", reference_mode, runtime=runtime)
+    finally:
+        close_settings_menu(tab)
+
+
 def apply_settings(
     tab,
     *,
@@ -602,4 +686,5 @@ __all__ = [
     "read_capabilities",
     "read_model_options",
     "select_model",
+    "select_reference_mode",
 ]

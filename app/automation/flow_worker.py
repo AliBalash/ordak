@@ -50,8 +50,29 @@ from app.flow_policy import validate_references
 from app.providers import get_provider_adapter
 from app.schemas import GenerationReceipt
 
-FLOW_BASE_URL = "https://labs.google/fx/tools/flow"
-FLOW_PROJECT_URL_PREFIX = "https://labs.google/fx/tools/flow/project/"
+FLOW_BASE_URL = "https://flow.google.com/"
+
+#: Flow answers on two hosts: the original ``labs.google/fx/tools/flow`` and the newer
+#: ``flow.google.com``, which the former now redirects to. Both are accepted so a redirect
+#: does not read as a lost tab, and so an account on either host works unchanged.
+FLOW_HOST_MARKERS = ("labs.google/fx/tools/flow", "flow.google.com")
+
+#: A project URL on either host. The composer only exists inside a project.
+FLOW_PROJECT_URL_MARKERS = (
+    "labs.google/fx/tools/flow/project/",
+    "flow.google.com/project/",
+)
+FLOW_PROJECT_URL_PREFIX = "flow.google.com/project/"
+
+
+def _is_flow_host(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(marker in lowered for marker in FLOW_HOST_MARKERS)
+
+
+def _is_flow_project_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(marker in lowered for marker in FLOW_PROJECT_URL_MARKERS)
 
 #: Only ever one output per submission — see the module docstring.
 FLOW_OUTPUT_COUNT = "x1"
@@ -147,6 +168,43 @@ def _flow_region_blocked(tab: ChromeTabRef, url: str) -> bool:
     return FLOW_REGION_BLOCK_TEXT in str(text or "").lower()
 
 
+def _bind_flow_tab(adapter: Any, target: str, runtime: WorkerRuntime | None) -> ChromeTabRef:
+    """Return a tab reference that actually resolves to the live Flow tab.
+
+    ``open_tab`` hands back a reference built from a DevTools target id, and that id does not
+    survive everything Flow does to its own page — opening a result and leaving it replaces the
+    target. A dead reference reads back as an empty URL, which surfaced as
+    ``FLOW_TAB_LOST: observed url: ''`` even though the Flow tab was sitting right there, and it
+    cost a resume every time (observed 2026-09-05).
+
+    So a reference that resolves to nothing is re-resolved against the live tab list, and only a
+    Chrome with no Flow tab at all is treated as a lost tab. Matching requires a Flow host, so
+    no other provider's tab can be bound by mistake.
+    """
+    opened = adapter.open_tab(target_url=target)
+    tab = opened.ref if hasattr(opened, "ref") else opened
+    if _current_url(tab):
+        return tab
+
+    from app.automation.existing_chrome import list_google_chrome_tabs
+
+    for info in list_google_chrome_tabs():
+        url = str(getattr(info, "url", "") or "")
+        if _is_flow_host(url):
+            _log(runtime, f"Rebound a stale Flow tab reference to the live tab ({url[:80]})")
+            return info.ref
+    # Nothing in this Chrome is on Flow any more: ask for the tab once more before giving up.
+    opened = adapter.open_tab(target_url=target)
+    tab = opened.ref if hasattr(opened, "ref") else opened
+    if not _current_url(tab):
+        _flow_raise(
+            ErrorCode.FLOW_TAB_LOST,
+            "Chrome has no usable Google Flow tab.",
+            f"reopening {target!r} produced a tab whose URL could not be read",
+        )
+    return tab
+
+
 def _ensure_flow_project(
     tab: ChromeTabRef,
     runtime: WorkerRuntime | None,
@@ -168,13 +226,23 @@ def _ensure_flow_project(
             "Google Flow is not available in this country.",
             f"observed url: {url!r}",
         )
-    if FLOW_PROJECT_URL_PREFIX in url:
-        _log(runtime, f"Flow project ready: {url}")
-        return url
-    if "labs.google/fx/tools/flow" not in url:
+    if _is_flow_project_url(url):
+        # The block can arrive a moment after the project URL loads, so the settled URL is
+        # what decides. Checked here, still before any upload or Generate.
+        time.sleep(1.5)
+        settled = _current_url(tab)
+        if _flow_region_blocked(tab, settled):
+            _flow_raise(
+                ErrorCode.FLOW_REGION_BLOCKED,
+                "Google Flow is not available in this country.",
+                f"observed url: {settled!r}",
+            )
+        _log(runtime, f"Flow project ready: {settled}")
+        return settled
+    if not _is_flow_host(url):
         _flow_raise(
             ErrorCode.FLOW_TAB_LOST,
-            "The Flow tab is no longer on labs.google/fx/tools/flow.",
+            "The Flow tab is no longer on a Google Flow host.",
             f"observed url: {url!r}",
         )
     for attempt in range(8):
@@ -184,7 +252,7 @@ def _ensure_flow_project(
             for _ in range(10):
                 time.sleep(1.5)
                 url = _current_url(tab)
-                if FLOW_PROJECT_URL_PREFIX in url:
+                if _is_flow_project_url(url):
                     _log(runtime, f"Created a new Flow project: {url}")
                     return url
         time.sleep(1.5 + 0.5 * attempt)
@@ -280,14 +348,87 @@ def _clear_pending(output_dir: Path) -> None:
         pass
 
 
+#: A result's media URL has two shapes: the older
+#: ``labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=<id>`` and the current
+#: ``flow-content.google/video/<id>``. Both carry a stable per-asset id, which is what makes
+#: "which clip is new" a set difference rather than a guess about grid order. Blob and data
+#: URLs are excluded: they are previews, not addressable assets.
+#: A finished clip shows up in the project grid as ``flow-video-tile > img.thumbnail``, not as
+#: a ``<video>`` — only the detail view mounts one (verified 2026-09-05). Waiting for a
+#: ``<video>`` therefore made a finished generation look like no result at all, and the job
+#: timed out while its clip sat in the grid. Both shapes are read here, newest first, because
+#: the grid lists the most recent asset first; each URL carries a stable per-asset id, so
+#: "which clip is new" stays a set difference rather than a guess about order.
 _RESULT_MEDIA_JS = r"""
 (() => {
-  const urls = Array.from(document.querySelectorAll('video'))
-    .map((v) => v.src || v.currentSrc || '')
-    .filter((src) => src.includes('media.getMediaUrlRedirect'));
-  return JSON.stringify({media: Array.from(new Set(urls))});
+  const seen = new Set();
+  const out = [];
+  const add = (src) => {
+    if (!src || /^(blob|data):/i.test(src)) return;
+    const id = src.split('?')[0];
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push(src);
+  };
+  document.querySelectorAll('video').forEach((v) => {
+    const src = v.src || v.currentSrc || '';
+    if (/media\.getMediaUrlRedirect|flow-content\.google\/video\/|\/video\/[0-9a-f-]{8,}/i.test(src)) {
+      add(src);
+    }
+  });
+  // Video tiles only: an image tile carries `img.image`, a video tile `img.thumbnail`, so a
+  // still is never counted as a generated clip.
+  document.querySelectorAll('flow-video-tile img.thumbnail, flow-video-tile img')
+    .forEach((im) => add(im.src || ''));
+  return JSON.stringify({media: out});
 })()
 """
+
+
+#: What a result is addressed by once it has been produced. Flow re-signs the grid's
+#: thumbnail URLs while the page is open, so the same clip is served under a different URL
+#: minutes apart; a set difference over those URLs therefore reported clips from earlier jobs
+#: as "new" and downloaded one of them (observed 2026-09-05: a 6s clip A was downloaded for a
+#: 4s clip B request, and only the duration check caught it). The grid lists the most recent
+#: asset first, so the clip a submission produced is the first tile once the count has grown.
+NEWEST_TILE = "tile:newest"
+
+_NEWEST_TILE_JS = r"""
+(() => {
+  const tiles = [...document.querySelectorAll('flow-video-tile')];
+  if (!tiles.length) return JSON.stringify({found: false, count: 0});
+  const tile = tiles[0];
+  const holder = tile.closest('flow-grid-tile-container') || tile;
+  const target = holder.getBoundingClientRect().width > 60 ? holder : tile;
+  const r = target.getBoundingClientRect();
+  const img = tile.querySelector('img');
+  const thumb = img ? String(img.src || '') : '';
+  // A tile appears the moment a generation is accepted, before the clip exists. Readiness is
+  // therefore positive evidence, not the absence of the word "generating" in the page text:
+  // a real poster frame, a play affordance, and no progress indicator anywhere in the tile.
+  const busy = holder.querySelectorAll(
+    '[role=progressbar],mat-progress-bar,mat-spinner,.mat-mdc-progress-bar,.mat-mdc-progress-spinner,.spinner'
+  ).length > 0 || /generating|processing|queued|in progress|\d{1,3}\s?%/i.test(holder.innerText || '');
+  const playable = /play_circle/i.test(tile.innerText || '') || !!tile.querySelector('video');
+  return JSON.stringify({
+    found: r.width > 60 && r.height > 60,
+    count: tiles.length,
+    title: (holder.getAttribute('aria-label') || '').slice(0, 120),
+    thumb: thumb ? thumb.split('?')[0] : null,
+    busy: busy,
+    playable: playable,
+    ready: /^https?:/i.test(thumb) && !busy && playable,
+    x: Math.round(r.x + r.width / 2),
+    y: Math.round(r.y + r.height / 2),
+  });
+})()
+"""
+
+
+def _newest_tile(tab: ChromeTabRef) -> dict[str, Any]:
+    """The first (most recent) video tile in the project grid, with its click point."""
+    state = _evaluate(tab, _NEWEST_TILE_JS)
+    return state if isinstance(state, dict) else {"found": False, "count": 0}
 
 
 def _result_media(tab: ChromeTabRef) -> list[str]:
@@ -338,18 +479,18 @@ def _reconcile_pending(
             f"recorded fingerprint {recorded!r} != current {fingerprint!r}",
         )
     if results_now > results_before:
-        known = list(pending.get("results_media") or [])
-        fresh = [url for url in _result_media(tab) if url not in set(known)]
         _log(
             runtime,
             f"Reconciled: Flow already produced a result for this submission "
             f"({results_before} -> {results_now} results); downloading instead of regenerating.",
         )
+        # The grid is most-recent-first, so the clip that submission produced is its first
+        # tile; the download is still validated against the requested duration and aspect.
         return _download_flow_video(
             tab,
             output_dir,
             runtime,
-            fresh[0] if fresh else None,
+            NEWEST_TILE,
             job_id=str(pending.get("job_id") or "flow"),
         )
     _flow_raise(
@@ -364,9 +505,31 @@ def _reconcile_pending(
 # ------------------------------------------------------------------- prompt and submit
 
 
+#: Flow's composer is a ProseMirror contenteditable. It carries no ``role="textbox"``, so
+#: requiring that role finds nothing; the search-box input and the reCAPTCHA textarea are
+#: the other editable nodes on the page, hence the visibility and class preference.
+_EDITOR_FINDER = r"""
+  const editorNode = () => {
+    const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+    const candidates = [
+      'div.ProseMirror[contenteditable="true"]',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of candidates) {
+      const hit = [...document.querySelectorAll(selector)].filter(vis)
+        .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+      if (hit) return hit;
+    }
+    return null;
+  };
+"""
+
 _EDITOR_JS = r"""
 (() => {
-  const e = document.querySelector('div[contenteditable="true"][role="textbox"]');
+%(finder)s
+  const e = editorNode();
   if (!e) return JSON.stringify({found: false});
   const r = e.getBoundingClientRect();
   return JSON.stringify({
@@ -376,13 +539,14 @@ _EDITOR_JS = r"""
     text: (e.innerText || '').trim(),
   });
 })()
-"""
+""" % {"finder": _EDITOR_FINDER}
 
 _SUBMIT_JS = r"""
 (() => {
-  const target = Array.from(document.querySelectorAll('button')).find(
-    (b) => (b.innerHTML || '').includes('arrow_forward')
-  );
+  // The generate control's aria-label is the stable part; the icon font text is the fallback.
+  const buttons = Array.from(document.querySelectorAll('button,[role=button]'));
+  const target = buttons.find(b => /start generation|generate/i.test(b.getAttribute('aria-label') || ''))
+    || buttons.find(b => (b.innerHTML || '').includes('arrow_forward'));
   if (!target) return JSON.stringify({found: false});
   const r = target.getBoundingClientRect();
   return JSON.stringify({
@@ -406,14 +570,15 @@ def _type_prompt(tab: ChromeTabRef, prompt: str, runtime: WorkerRuntime | None) 
         tab,
         """
 (() => {
-  const e = document.querySelector('div[contenteditable="true"][role="textbox"]');
+%(finder)s
+  const e = editorNode();
   if (!e) return 'no-editor';
   e.focus();
   document.execCommand('selectAll', false, null);
   document.execCommand('delete', false, null);
   return 'cleared';
 })()
-""",
+""" % {"finder": _EDITOR_FINDER},
     )
     time.sleep(0.3)
     insert_text(tab, prompt)
@@ -480,7 +645,11 @@ def _submit(tab: ChromeTabRef, runtime: WorkerRuntime | None) -> None:
 _GENERATION_STATE_JS = r"""
 (() => {
   const baseline = %d;
-  const videos = Array.from(document.querySelectorAll('video'));
+  // Count what the grid actually shows for a clip (see _RESULT_MEDIA_JS): the detail view's
+  // <video> plus the grid's video-tile thumbnails.
+  const videos = Array.from(document.querySelectorAll(
+    'video, flow-video-tile img.thumbnail, flow-video-tile img'
+  ));
   const text = (document.body.innerText || '').toLowerCase();
   const failed =
     text.includes("didn't follow") ||
@@ -498,40 +667,103 @@ _GENERATION_STATE_JS = r"""
 """
 
 
+#: How Flow words a refusal on the page. An abuse flag and a content rejection both end
+#: with no video and no charge, but they need different answers from the operator.
+_REFUSAL_JS = r"""
+(() => {
+  const text = ((document.body ? document.body.innerText : '') || '')
+      .replace(/\s+/g, ' ').toLowerCase();
+  if (/unusual activity/.test(text)) return 'unusual_activity';
+  if (/violat|content polic|not allowed|cannot generate/.test(text)) return 'policy';
+  return '';
+})()
+"""
+
+
+def _refusal_reason(tab: ChromeTabRef) -> str:
+    """``"unusual_activity"``, ``"policy"`` or ``""`` — read from the page, not inferred."""
+    try:
+        from app.automation.existing_chrome import execute_javascript
+
+        return str(execute_javascript(tab, _REFUSAL_JS) or "").strip()
+    except Exception:
+        return ""
+
+
 def _wait_for_generation(
     tab: ChromeTabRef,
     baseline: list[str],
     runtime: WorkerRuntime | None,
     timeout_ms: int,
 ) -> str:
-    """Wait for a result that was not in ``baseline`` and return its media URL."""
-    known = set(baseline)
-    script = _GENERATION_STATE_JS % len(baseline)
+    """Wait until the grid holds one more clip than ``baseline`` and return its locator.
+
+    The returned value is :data:`NEWEST_TILE`, not a URL: Flow re-signs the grid thumbnails
+    while the page is open, so URL identity cannot answer "which clip is new" (see
+    :data:`NEWEST_TILE`). Position can — the grid is most-recent-first — and the downloaded
+    file is still validated against the requested duration and aspect before it is accepted.
+    """
+    baseline_count = len(baseline)
+    script = _GENERATION_STATE_JS % baseline_count
     deadline = time.monotonic() + max(60.0, timeout_ms / 1000)
     last = ""
     while time.monotonic() < deadline:
         _runtime_checkpoint(runtime)
         state = _evaluate(tab, script) or {}
-        fresh = [url for url in _result_media(tab) if url not in known]
+        newest = _newest_tile(tab)
+        count = int(newest.get("count") or 0)
         summary = (
-            f"results={state.get('videos')} new={len(fresh)} "
+            f"results={count} new={max(0, count - baseline_count)} "
             f"generating={state.get('generating')}"
         )
         if summary != last:
             _log(runtime, f"Flow generation: {summary}")
             last = summary
         _assert_credits_available(tab, runtime)
-        if fresh:
-            _log(runtime, f"Flow produced a new result: {fresh[0][:90]}")
-            # A tile can appear while the clip is still rendering, so settle before download:
-            # only a finished asset stops reporting progress.
-            quiet = 0
-            settle_deadline = time.monotonic() + 120.0
-            while quiet < 2 and time.monotonic() < settle_deadline:
+        if count > baseline_count and newest.get("found"):
+            if not newest.get("ready"):
+                # The tile exists but the clip does not yet: keep waiting rather than opening
+                # a half-rendered asset and asking it to export (observed 2026-09-05 —
+                # downloading here produced a failed export, not a video).
+                time.sleep(5.0)
+                continue
+            _log(
+                runtime,
+                "Flow produced a new result: "
+                f"{newest.get('title') or newest.get('thumb') or 'the newest tile'}",
+            )
+            # Readiness must hold, not merely occur: three consecutive confirmations, and the
+            # same asset each time, before the export is asked for.
+            stable = 1
+            thumb = newest.get("thumb")
+            settle_deadline = time.monotonic() + 180.0
+            while stable < 3 and time.monotonic() < settle_deadline:
                 time.sleep(3.0)
-                later = _evaluate(tab, script) or {}
-                quiet = quiet + 1 if not later.get("generating") else 0
-            return fresh[0]
+                later = _newest_tile(tab)
+                if later.get("ready") and later.get("thumb") == thumb:
+                    stable += 1
+                else:
+                    stable = 0
+                    thumb = later.get("thumb")
+            if stable < 3:
+                _flow_raise(
+                    ErrorCode.FLOW_GENERATION_TIMEOUT,
+                    "Flow's newest result never settled into a finished clip.",
+                    f"last seen: {json.dumps(_newest_tile(tab))[:200]}",
+                )
+            _log(runtime, "Flow result confirmed finished; exporting")
+            return NEWEST_TILE
+        # Flow can refuse a generation outright, and the reason matters: an abuse flag is
+        # not a content-policy rejection and not a timeout. Both say "no charge", so
+        # neither should be retried blindly, and polling on for the full timeout only
+        # hides what happened.
+        refusal = _refusal_reason(tab)
+        if refusal == "unusual_activity":
+            _flow_raise(
+                ErrorCode.FLOW_UNUSUAL_ACTIVITY,
+                "Flow refused the generation as unusual activity and produced no video.",
+                "the page states the account was not charged for this generation",
+            )
         if state.get("failed") and not state.get("generating"):
             _flow_raise(
                 ErrorCode.FLOW_POLICY_VIOLATION,
@@ -668,15 +900,22 @@ def _media_id(media_url: str) -> str:
 
 
 def _open_result(tab: ChromeTabRef, media_url: str, runtime: WorkerRuntime | None) -> bool:
-    """Open the detail view of the exact result we identified, not "whatever is first"."""
-    script = _RESULT_TILE_JS % json.dumps(_media_id(media_url))
+    """Open the detail view of the result we identified, never "whatever is first" by luck.
+
+    :data:`NEWEST_TILE` means the clip this submission produced — the grid's first tile, which
+    is how a just-generated clip is addressed since its thumbnail URL is not stable. Any other
+    value is a media URL and is matched against the tile that carries it.
+    """
+    newest = media_url == NEWEST_TILE
+    script = _NEWEST_TILE_JS if newest else _RESULT_TILE_JS % json.dumps(_media_id(media_url))
     for attempt in range(6):
         tile = _evaluate(tab, script) or {}
         if tile.get("found"):
             dispatch_mouse_click(tab, tile["x"], tile["y"])
             time.sleep(3.0)
             if (_evaluate(tab, _DOWNLOAD_BUTTON_JS) or {}).get("found"):
-                _log(runtime, f"Opened the result tile for {_media_id(media_url)}")
+                label = tile.get("title") if newest else _media_id(media_url)
+                _log(runtime, f"Opened the result tile for {label or media_url[:60]}")
                 return True
         time.sleep(1.5 + 0.5 * attempt)
     return False
@@ -688,6 +927,60 @@ def _leave_result_view(tab: ChromeTabRef) -> None:
     if state.get("found"):
         dispatch_mouse_click(tab, state["x"], state["y"])
         time.sleep(2.0)
+
+
+_PLAYABLE_JS = r"""
+(() => {
+  const vis = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const video = [...document.querySelectorAll('video')].filter(vis)
+    .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+  if (!video) return JSON.stringify({found: false});
+  const duration = video.duration;
+  return JSON.stringify({
+    found: true,
+    duration: Number.isFinite(duration) ? Math.round(duration * 100) / 100 : null,
+    readyState: video.readyState,
+    width: video.videoWidth,
+    height: video.videoHeight,
+    src: String(video.src || video.currentSrc || '').split('?')[0].slice(0, 120),
+  });
+})()
+"""
+
+
+def _wait_for_playable(
+    tab: ChromeTabRef,
+    runtime: WorkerRuntime | None,
+    timeout_s: float = 120.0,
+) -> dict[str, Any]:
+    """Wait until the opened result really is a playable clip, and say what it is.
+
+    The detail view mounts a ``<video>``; a finished asset reports a finite duration and has
+    loaded its metadata. Asking for the export before that is what produced a failed export
+    with no file (observed 2026-09-05), so the wait is a precondition of the download rather
+    than a retry around it.
+    """
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = _evaluate(tab, _PLAYABLE_JS) or {}
+        last = state if isinstance(state, dict) else {}
+        duration = last.get("duration")
+        if last.get("found") and isinstance(duration, (int, float)) and duration > 0.2:
+            if int(last.get("readyState") or 0) >= 1:
+                _log(
+                    runtime,
+                    f"Flow result is playable: {duration}s "
+                    f"{last.get('width')}x{last.get('height')}",
+                )
+                return last
+        time.sleep(2.0)
+    _flow_raise(
+        ErrorCode.FLOW_RESULT_NOT_FOUND,
+        "Flow opened the result but it never became a playable clip, so nothing was exported.",
+        f"last observed: {json.dumps(last)[:200]}",
+    )
+    raise AssertionError("unreachable")
 
 
 def _download_flow_video(
@@ -709,6 +1002,10 @@ def _download_flow_video(
             "Flow produced a result but its tile could not be opened for download.",
             f"media={media_url[:120]}",
         )
+    if media_url:
+        # Only a clip that plays can be exported; this is the check that keeps the export from
+        # being asked for while the asset is still being rendered.
+        _wait_for_playable(tab, runtime)
 
     # The download routing only holds while this DevTools session is open, so the click and
     # the wait both happen inside the block.
@@ -952,6 +1249,35 @@ def _build_receipt(
     )
 
 
+def _reclassify_region_block(exc: OrdaKError) -> OrdaKError:
+    """Rename any Flow failure that is really the unsupported-country page.
+
+    The block can land at any point — while the project loads, while the composer is being
+    waited for, or between two steps — and each of those paths has its own error. Rather
+    than teaching every one of them about geography, the live tab is checked once here, so
+    the operator is never told to look for a DOM change that did not happen.
+    """
+    if exc.code is ErrorCode.FLOW_REGION_BLOCKED:
+        return exc
+    try:
+        from app.automation.existing_chrome import list_google_chrome_tabs
+
+        for info in list_google_chrome_tabs():
+            url = str(getattr(info, "url", "") or "").lower()
+            if any(marker in url for marker in FLOW_REGION_BLOCK_URL_MARKERS):
+                return OrdaKError(
+                    code=ErrorCode.FLOW_REGION_BLOCKED,
+                    message="Google Flow is not available in this country.",
+                    technical_details=(
+                        f"observed url: {getattr(info, 'url', '')!r}; "
+                        f"original failure: {exc.code.value}: {exc.message}"
+                    ),
+                )
+    except Exception:
+        return exc
+    return exc
+
+
 def run_flow_job(
     job_id: str,
     job: AutomationJobRequest,
@@ -964,6 +1290,7 @@ def run_flow_job(
     try:
         return _run_flow_job_inner(job_id, job, runtime, resolved, output_dir)
     except OrdaKError as exc:
+        exc = _reclassify_region_block(exc)
         error = _as_automation_error(exc)
         if runtime is not None:
             runtime.save_error(error.message, error.status, exc.code.value)
@@ -972,10 +1299,16 @@ def run_flow_job(
     except GeminiAutomationError:
         raise
     except Exception as exc:  # pragma: no cover - unexpected browser faults
+        replacement = _reclassify_region_block(
+            OrdaKError(code=ErrorCode.PROVIDER_UI_CHANGED, message=str(exc))
+        )
         if runtime is not None:
-            runtime.save_error(str(exc), "failed", ErrorCode.PROVIDER_UI_CHANGED.value)
+            runtime.save_error(replacement.message, "failed", replacement.code.value)
+            runtime.append_log(
+                f"Flow job failed [{replacement.code.value}]: {replacement.message}", "error"
+            )
         raise GeminiAutomationError(
-            str(exc), error_code=ErrorCode.PROVIDER_UI_CHANGED.value
+            replacement.message, error_code=replacement.code.value
         ) from exc
 
 
@@ -1004,8 +1337,7 @@ def _run_flow_job_inner(
     if runtime is not None:
         runtime.update_status("opening_provider_tab")
     target = getattr(resolved, "flow_url", None) or FLOW_BASE_URL
-    opened = adapter.open_tab(target_url=target)
-    tab = opened.ref if hasattr(opened, "ref") else opened
+    tab = _bind_flow_tab(adapter, target, runtime)
     workspace_url = _ensure_flow_project(tab, runtime, resolved)
 
     if runtime is not None:
@@ -1014,7 +1346,19 @@ def _run_flow_job_inner(
 
     if runtime is not None:
         runtime.update_status("finding_input")
-    wait_for_prompt_input(tab, provider="flow", timeout_ms=60_000)
+    try:
+        wait_for_prompt_input(tab, provider="flow", timeout_ms=60_000)
+    except (TimeoutError, RuntimeError):
+        # A regional block redirects the workspace *after* the project URL has loaded, so
+        # the composer is simply absent. Saying "the input box is missing" would send the
+        # operator looking for a DOM change; name the real cause when it is the real cause.
+        if _flow_region_blocked(tab, _current_url(tab)):
+            _flow_raise(
+                ErrorCode.FLOW_REGION_BLOCKED,
+                "Google Flow is not available in this country.",
+                f"observed url: {_current_url(tab)!r}",
+            )
+        raise
     _assert_credits_available(tab, runtime)
 
     if runtime is not None:

@@ -68,6 +68,23 @@ def test_ensure_project_raises_the_named_error(monkeypatch) -> None:
     assert "not available in this country" in excinfo.value.message
 
 
+def test_a_block_that_lands_after_the_project_loads_is_caught(monkeypatch) -> None:
+    """The redirect can arrive a moment after the project URL, so the settled URL decides."""
+    urls = iter([
+        "https://labs.google/fx/tools/flow/project/abc",   # first read: looks fine
+        "https://flow.google.com/unsupported-country",     # settled read: blocked
+        "https://flow.google.com/unsupported-country",
+    ])
+    monkeypatch.setattr(fw, "_current_url", lambda tab: next(urls))
+    monkeypatch.setattr(fw.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        fw, "_flow_region_blocked", lambda tab, url: "unsupported" in url
+    )
+    with pytest.raises(OrdaKError) as excinfo:
+        fw._ensure_flow_project(Tab(), runtime=None, app_settings=object())
+    assert excinfo.value.code is ErrorCode.FLOW_REGION_BLOCKED
+
+
 def test_the_descriptor_says_it_is_not_a_bug() -> None:
     from app.errors import get_error_descriptor
 

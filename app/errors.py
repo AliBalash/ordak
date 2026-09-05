@@ -50,6 +50,9 @@ class ErrorCode(StrEnum):
     FLOW_RECONCILIATION_REQUIRED = "flow_reconciliation_required"
     FLOW_REFERENCE_POLICY_VIOLATION = "flow_reference_policy_violation"
     FLOW_REGION_BLOCKED = "flow_region_blocked"
+    FLOW_UNUSUAL_ACTIVITY = "flow_unusual_activity"
+    GEMINI_VIDEO_NOT_ENTITLED = "gemini_video_not_entitled"
+    GEMINI_VIDEO_TOOL_MISSING = "gemini_video_tool_missing"
     INVALID_VIDEO_OUTPUT = "invalid_video_output"
 
 
@@ -313,6 +316,46 @@ ERROR_DESCRIPTORS: dict[ErrorCode, ErrorDescriptor] = {
         title="Flow UI changed",
         message="The Google Flow layout no longer matches the controls Ordak expects.",
         suggested_action="Capture diagnostics, update the Flow selectors, then retry.",
+        recoverable=True,
+    ),
+    ErrorCode.GEMINI_VIDEO_NOT_ENTITLED: ErrorDescriptor(
+        code=ErrorCode.GEMINI_VIDEO_NOT_ENTITLED,
+        title="Gemini video needs a higher plan",
+        message=(
+            "Gemini answered the video request by asking for a subscription upgrade, so it "
+            "will not generate video on this account."
+        ),
+        suggested_action=(
+            "Upgrade the Google account's plan, or switch the video provider back to Flow. "
+            "Nothing was generated, so switching and resuming costs nothing."
+        ),
+        recoverable=True,
+    ),
+    ErrorCode.GEMINI_VIDEO_TOOL_MISSING: ErrorDescriptor(
+        code=ErrorCode.GEMINI_VIDEO_TOOL_MISSING,
+        title="Gemini has no video tool",
+        message=(
+            "Gemini's composer does not offer a 'Create video' tool for this account, so a "
+            "video request cannot be placed through the UI."
+        ),
+        suggested_action=(
+            "Check the account's plan in the Gemini UI at :4143, or switch the video "
+            "provider to Flow."
+        ),
+        recoverable=True,
+    ),
+    ErrorCode.FLOW_UNUSUAL_ACTIVITY: ErrorDescriptor(
+        code=ErrorCode.FLOW_UNUSUAL_ACTIVITY,
+        title="Flow refused the generation as unusual activity",
+        message=(
+            "Flow answered Generate with \"We noticed some unusual activity\" and produced no "
+            "video. It states the account was not charged."
+        ),
+        suggested_action=(
+            "Flow is refusing automated generation for this session, not failing on a "
+            "selector. Open the project at :4143, generate once by hand to clear the flag, "
+            "and leave more time between attempts before resuming."
+        ),
         recoverable=True,
     ),
     ErrorCode.FLOW_REGION_BLOCKED: ErrorDescriptor(

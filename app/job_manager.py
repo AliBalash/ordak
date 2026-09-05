@@ -1494,7 +1494,7 @@ class JobManager:
         if provider == "chatgpt":
             return "chatgpt.com" in url
         if provider == "flow":
-            return "labs.google/fx/tools/flow" in url
+            return "labs.google/fx/tools/flow" in url or "flow.google.com" in url
         return "gemini.google.com" in url or "bard.google.com" in url
 
     def _probe_apple_events(self, chrome_running: bool) -> bool:

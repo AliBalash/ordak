@@ -67,11 +67,13 @@ class FlowComposerMock:
         )
 
     def execute_javascript(self, tab, script: str) -> str:
-        # The model-list script also mentions tablists (it skips them), so match it first.
+        # The settings panel is Angular Material: its read script is the one that inspects
+        # aria-checked on radios. Both read scripts mention the model names, so this order
+        # matters — match the more specific marker first.
+        if "aria-checked" in script:
+            return self._settings_payload()
         if "omni|veo" in script:
             return json.dumps({"found": True, "items": list(self.model_options)})
-        if "data-radix-popper-content-wrapper" in script and "tablist" in script:
-            return self._settings_payload()
         if "getBoundingClientRect" in script:
             needle = json.loads(script.split("const needle = ", 1)[1].split(";", 1)[0])
             if not self.clickable:

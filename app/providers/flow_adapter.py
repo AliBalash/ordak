@@ -10,7 +10,7 @@ class FlowAdapter(ProviderAdapter):
 
     def open_tab(self, *, target_url: str | None = None) -> ChromeTabInfo:
         from app.automation.existing_chrome import open_provider_tab_in_existing_chrome, get_tab_info
-        target = target_url or "https://labs.google/fx/tools/flow"
+        target = target_url or "https://flow.google.com/"
         tab = open_provider_tab_in_existing_chrome(self.provider, target)
         info = get_tab_info(tab)
         return info or ChromeTabInfo(window_id=tab.window_id, tab_id=tab.tab_id, url=target, title="Flow", active=True, window_key=tab.window_key, target_id=tab.target_id)

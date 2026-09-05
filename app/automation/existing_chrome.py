@@ -2802,6 +2802,48 @@ def _linux_cdp_call(
     return results
 
 
+@contextmanager
+def intercepted_file_chooser(tab: ChromeTabRef):
+    """Stop Chrome opening the OS file chooser inside this block.
+
+    Some upload affordances only create their hidden ``<input type=file>`` when clicked, and
+    that click would normally raise a native dialog that nothing can dismiss on a headless
+    X display. ``Page.setInterceptFileChooserDialog`` makes Chrome fire an event instead, so
+    the input can be created and then filled through ``DOM.setFileInputFiles``.
+    """
+    if _is_mac_backend():
+        yield
+        return
+    try:
+        _linux_cdp_commands(
+            tab, [{"method": "Page.setInterceptFileChooserDialog", "params": {"enabled": True}}]
+        )
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            _linux_cdp_commands(
+                tab,
+                [{"method": "Page.setInterceptFileChooserDialog", "params": {"enabled": False}}],
+            )
+        except Exception:
+            pass
+
+
+def file_input_count(tab: ChromeTabRef, selector: str) -> int:
+    """How many nodes match ``selector`` right now."""
+    try:
+        raw = execute_javascript(
+            tab, f"(() => document.querySelectorAll({json.dumps(selector)}).length)()"
+        )
+        return int(str(raw).strip() or 0)
+    except Exception:
+        return 0
+
+
 def set_file_input_files(
     tab: ChromeTabRef,
     selector: str,
