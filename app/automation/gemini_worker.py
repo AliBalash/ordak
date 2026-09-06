@@ -533,6 +533,7 @@ def _build_gemini_receipt(
     pro_outcome: gemini_pro.ProOutcome | None,
     validations: list[image_validation.ImageValidation],
     workspace_url: str | None,
+    artifact_source: str,
 ) -> GenerationReceipt:
     """Only observations go in here — labels from the UI, hashes from the files (§8)."""
     requested = job.requested_model
@@ -546,6 +547,7 @@ def _build_gemini_receipt(
     notes: list[str] = []
     if observed_source:
         notes.append(f"model_label_source={observed_source}")
+    notes.append(f"artifact_source={artifact_source}")
     if pro_outcome is not None:
         notes.extend(pro_outcome.notes)
     for record in validations:
@@ -1560,6 +1562,14 @@ def _run_gemini_job_in_existing_chrome(
                         message=f"Could not extract generated images from {_provider_name(job.provider)} UI.",
                     )
                 )
+            if job.provider == "gemini" and extraction.source != "download":
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.RESULT_NOT_EXTRACTABLE,
+                        message="Gemini image output was rejected because it was not a downloaded file.",
+                        technical_details=f"artifact_source={extraction.source}",
+                    )
+                )
             validations: list[image_validation.ImageValidation] = []
             if job.provider == "gemini":
                 try:
@@ -1588,6 +1598,7 @@ def _run_gemini_job_in_existing_chrome(
                             pro_outcome=pro_outcome,
                             validations=validations,
                             workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),
+                            artifact_source=extraction.source,
                         )
                     )
             answer = (
@@ -1595,6 +1606,19 @@ def _run_gemini_job_in_existing_chrome(
                 f"Saved images: {len(extraction.artifacts)}."
             )
         else:
+            # Image generation is not a text conversation. Gemini sometimes presents a
+            # transient "something went wrong" card as the assistant response; recording
+            # that as a successful job with zero artifacts bypassed the client's retry
+            # policy and stopped the whole video. Make the contract explicit so the client
+            # can safely retry the paid request in a fresh chat, with its bounded policy.
+            if job.provider == "gemini" and job.mode == "image_generate":
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.RESULT_NOT_EXTRACTABLE,
+                        message="Gemini did not return a generated image artifact; the provider response was text-only.",
+                        technical_details=f"response={answer[:500]!r}",
+                    )
+                )
             answer = adapter.extract_text_result(answer)
         if not answer:
             _raise_structured_error(

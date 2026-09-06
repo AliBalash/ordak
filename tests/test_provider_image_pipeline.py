@@ -83,7 +83,7 @@ def test_extract_image_result_falls_back_to_asset_url(
     assert result.is_acceptable is True
 
 
-def test_extract_image_result_uses_visible_gemini_pixels_when_download_is_protected(
+def test_extract_image_result_rejects_gemini_when_download_is_unavailable(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -94,7 +94,6 @@ def test_extract_image_result_uses_visible_gemini_pixels_when_download_is_protec
     monkeypatch.setattr(adapter, "_wait_for_generated_image_ready", lambda tab, timeout_ms: True)
     monkeypatch.setattr(adapter, "_inspect_generated_image_state", lambda tab: {"generatedMarker": True})
     monkeypatch.setattr("app.providers.existing_chrome.download_generated_images_from_controls", lambda *args, **kwargs: [])
-    monkeypatch.setattr("app.providers.existing_chrome.capture_visible_generated_images", lambda *args, **kwargs: [saved])
     monkeypatch.setattr(adapter, "_export_generated_images", lambda *args, **kwargs: [])
 
     result = adapter.extract_image_result(
@@ -105,10 +104,10 @@ def test_extract_image_result_uses_visible_gemini_pixels_when_download_is_protec
         max_images=1,
     )
 
-    assert result.source == "dom"
-    assert result.confidence == "medium"
-    assert result.artifacts == [saved]
-    assert result.is_acceptable is True
+    assert result.source == "download"
+    assert result.confidence == "low"
+    assert result.artifacts == []
+    assert result.is_acceptable is False
 
 
 def test_extract_image_result_rejects_low_confidence_dom_fallback(

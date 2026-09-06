@@ -2085,26 +2085,93 @@ def download_generated_images_from_controls(
     the downloaded bytes belong to this job.
     """
     download_dir = output_dir / f"{job_id}_downloads"
-    click_script = f"""
+    viewport_fit_script = """
+(() => {
+  // Gemini renders the action rail to the right of a portrait image. In the
+  // 1280px remote desktop it can therefore be outside the visual viewport,
+  // even though the control is present in the DOM. Zooming the *page* (not the
+  // image) makes the genuine control reachable for a trusted CDP click.
+  if (innerWidth < 1800) document.documentElement.style.zoom = '75%';
+  return String(innerWidth);
+})()
+"""
+    hover_target_script = """
+(() => {
+  const images = Array.from(document.querySelectorAll('img[alt*="AI generated" i], generated-image img, .generated-images-container img'));
+  const image = images.filter((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    return rect.width >= 160 && rect.height >= 160;
+  }).at(-1);
+  if (!image) return "";
+  const scroller = image.closest('infinite-scroller') || image.parentElement;
+  if (scroller) {
+    const imageRect = image.getBoundingClientRect();
+    const scrollerRect = scroller.getBoundingClientRect();
+    // Generated vertical images can be taller than the chat viewport.  Centering such
+    // an image mathematically asks for an impossible scroll position and leaves its
+    // action controls above the viewport.  Put its top inside a safe visible band.
+    const desiredTop = scrollerRect.top + Math.min(96, Math.max(24, scroller.clientHeight * 0.15));
+    scroller.scrollTop += imageRect.top - desiredTop;
+  } else {
+    image.scrollIntoView({block: 'center', inline: 'center'});
+  }
+  const rect = image.getBoundingClientRect();
+  return JSON.stringify({x: rect.left + rect.width / 2, y: rect.top + rect.height / 2});
+})()
+"""
+    controls_script = f"""
 (() => {{
   const limit = {max(1, int(max_images))};
   const visible = (el) => {{
     const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 0 && rect.height >= 0;
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 16 && rect.height >= 16;
   }};
   const controls = Array.from(document.querySelectorAll(
-    '[data-test-id="download-generated-image-button"] button, button[aria-label*="Download full-sized image"]'
+    '[data-test-id="download-generated-image-button"], [data-test-id="download-generated-image-button"] button, button[aria-label*="Download full-sized image" i], button[aria-label*="Download" i], [aria-label*="Download full-sized image" i]'
   )).filter(visible);
   const unique = [...new Set(controls)].slice(-limit);
-  for (const button of unique) button.click();
-  return String(unique.length);
+  return JSON.stringify(unique.map((control) => {{
+    control.scrollIntoView({{block: 'center', inline: 'center'}});
+    const rect = control.getBoundingClientRect();
+    const visibleInViewport = rect.left >= 0 && rect.top >= 0
+      && rect.right <= innerWidth && rect.bottom <= innerHeight;
+    control.focus({{preventScroll: true}});
+    return {{x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, visibleInViewport}};
+  }}));
 }})()
 """
     try:
         with download_to(tab, download_dir):
-            clicked = int(execute_javascript(tab, click_script) or "0")
-            if clicked <= 0:
+            execute_javascript(tab, viewport_fit_script)
+            raw_hover_target = execute_javascript(tab, hover_target_script)
+            hover_target = json.loads(raw_hover_target or "null")
+            if isinstance(hover_target, dict):
+                x, y = hover_target.get("x"), hover_target.get("y")
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    dispatch_mouse_move(tab, float(x), float(y))
+                    time.sleep(0.3)
+            raw_controls = execute_javascript(tab, controls_script)
+            controls = json.loads(raw_controls or "[]")
+            if not isinstance(controls, list) or not controls:
                 return []
+            # Gemini's React controls require a trusted pointer event. Calling
+            # HTMLElement.click() from Runtime.evaluate is synthetic and can silently do
+            # nothing, which was the trigger for the old screenshot fallback.
+            for control in controls:
+                if not isinstance(control, dict):
+                    continue
+                x, y = control.get("x"), control.get("y")
+                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                    continue
+                if control.get("visibleInViewport"):
+                    dispatch_mouse_click(tab, float(x), float(y))
+                else:
+                    # On a narrow browser a vertical Gemini image can extend past the
+                    # right edge, taking its download affordance with it.  Focusing the
+                    # native control then sending a trusted Enter is equivalent to a user
+                    # activation and avoids clicking an off-screen coordinate.
+                    dispatch_key(tab, "Enter", code="Enter", key_code=13)
+                time.sleep(0.25)
             deadline = time.monotonic() + timeout_ms / 1000
             accepted: list[Path] = []
             seen: set[Path] = set()
@@ -2128,10 +2195,10 @@ def download_generated_images_from_controls(
                 if accepted and not partials:
                     return accepted
                 time.sleep(0.5)
-    except (OSError, RuntimeError, ValueError):
-        # The caller continues with URL and canvas alternatives.  A visible result must
-        # never become a hard extraction failure merely because a browser blocks downloads.
-        return []
+    except (OSError, RuntimeError, ValueError) as exc:
+        # Gemini has no screenshot/DOM escape hatch.  Preserve the real reason in the
+        # job log rather than disguising a browser control fault as missing output.
+        raise RuntimeError(f"Gemini download control failed: {exc}") from exc
     return []
 
 
@@ -2886,6 +2953,27 @@ def dispatch_mouse_click(tab: ChromeTabRef, x: float, y: float) -> None:
                     "clickCount": 1,
                 },
             },
+        ],
+    )
+
+
+def dispatch_mouse_move(tab: ChromeTabRef, x: float, y: float) -> None:
+    """Move the real pointer so hover-only provider controls become visible."""
+    if _is_mac_backend():
+        return
+    _linux_cdp_commands(
+        tab,
+        [
+            {
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
+                    "button": "none",
+                    "buttons": 0,
+                },
+            }
         ],
     )
 

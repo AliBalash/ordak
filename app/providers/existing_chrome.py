@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import time
 from urllib.parse import urlparse
 
 from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
     best_effort_stop,
-    capture_visible_generated_images,
     detect_busy_state,
     detect_login_or_verification,
     download_generated_images_from_controls,
@@ -232,38 +232,60 @@ class ExistingChromeProviderAdapter:
 
         state = self._inspect_generated_image_state(tab)
         if self.provider == "gemini":
-            control_paths = download_generated_images_from_controls(
+            # Gemini frequently paints the generated pixels before its action rail is
+            # interactive.  Treat that as a normal UI settling period, not as a reason to
+            # fall back to a screenshot.  Each attempt uses the same job-scoped download
+            # directory; only an image file that actually lands there is accepted.
+            attempt_timeout_ms = max(10_000, min(30_000, timeout_ms // 3))
+            for attempt in range(1, 4):
+                control_paths = download_generated_images_from_controls(
+                    tab,
+                    output_dir=output_dir,
+                    job_id=job_id,
+                    max_images=max_images,
+                    timeout_ms=attempt_timeout_ms,
+                )
+                if control_paths:
+                    notes.append(
+                        "provider download control: clicked Gemini full-size control and "
+                        f"captured its job-scoped file (attempt {attempt}/3)"
+                    )
+                    return ImageExtractionResult(
+                        artifacts=control_paths,
+                        source="download",
+                        confidence="high",
+                        technical_notes=notes,
+                    )
+                notes.append(f"Gemini download control attempt {attempt}/3 did not yield a file; waiting for the action rail.")
+                if attempt < 3:
+                    time.sleep(1.5)
+            # A browser screenshot is never an image-generation artifact. It can include
+            # Gemini's composer, legal text, controls, or empty page area even when the
+            # generated pixels look plausible. Gemini therefore has a hard provenance
+            # contract: only a file delivered by an explicit download path is accepted.
+            download_paths = self._export_generated_images(
                 tab,
                 output_dir=output_dir,
                 job_id=job_id,
                 max_images=max_images,
-                # A protected Gemini URL either begins downloading immediately or
-                # will not do so at all.  Do not hold a completed video pipeline
-                # hostage for the full generation timeout before pixel recovery.
-                timeout_ms=min(timeout_ms, 8_000),
+                timeout_ms=timeout_ms,
+                strategy="download",
             )
-            if control_paths:
-                notes.append("provider download control: clicked Gemini full-size control and captured its job-scoped file")
+            if download_paths:
+                notes.append("provider download control: captured same-turn Gemini download asset")
                 return ImageExtractionResult(
-                    artifacts=control_paths,
+                    artifacts=download_paths,
                     source="download",
                     confidence="high",
                     technical_notes=notes,
                 )
-            screenshot_paths = capture_visible_generated_images(
-                tab,
-                output_dir=output_dir,
-                job_id=job_id,
-                max_images=max_images,
+            notes.append("Gemini download required: no verified downloaded image was available; screenshot, DOM, and asset-URL fallbacks were rejected")
+            return ImageExtractionResult(
+                artifacts=[],
+                source="download",
+                confidence="low",
+                technical_notes=notes,
             )
-            if screenshot_paths:
-                notes.append("provider rendered-pixel fallback: captured the completed Gemini image from its visible element")
-                return ImageExtractionResult(
-                    artifacts=screenshot_paths,
-                    source="dom",
-                    confidence="medium",
-                    technical_notes=notes,
-                )
         download_paths = self._export_generated_images(
             tab,
             output_dir=output_dir,
