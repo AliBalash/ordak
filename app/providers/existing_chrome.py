@@ -237,7 +237,10 @@ class ExistingChromeProviderAdapter:
                 output_dir=output_dir,
                 job_id=job_id,
                 max_images=max_images,
-                timeout_ms=timeout_ms,
+                # A protected Gemini URL either begins downloading immediately or
+                # will not do so at all.  Do not hold a completed video pipeline
+                # hostage for the full generation timeout before pixel recovery.
+                timeout_ms=min(timeout_ms, 8_000),
             )
             if control_paths:
                 notes.append("provider download control: clicked Gemini full-size control and captured its job-scoped file")
