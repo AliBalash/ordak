@@ -102,3 +102,18 @@ def test_a_tool_that_never_turns_on_is_a_ui_change(monkeypatch) -> None:
     with pytest.raises(OrdaKError) as excinfo:
         gw._activate_gemini_image_tool(object(), Runtime())
     assert excinfo.value.code is ErrorCode.PROVIDER_UI_CHANGED
+
+
+def test_image_tool_waits_for_a_late_mounted_menu_before_retrying(monkeypatch) -> None:
+    states = [
+        {"imageToolActive": False, "toolsButton": {"x": 5.0, "y": 6.0}, "attribution": []},
+        {"imageToolActive": True, "toolsButton": None, "attribution": ["Create with Nano Banana 2."]},
+    ]
+    monkeypatch.setattr(gw, "_read_image_tool_state", lambda tab: states.pop(0) if states else {"imageToolActive": True})
+    attempts = iter([False, False, True])
+    monkeypatch.setattr(gw, "_click_menu_item", lambda tab, label: next(attempts))
+    monkeypatch.setattr("app.automation.existing_chrome.dispatch_mouse_click", lambda *args: None)
+    monkeypatch.setattr("app.automation.existing_chrome.dispatch_key", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gw.time, "sleep", lambda _seconds: None)
+    state = gw._activate_gemini_image_tool(object(), Runtime())
+    assert state["imageToolActive"] is True

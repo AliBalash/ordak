@@ -256,20 +256,35 @@ def _activate_gemini_image_tool(tab, runtime) -> dict[str, object]:
         time.sleep(0.5)
     except Exception:
         pass
-    for attempt in range(3):
+    # The menu is an asynchronously-mounted overlay.  A single click followed by
+    # an immediate lookup can race its mount; a blind second click can then close
+    # the still-open menu.  Treat each try as a complete open → observe → select
+    # transaction and dismiss a failed overlay before retrying.
+    for attempt in range(5):
         tools = state.get("toolsButton")
         if isinstance(tools, dict):
             dispatch_mouse_click(tab, float(tools["x"]), float(tools["y"]))
-            # The tools group renders after the upload rows, so a cold page needs a beat.
-            time.sleep(1.6 + 0.6 * attempt)
-            if _click_menu_item(tab, "Create image"):
-                time.sleep(1.5)
+            # The tools group renders after the upload rows, so poll rather than
+            # guessing one fixed delay on a cold or busy Gemini tab.
+            selected = False
+            for _poll in range(8 + attempt * 2):
+                if _click_menu_item(tab, "Create image"):
+                    selected = True
+                    break
+                time.sleep(0.35)
+            if selected:
+                time.sleep(1.0)
         state = _read_image_tool_state(tab)
         if state.get("imageToolActive"):
             if runtime is not None:
                 runtime.append_log("Gemini image tool activated ('Create image').")
             return state
-        time.sleep(0.6)
+        try:
+            dispatch_key(tab, key="Escape", code="Escape")
+        except Exception:
+            pass
+        time.sleep(0.7 + 0.25 * attempt)
+        state = _read_image_tool_state(tab)
     raise OrdaKError(
         code=ErrorCode.PROVIDER_UI_CHANGED,
         message="Could not turn on Gemini's image tool.",
