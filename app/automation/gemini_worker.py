@@ -173,7 +173,14 @@ _IMAGE_TOOL_STATE_SCRIPT = """
   const clean = s => String(s || '').replace(/\\s+/g, ' ').trim();
   const buttons = Array.from(document.querySelectorAll('button,[role=button]'))
       .filter(el => el.getClientRects().length);
-  const chip = buttons.find(el => /deselect images/i.test(el.getAttribute('aria-label') || ''));
+  // Gemini has two first-party representations of this state: the older
+  // ``Deselect Images`` chip and the newer checked toolbox entry.  Recognize
+  // both before retrying, otherwise a successful click is misread as a failure
+  // and later retries can toggle an unrelated tool.
+  const chip = buttons.find(el => /deselect images?/i.test(el.getAttribute('aria-label') || ''));
+  const selectedImageMenuItem = Array.from(document.querySelectorAll(
+      '[role=menuitemcheckbox][aria-checked=true], [role=menuitemradio][aria-checked=true], [role=option][aria-selected=true]'
+    )).find(el => /create image|image generation/i.test(clean(el.innerText || el.getAttribute('aria-label') || '')));
   const toolsButton = buttons.find(el => /upload & tools|upload and tools/i.test(el.getAttribute('aria-label') || ''));
   const rect = el => {
     const box = el.getBoundingClientRect();
@@ -182,7 +189,7 @@ _IMAGE_TOOL_STATE_SCRIPT = """
   const attribution = Array.from(document.querySelectorAll('.subtitle-attribution, [class*=attribution]'))
       .map(el => clean(el.textContent)).filter(Boolean);
   return JSON.stringify({
-    imageToolActive: !!chip,
+    imageToolActive: !!chip || !!selectedImageMenuItem,
     toolsButton: toolsButton ? rect(toolsButton) : null,
     attribution: attribution,
   });
