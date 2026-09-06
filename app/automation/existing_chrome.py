@@ -1926,7 +1926,10 @@ def inspect_generated_image_state(
     .some((el) => /download|save image|open image/.test(`${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase()));
   const generatedMarker = downloadAffordance
     || /generated image|created with|open image|download image|image ready/.test(rootText)
-    || assistantImages.some((img) => /generated image/.test((img.alt || "").toLowerCase()));
+    || assistantImages.some((img) => /generated image|ai[ -]?generated/i.test(img.alt || ""))
+    || assistantImages.some((img) => !!img.closest(
+         'generated-image, single-image, .generated-images-container, .image-gallery'
+       ));
   const loading = loadingSelectors
     .flatMap((selector) => Array.from(scope.querySelectorAll(selector)))
     .some((el) => isVisible(el) && /loading|creating|generating|rendering|processing/.test(`${{el.innerText || ""}} ${{el.getAttribute("aria-label") || ""}}`.toLowerCase() || "loading"))
@@ -2411,7 +2414,15 @@ def wait_for_response_stable(
   const allGeneratedImageCandidates = Array.from(imageScope.querySelectorAll('img, generated-image img, .generated-images-container img, .image-gallery img, picture img'))
     .filter((img) => isVisible(img) && img.naturalWidth >= 160 && img.naturalHeight >= 160)
     .filter((img) => !img.closest('[data-message-author-role="user"]') && !isUserUpload(img));
-  const generatedHintCandidates = allGeneratedImageCandidates.filter((img) => /generated image/i.test(img.alt || ""));
+  // Gemini labels its own result ", AI generated" and mounts it inside a <generated-image>
+  // element, so requiring the words "generated image" in the alt text recognised nothing: the
+  // answer counted as text-only and the image on screen was never extracted (2026-09-05).
+  const isGeneratedElement = (img) => !!img.closest(
+    'generated-image, single-image, .generated-images-container, .image-gallery, [data-test-id*="generated" i]'
+  );
+  const generatedHintCandidates = allGeneratedImageCandidates.filter(
+    (img) => /generated image|ai[ -]?generated/i.test(img.alt || "") || isGeneratedElement(img)
+  );
   const imageRootText = clean(latestAssistantRoot?.innerText || "").toLowerCase();
   const imageDownloadAffordance = Array.from(imageScope.querySelectorAll('a, button, [role="button"], [role="menuitem"]'))
     .filter((el) => isVisible(el))
@@ -2571,10 +2582,13 @@ def wait_for_response_stable(
             last_text = current
             stable_since = time.monotonic()
             stable_elapsed = 0
+        elif expect_images and generated_images > 0 and not busy and stable_elapsed >= stable_seconds:
+            # Gemini often writes a sentence about the picture and then shows it. The text is
+            # non-empty either way, so returning it first meant the caller never ran the image
+            # extraction and reported "produced no image artifact" for a result on screen.
+            return f"__GENERATED_IMAGES__:{generated_images}"
         elif current and not busy and stable_elapsed >= stable_seconds:
             return current
-        elif expect_images and generated_images > 0 and not busy and stable_elapsed >= stable_seconds:
-            return f"__GENERATED_IMAGES__:{generated_images}"
         last_generated_images = generated_images
         time.sleep(1)
     raise TimeoutError(

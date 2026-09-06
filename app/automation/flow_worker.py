@@ -141,9 +141,22 @@ _NEW_PROJECT_JS = r"""
 """
 
 
-def _current_url(tab: ChromeTabRef) -> str:
-    info = get_tab_info(tab)
-    return (info.url or "") if info is not None else ""
+def _current_url(tab: ChromeTabRef, *, attempts: int = 3) -> str:
+    """The tab's URL, read again when the answer comes back empty.
+
+    An empty answer means "could not read it" — a DevTools reply that raced a navigation, or a
+    target id that has just been replaced — not "this tab left Flow". Treating the first empty
+    read as fact is what produced ``FLOW_TAB_LOST: observed url: ''`` for a tab that was sitting
+    on the project page, and it cost a resume every time (observed 2026-09-05).
+    """
+    for attempt in range(max(1, attempts)):
+        info = get_tab_info(tab)
+        url = (info.url or "") if info is not None else ""
+        if url:
+            return url
+        if attempt + 1 < attempts:
+            time.sleep(1.0)
+    return ""
 
 
 #: How Flow announces a blocked location, in the URL and on the page.
@@ -823,23 +836,48 @@ _DOWNLOAD_BUTTON_JS = r"""
 })()
 """
 
+#: The quality the export should choose when Flow offers a choice, best first. Flow only ever
+#: *generates* 360p or 720p, so 1080 can only come from its own upscale on export; when the menu
+#: offers it, it is taken, and every label seen is logged so the real vocabulary is on record
+#: rather than guessed at.
+_DOWNLOAD_QUALITY_ORDER = ("1080", "upscale", "original", "highest", "720", "mp4")
+
 _DOWNLOAD_OPTION_JS = r"""
 (() => {
-  const wrapper = document.querySelector('[data-radix-popper-content-wrapper]');
-  if (!wrapper) return JSON.stringify({found: false});
-  const pick = Array.from(wrapper.querySelectorAll('[role="menuitem"],button'))
-    .map((el) => ({el: el, text: (el.innerText || '').trim()}))
-    .find((c) => c.text && !c.el.disabled && /original|720|1080|mp4|video/i.test(c.text));
-  if (!pick) return JSON.stringify({found: false});
-  const r = pick.el.getBoundingClientRect();
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const vis = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+  // Angular Material menus and Radix poppers both appear here depending on the view.
+  const panes = [...document.querySelectorAll(
+    '[data-radix-popper-content-wrapper],.cdk-overlay-pane,[role=menu],mat-menu-panel,.mat-mdc-menu-panel'
+  )].filter(vis);
+  const items = panes.flatMap((pane) =>
+    [...pane.querySelectorAll('[role="menuitem"],button,[role=option]')].filter(vis)
+      .filter((el) => !el.disabled)
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          label: clean(el.innerText).slice(0, 60),
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+        };
+      })
+      .filter((o) => o.label)
+  );
+  const order = %(order)s;
+  let pick = null;
+  for (const needle of order) {
+    pick = items.find((o) => o.label.toLowerCase().includes(needle));
+    if (pick) break;
+  }
   return JSON.stringify({
-    found: true,
-    label: pick.text.slice(0, 40),
-    x: Math.round(r.x + r.width / 2),
-    y: Math.round(r.y + r.height / 2),
+    found: !!pick,
+    label: pick ? pick.label : null,
+    x: pick ? pick.x : null,
+    y: pick ? pick.y : null,
+    offered: items.map((o) => o.label).slice(0, 12),
   });
 })()
-"""
+""" % {"order": json.dumps(list(_DOWNLOAD_QUALITY_ORDER))}
 
 _LEAVE_EDIT_JS = r"""
 (() => {
@@ -931,18 +969,38 @@ def _leave_result_view(tab: ChromeTabRef) -> None:
 
 _PLAYABLE_JS = r"""
 (() => {
-  const vis = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const vis = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
   const video = [...document.querySelectorAll('video')].filter(vis)
     .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
-  if (!video) return JSON.stringify({found: false});
-  const duration = video.duration;
+  const duration = video && Number.isFinite(video.duration)
+    ? Math.round(video.duration * 100) / 100
+    : null;
+  // Flow's result view is the scene editor, and it is a canvas player: it mounts no <video>
+  // at all (verified 2026-09-05). What it does state is the clip it holds — "Total duration:
+  // 00:08" — so that line is the proof the asset exists, and requiring a <video> made every
+  // export fail with "never became a playable clip" for clips that were sitting right there.
+  const stated = clean(document.body.innerText)
+    .match(/total duration:\s*(?:(\d+):)?(\d{1,2}):(\d{2})/i);
+  const statedSeconds = stated
+    ? Number(stated[1] || 0) * 3600 + Number(stated[2]) * 60 + Number(stated[3])
+    : null;
+  const downloadReady = [...document.querySelectorAll('button,[role=button],a')].filter(vis)
+    .some((b) => /download/i.test(clean(b.innerText) + ' ' + clean(b.getAttribute('aria-label')))
+              && !b.disabled);
+  // The grid also mounts a <video> for the tile it is previewing, so a playable video alone
+  // does not mean we are where the export control lives: that is the scene view, /edit/<id>.
+  const sceneView = /\/edit\//.test(location.href);
   return JSON.stringify({
-    found: true,
-    duration: Number.isFinite(duration) ? Math.round(duration * 100) / 100 : null,
-    readyState: video.readyState,
-    width: video.videoWidth,
-    height: video.videoHeight,
-    src: String(video.src || video.currentSrc || '').split('?')[0].slice(0, 120),
+    found: !!video || statedSeconds !== null || downloadReady,
+    sceneView,
+    duration,
+    statedSeconds,
+    downloadReady,
+    readyState: video ? video.readyState : null,
+    width: video ? video.videoWidth : null,
+    height: video ? video.videoHeight : null,
+    src: video ? String(video.src || video.currentSrc || '').split('?')[0].slice(0, 120) : null,
   });
 })()
 """
@@ -966,14 +1024,22 @@ def _wait_for_playable(
         state = _evaluate(tab, _PLAYABLE_JS) or {}
         last = state if isinstance(state, dict) else {}
         duration = last.get("duration")
-        if last.get("found") and isinstance(duration, (int, float)) and duration > 0.2:
-            if int(last.get("readyState") or 0) >= 1:
-                _log(
-                    runtime,
-                    f"Flow result is playable: {duration}s "
-                    f"{last.get('width')}x{last.get('height')}",
-                )
-                return last
+        stated = last.get("statedSeconds")
+        proof = ""
+        if last.get("downloadReady"):
+            proof = "an enabled export control on the opened scene"
+        elif isinstance(stated, (int, float)) and stated > 0:
+            proof = f"the player's own total duration of {int(stated)}s"
+        elif (
+            last.get("sceneView")
+            and isinstance(duration, (int, float))
+            and duration > 0.2
+            and int(last.get("readyState") or 0) >= 1
+        ):
+            proof = f"a playable <video> of {duration}s {last.get('width')}x{last.get('height')}"
+        if proof:
+            _log(runtime, f"Flow result confirmed by {proof}")
+            return last
         time.sleep(2.0)
     _flow_raise(
         ErrorCode.FLOW_RESULT_NOT_FOUND,
@@ -1014,15 +1080,30 @@ def _download_flow_video(
         for attempt in range(3):
             button = _evaluate(tab, _DOWNLOAD_BUTTON_JS) or {}
             if not button.get("found"):
+                # The grid has no export control; only the scene view does. Leaving the scene
+                # (or never having opened it) is a recoverable state, so the result is opened
+                # again rather than the attempts being spent clicking nothing.
+                if media_url:
+                    _log(runtime, "No export control here; opening the result view again")
+                    if _open_result(tab, media_url, runtime):
+                        _wait_for_playable(tab, runtime, timeout_s=60.0)
                 time.sleep(2.0)
                 continue
             dispatch_mouse_click(tab, button["x"], button["y"])
             _log(runtime, f"Flow download control clicked ({button.get('label')})")
             time.sleep(1.5)
+            time.sleep(1.0)
             option = _evaluate(tab, _DOWNLOAD_OPTION_JS) or {}
+            offered = option.get("offered") or []
+            if offered:
+                _log(runtime, f"Flow export options offered: {json.dumps(offered)[:200]}")
             if option.get("found"):
                 dispatch_mouse_click(tab, option["x"], option["y"])
-                _log(runtime, f"Flow download option chosen: {option.get('label')}")
+                _log(
+                    runtime,
+                    f"Flow export quality chosen: {option.get('label')} "
+                    f"(preference order {'/'.join(_DOWNLOAD_QUALITY_ORDER)})",
+                )
             settled = _settled_download(output_dir, 180.0)
             if settled is not None:
                 _log(
@@ -1337,8 +1418,24 @@ def _run_flow_job_inner(
     if runtime is not None:
         runtime.update_status("opening_provider_tab")
     target = getattr(resolved, "flow_url", None) or FLOW_BASE_URL
+    # Binding and opening the project are one operation: if the reference goes stale between
+    # them, rebinding is the fix, not failing the job.
     tab = _bind_flow_tab(adapter, target, runtime)
-    workspace_url = _ensure_flow_project(tab, runtime, resolved)
+    workspace_url = ""
+    for attempt in range(3):
+        try:
+            workspace_url = _ensure_flow_project(tab, runtime, resolved)
+            break
+        except OrdaKError as exc:
+            if exc.code is not ErrorCode.FLOW_TAB_LOST or attempt == 2:
+                raise
+            _log(
+                runtime,
+                "Flow tab reference went stale while opening the project; rebinding and retrying",
+                "warning",
+            )
+            time.sleep(2.0)
+            tab = _bind_flow_tab(adapter, target, runtime)
 
     if runtime is not None:
         runtime.update_status("checking_login")
