@@ -83,6 +83,34 @@ def test_extract_image_result_falls_back_to_asset_url(
     assert result.is_acceptable is True
 
 
+def test_extract_image_result_uses_visible_gemini_pixels_when_download_is_protected(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    adapter = ExistingChromeProviderAdapter("gemini")
+    saved = tmp_path / "rendered.png"
+    saved.write_bytes(b"image")
+
+    monkeypatch.setattr(adapter, "_wait_for_generated_image_ready", lambda tab, timeout_ms: True)
+    monkeypatch.setattr(adapter, "_inspect_generated_image_state", lambda tab: {"generatedMarker": True})
+    monkeypatch.setattr("app.providers.existing_chrome.download_generated_images_from_controls", lambda *args, **kwargs: [])
+    monkeypatch.setattr("app.providers.existing_chrome.capture_visible_generated_images", lambda *args, **kwargs: [saved])
+    monkeypatch.setattr(adapter, "_export_generated_images", lambda *args, **kwargs: [])
+
+    result = adapter.extract_image_result(
+        ChromeTabRef(window_id=1, tab_id=1),
+        output_dir=tmp_path,
+        job_id="job-visible-pixels",
+        timeout_ms=10_000,
+        max_images=1,
+    )
+
+    assert result.source == "dom"
+    assert result.confidence == "medium"
+    assert result.artifacts == [saved]
+    assert result.is_acceptable is True
+
+
 def test_extract_image_result_rejects_low_confidence_dom_fallback(
     monkeypatch,
     tmp_path: Path,

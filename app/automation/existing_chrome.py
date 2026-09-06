@@ -2068,6 +2068,159 @@ def _looks_like_image_bytes(payload: bytes) -> bool:
     return False
 
 
+def download_generated_images_from_controls(
+    tab: ChromeTabRef,
+    *,
+    output_dir: Path,
+    job_id: str,
+    max_images: int,
+    timeout_ms: int,
+) -> list[Path]:
+    """Click Gemini's official per-image download control and collect its real file.
+
+    Gemini's current image result exposes ``data-test-id=download-generated-image-button``
+    as a button, not an anchor.  URL/canvas export is intentionally only a fallback: it can
+    fail due to cross-origin image policy even though the result is visibly complete.  CDP's
+    browser-level download routing gives this click an isolated directory and lets us prove
+    the downloaded bytes belong to this job.
+    """
+    download_dir = output_dir / f"{job_id}_downloads"
+    click_script = f"""
+(() => {{
+  const limit = {max(1, int(max_images))};
+  const visible = (el) => {{
+    const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 0 && rect.height >= 0;
+  }};
+  const controls = Array.from(document.querySelectorAll(
+    '[data-test-id="download-generated-image-button"] button, button[aria-label*="Download full-sized image"]'
+  )).filter(visible);
+  const unique = [...new Set(controls)].slice(-limit);
+  for (const button of unique) button.click();
+  return String(unique.length);
+}})()
+"""
+    try:
+        with download_to(tab, download_dir):
+            clicked = int(execute_javascript(tab, click_script) or "0")
+            if clicked <= 0:
+                return []
+            deadline = time.monotonic() + timeout_ms / 1000
+            accepted: list[Path] = []
+            seen: set[Path] = set()
+            while time.monotonic() < deadline:
+                partials = list(download_dir.glob("*.crdownload"))
+                candidates = [path for path in download_dir.iterdir() if path.is_file() and path not in seen and not path.name.endswith((".crdownload", ".part"))]
+                for candidate in candidates:
+                    size_before = candidate.stat().st_size
+                    if size_before < 1024 or partials:
+                        continue
+                    time.sleep(0.5)
+                    if candidate.exists() and candidate.stat().st_size == size_before:
+                        payload = candidate.read_bytes()
+                        if _looks_like_image_bytes(payload):
+                            destination = output_dir / slugify_filename(f"{job_id}_output_{len(accepted) + 1}{candidate.suffix or '.png'}")
+                            destination.write_bytes(payload)
+                            accepted.append(destination)
+                            seen.add(candidate)
+                            if len(accepted) >= max_images:
+                                return accepted
+                if accepted and not partials:
+                    return accepted
+                time.sleep(0.5)
+    except (OSError, RuntimeError, ValueError):
+        # The caller continues with URL and canvas alternatives.  A visible result must
+        # never become a hard extraction failure merely because a browser blocks downloads.
+        return []
+    return []
+
+
+def capture_visible_generated_images(
+    tab: ChromeTabRef,
+    *,
+    output_dir: Path,
+    job_id: str,
+    max_images: int,
+) -> list[Path]:
+    """Capture the rendered provider image when its protected URL cannot be read.
+
+    Gemini can display a completed image from a short-lived, cross-origin URL while
+    refusing both ``fetch`` and an automation-triggered download.  The browser has
+    already decoded those pixels, so a CDP screenshot of the image element is a
+    reliable last-mile extraction.  This is deliberately scoped to generated images
+    (never uploaded reference previews) and preserves the element's exact 9:16 crop.
+    """
+    if _is_mac_backend():
+        return []
+    script = f"""
+(() => {{
+  const visible = (el) => {{
+    const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+      && rect.width >= 160 && rect.height >= 160;
+  }};
+  const images = Array.from(document.querySelectorAll('generated-image img, .generated-images-container img, .image-gallery img, img[alt*="generated" i]'))
+    .filter(visible)
+    .filter((img) => !/uploaded image|open image\\s+\\d+\\s+of/i.test(`${{img.alt || ''}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ''}}`))
+    .slice(-{max(1, int(max_images))});
+  return JSON.stringify(images.map((img) => {{
+    img.scrollIntoView({{block: 'center', inline: 'center'}});
+    const rect = img.getBoundingClientRect();
+    return {{x: rect.left, y: rect.top, width: rect.width, height: rect.height}};
+  }}));
+}})()
+"""
+    try:
+        raw = execute_javascript(tab, script)
+        clips = json.loads(raw or "[]")
+        if not isinstance(clips, list) or not clips:
+            return []
+        # scrollIntoView is asynchronous from the compositor's perspective.
+        time.sleep(0.25)
+        info = _linux_find_tab(tab)
+        if info is None or not info.websocket_debugger_url:
+            return []
+        saved: list[Path] = []
+        # A 9:16 PNG is routinely >1 MiB once base64-encoded; websockets' default
+        # receive limit would otherwise close the CDP connection mid-screenshot.
+        with websocket_connect(
+            info.websocket_debugger_url,
+            proxy=None,
+            open_timeout=5,
+            close_timeout=2,
+            max_size=None,
+        ) as websocket:
+            for index, clip in enumerate(clips, start=1):
+                if not isinstance(clip, dict):
+                    continue
+                width, height = float(clip.get("width") or 0), float(clip.get("height") or 0)
+                if width < 160 or height < 160:
+                    continue
+                websocket.send(json.dumps({
+                    "id": index,
+                    "method": "Page.captureScreenshot",
+                    "params": {
+                        "format": "png",
+                        "captureBeyondViewport": False,
+                        "clip": {"x": float(clip["x"]), "y": float(clip["y"]), "width": width, "height": height, "scale": 1},
+                    },
+                }))
+                while True:
+                    response = json.loads(websocket.recv())
+                    if response.get("id") == index:
+                        break
+                encoded = str((response.get("result") or {}).get("data") or "")
+                payload = base64.b64decode(encoded) if encoded else b""
+                if not _looks_like_image_bytes(payload):
+                    continue
+                target = output_dir / slugify_filename(f"{job_id}_output_{len(saved) + 1}.png")
+                target.write_bytes(payload)
+                saved.append(target)
+        return saved
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
 def export_generated_images(
     tab: ChromeTabRef,
     *,

@@ -8,8 +8,10 @@ from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
     best_effort_stop,
+    capture_visible_generated_images,
     detect_busy_state,
     detect_login_or_verification,
+    download_generated_images_from_controls,
     inspect_generated_image_state,
     export_generated_images,
     get_tab_info,
@@ -229,6 +231,36 @@ class ExistingChromeProviderAdapter:
             )
 
         state = self._inspect_generated_image_state(tab)
+        if self.provider == "gemini":
+            control_paths = download_generated_images_from_controls(
+                tab,
+                output_dir=output_dir,
+                job_id=job_id,
+                max_images=max_images,
+                timeout_ms=timeout_ms,
+            )
+            if control_paths:
+                notes.append("provider download control: clicked Gemini full-size control and captured its job-scoped file")
+                return ImageExtractionResult(
+                    artifacts=control_paths,
+                    source="download",
+                    confidence="high",
+                    technical_notes=notes,
+                )
+            screenshot_paths = capture_visible_generated_images(
+                tab,
+                output_dir=output_dir,
+                job_id=job_id,
+                max_images=max_images,
+            )
+            if screenshot_paths:
+                notes.append("provider rendered-pixel fallback: captured the completed Gemini image from its visible element")
+                return ImageExtractionResult(
+                    artifacts=screenshot_paths,
+                    source="dom",
+                    confidence="medium",
+                    technical_notes=notes,
+                )
         download_paths = self._export_generated_images(
             tab,
             output_dir=output_dir,
