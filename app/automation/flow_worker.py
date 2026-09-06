@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -572,6 +573,23 @@ _SUBMIT_JS = r"""
 """
 
 
+def _composer_has_prompt(editor_text: str, prompt: str) -> bool:
+    """Verify Flow retained our whole prompt, allowing its current ``Edit`` prefix.
+
+    Flow's September 2026 composer renders an ``Edit`` command line above the
+    actual ProseMirror text.  It is part of the visible editor's ``innerText``
+    even after select-all/delete, so an exact prefix comparison reports a
+    false UI-change failure although the full prompt is present.  Permit only
+    that known one-line UI prefix; arbitrary stale text is still rejected.
+    """
+    expected = re.sub(r"\s+", " ", prompt).strip()
+    observed = re.sub(r"\s+", " ", editor_text).strip()
+    if observed == expected:
+        return True
+    prefix = "Edit "
+    return observed.startswith(prefix) and observed[len(prefix):] == expected
+
+
 def _type_prompt(tab: ChromeTabRef, prompt: str, runtime: WorkerRuntime | None) -> None:
     """Put exactly ``prompt`` in the composer and confirm the composer holds it."""
     state = _evaluate(tab, _EDITOR_JS) or {}
@@ -598,7 +616,7 @@ def _type_prompt(tab: ChromeTabRef, prompt: str, runtime: WorkerRuntime | None) 
     for attempt in range(6):
         time.sleep(0.5 + 0.3 * attempt)
         current = (_evaluate(tab, _EDITOR_JS) or {}).get("text") or ""
-        if current.strip()[:80] == prompt.strip()[:80]:
+        if _composer_has_prompt(current, prompt):
             _log(runtime, f"Flow prompt set ({len(prompt)} chars)")
             return
     _flow_raise(
