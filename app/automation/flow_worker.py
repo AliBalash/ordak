@@ -703,22 +703,39 @@ _GENERATION_STATE_JS = r"""
 _REFUSAL_JS = r"""
 (() => {
   const text = ((document.body ? document.body.innerText : '') || '')
-      .replace(/\s+/g, ' ').toLowerCase();
-  if (/unusual activity/.test(text)) return 'unusual_activity';
-  if (/violat|content polic|not allowed|cannot generate/.test(text)) return 'policy';
-  return '';
+      .replace(/\s+/g, ' ').trim();
+  const lower = text.toLowerCase();
+  const patterns = [
+    /we noticed some unusual activity[^.?!]{0,280}[.?!]?/i,
+    /(?:didn't follow|did not follow|violat\w*|content polic\w*|not allowed|can't generate|cannot generate|unable to generate|generation failed)[^.?!]{0,280}[.?!]?/i,
+  ];
+  let reason = '';
+  if (/unusual activity/.test(lower)) reason = 'unusual_activity';
+  else if (/(didn't follow|did not follow|violat\w*|content polic\w*|not allowed|can't generate|cannot generate|unable to generate|generation failed)/.test(lower)) reason = 'policy';
+  const match = patterns.map((pattern) => text.match(pattern)).find(Boolean);
+  return JSON.stringify({reason, evidence: match ? match[0].slice(0, 300) : ''});
 })()
 """
 
 
-def _refusal_reason(tab: ChromeTabRef) -> str:
-    """``"unusual_activity"``, ``"policy"`` or ``""`` — read from the page, not inferred."""
+def _refusal_reason(tab: ChromeTabRef) -> dict[str, str]:
+    """Visible Flow rejection and its exact UI evidence, never an inferred diagnosis."""
     try:
         from app.automation.existing_chrome import execute_javascript
 
-        return str(execute_javascript(tab, _REFUSAL_JS) or "").strip()
+        raw = execute_javascript(tab, _REFUSAL_JS)
+        if isinstance(raw, str):
+            parsed = json.loads(raw or "{}")
+        else:
+            parsed = raw or {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            "reason": str(parsed.get("reason") or "").strip(),
+            "evidence": str(parsed.get("evidence") or "").strip()[:300],
+        }
     except Exception:
-        return ""
+        return {}
 
 
 def _wait_for_generation(
@@ -789,16 +806,17 @@ def _wait_for_generation(
         # neither should be retried blindly, and polling on for the full timeout only
         # hides what happened.
         refusal = _refusal_reason(tab)
-        if refusal == "unusual_activity":
+        evidence = refusal.get("evidence") or "no specific Flow message was readable"
+        if refusal.get("reason") == "unusual_activity":
             _flow_raise(
                 ErrorCode.FLOW_UNUSUAL_ACTIVITY,
                 "Flow refused the generation as unusual activity and produced no video.",
-                "the page states the account was not charged for this generation",
+                f"Flow UI: {evidence}",
             )
-        if state.get("failed") and not state.get("generating"):
+        if refusal.get("reason") == "policy" or (state.get("failed") and not state.get("generating")):
             _flow_raise(
                 ErrorCode.FLOW_POLICY_VIOLATION,
-                "Flow rejected the prompt (content policy) and produced no video.",
+                f"Flow rejected the generation for policy reasons. Flow UI: {evidence}",
             )
         time.sleep(5.0)
     _flow_raise(
