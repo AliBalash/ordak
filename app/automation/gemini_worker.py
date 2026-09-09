@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import mimetypes
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -125,6 +126,7 @@ def _provider_name(provider: Provider) -> str:
 
 
 GEMINI_MODEL_LABELS = {
+    "auto_best": "Best model currently available in Gemini",
     "nano_banana_pro": "Nano Banana Pro",
     "nano_banana_2": "Nano Banana 2",
 }
@@ -134,6 +136,13 @@ GEMINI_MODEL_MATCHERS = {
     "nano_banana_pro": ("nano banana pro", "nanobananapro"),
     "nano_banana_2": ("nano banana 2", "nano banana2", "nanobanana2"),
 }
+
+# The Gemini consumer app no longer puts the Nano Banana name in the image-tool
+# chip. Its actual selector is the conversation mode picker. Google's Gemini Apps
+# help documents the contract: Flash-Lite selects Nano Banana 2 Lite, while Flash
+# and Pro select Nano Banana 2; Nano Banana Pro is an explicit post-result redo.
+_GEMINI_MODE_NB2_RE = re.compile(r"\b(?:flash|pro)\b", re.IGNORECASE)
+_GEMINI_MODE_FLASH_LITE_RE = re.compile(r"\bflash[-\s]*lite\b", re.IGNORECASE)
 
 
 def _gemini_display_label(model: str) -> str:
@@ -158,12 +167,17 @@ def _identify_gemini_model(label: str) -> str | None:
     for needle in GEMINI_MODEL_MATCHERS["nano_banana_pro"]:
         if needle in normalized:
             return "nano_banana_pro"
-    if "pro" in normalized:
-        return None
     for needle in GEMINI_MODEL_MATCHERS["nano_banana_2"]:
         if needle in normalized:
             return "nano_banana_2"
     if "nano banana" in normalized:
+        return "nano_banana_2"
+    # Gemini app mode-picker labels (e.g. "3.8 Flash" and "3.1 Pro") are the
+    # verified UI control that determines the image model. Lite is excluded: it
+    # maps to Nano Banana 2 Lite, not this contract.
+    if _GEMINI_MODE_FLASH_LITE_RE.search(normalized):
+        return None
+    if _GEMINI_MODE_NB2_RE.search(normalized):
         return "nano_banana_2"
     return None
 
@@ -401,9 +415,42 @@ def _select_gemini_image_model(tab, requested: str, runtime) -> dict[str, str]:
 
     state = _activate_gemini_image_tool(tab, runtime)
     attributions = [str(line) for line in (state.get("attribution") or []) if str(line).strip()]
+
+    # Current Gemini app builds expose image-model selection through the mode
+    # picker, not the old composer attribution. Read its selected value first;
+    # the helper intentionally ignores names merely listed in an open menu.
+    selected_mode = _read_gemini_selected_model(tab)
+    selected_model = _identify_gemini_model(str(selected_mode.get("label") or ""))
+    if requested_key == GEMINI_PRO_MODEL and selected_model == "nano_banana_2":
+        return {"label": str(selected_mode["label"]), "source": "mode-picker"}
+    if requested_key == "auto_best" and selected_model:
+        if runtime is not None:
+            runtime.append_log(
+                "Gemini image model verified from the selected mode picker: "
+                f"{selected_mode['label']!r} → Nano Banana 2."
+            )
+        return {"label": str(selected_mode["label"]), "source": "mode-picker"}
+    if selected_model == requested_key:
+        if runtime is not None:
+            runtime.append_log(
+                "Gemini image model verified from the selected mode picker: "
+                f"{selected_mode['label']!r} → {display}."
+            )
+        return {"label": str(selected_mode["label"]), "source": "mode-picker"}
+    if requested_key == "auto_best":
+        observed = [( _identify_gemini_model(line), line) for line in attributions]
+        observed = [(model, line) for model, line in observed if model]
+        if observed:
+            # When Gemini exposes more than one eligible label, prefer Pro before the
+            # standard generation model. Unknown labels are never guessed at.
+            rank = {"nano_banana_pro": 2, "nano_banana_2": 1}
+            _model, line = max(observed, key=lambda item: rank.get(item[0], 0))
+            if runtime is not None:
+                runtime.append_log(f"Gemini selected its strongest named image model: {line!r}")
+            return {"label": line, "source": "composer-attribution"}
     for line in attributions:
         identified = _identify_gemini_model(line)
-        if identified == requested_key:
+        if identified == requested_key or (requested_key == GEMINI_PRO_MODEL and identified == "nano_banana_2"):
             if runtime is not None:
                 runtime.append_log(f"Gemini image model confirmed by the UI: {line!r}")
             return {"label": line, "source": "composer-attribution"}
@@ -546,10 +593,19 @@ def _build_gemini_receipt(
     requested = job.requested_model
     observed_label = str((model_evidence or {}).get("label") or "").strip() or None
     observed_source = str((model_evidence or {}).get("source") or "").strip()
+    observed_model = _identify_gemini_model(observed_label or "")
+    requested_model = _normalize_gemini_model(requested)
+    # A receipt can only verify a model explicitly named by Gemini's composer.  In
+    # auto_best mode that means one of the known named image models; for a pinned
+    # request it must be the exact requested model.  Never bless a provider default
+    # whose model name the UI hid.
     verified = bool(
         observed_label
-        and observed_source
-        and _identify_gemini_model(observed_label) == _normalize_gemini_model(requested)
+        and observed_source in {"composer-attribution", "model-control", "mode-picker"}
+        and (
+            (requested_model == "auto_best" and observed_model in {"nano_banana_pro", "nano_banana_2"})
+            or observed_model == requested_model
+        )
     )
     notes: list[str] = []
     if observed_source:
@@ -557,6 +613,12 @@ def _build_gemini_receipt(
     notes.append(f"artifact_source={artifact_source}")
     if pro_outcome is not None:
         notes.extend(pro_outcome.notes)
+        if (requested_model == GEMINI_PRO_MODEL and pro_outcome.used and
+                pro_outcome.control is not None and pro_outcome.result is not None and
+                pro_outcome.distinction != "none"):
+            observed_label = pro_outcome.control.label
+            verified = True
+            notes.append("final_model_label_source=pro-regeneration-control")
     for record in validations:
         notes.append(
             f"image={record.path.name} {record.width}x{record.height} sha256={record.sha256}"
@@ -707,34 +769,15 @@ _ASPECT_FRAMING = {
 }
 
 
-def _aspect_ratio_instruction(job: AutomationJobRequest) -> str:
-    """Say the requested aspect ratio in the prompt, because the UI cannot.
-
-    Gemini's image composer offers no aspect-ratio control, and a result whose shape
-    does not match the contract is rejected by validation (§32). Asking in words is the
-    only lever the UI leaves, so the request is stated instead of hoped for.
-    """
-    requested = str((job.generation.aspect_ratio if job.generation else None) or "").strip()
-    if not requested:
-        return ""
-    described = _ASPECT_FRAMING.get(requested)
-    if described is None:
-        described = f"an aspect ratio of exactly {requested}"
-    return f"Compose the image in {described}. The output must have aspect ratio {requested}."
-
-
 def _effective_prompt(job: AutomationJobRequest) -> str:
-    aspect = _aspect_ratio_instruction(job)
-    suffix = f"\n\n{aspect}" if aspect else ""
-    if job.mode == "image_generate" and job.uploads:
-        return (
-            "Using the uploaded reference image, generate or edit an image that matches this prompt:\n"
-            f"{job.question}{suffix}"
-        )
-    if job.mode == "image_generate":
-        return f"Generate an image based on this prompt:\n{job.question}{suffix}"
-    if job.mode == "image_analyze" and job.uploads:
-        return f"Analyze the uploaded image and answer this request:\n{job.question}"
+    """Return the provider prompt verbatim.
+
+    Image direction is authored by the dedicated ChatGPT prompt-writer.  Adding
+    wrappers, aspect-ratio prose, reference policy, or revision text here changes the
+    creative request after approval and was the regression behind the reference-sheet
+    copies.  Provider mechanics (uploads and the selected model) are carried outside
+    the text, so they do not belong in this function.
+    """
     return job.question
 
 
@@ -1191,6 +1234,28 @@ def _remember_tab(runtime: WorkerRuntime | None, tab: ChromeTabRef) -> None:
         runtime.remember_conversation_state(info)
 
 
+def _uploaded_pixels_match(state: dict, paths: list[Path]) -> bool:
+    """Gemini hides file names and revokes preview blobs; compare decoded pixels in order."""
+    from PIL import Image
+    previews = state.get("attachmentPixels") or []
+    if len(previews) != len(paths):
+        return False
+    for pixels, path in zip(previews, paths):
+        if not isinstance(pixels, list) or len(pixels) != 32 * 32 * 4:
+            return False
+        with Image.open(path) as image:
+            rgba = image.convert("RGBA")
+            white = Image.new("RGBA", rgba.size, "white")
+            white.alpha_composite(rgba)
+            expected = list(white.resize((32, 32), Image.Resampling.BILINEAR).tobytes())
+        # Canvas and Pillow use different resampling kernels. Allow that small
+        # difference, but reject swapped references and extra copies.
+        delta = sum(abs(a-b) for a,b in zip(expected, pixels)) / len(expected)
+        if delta > 12:
+            return False
+    return True
+
+
 def _attach_uploads_in_existing_chrome(
     tab: ChromeTabRef,
     upload_paths: list[Path],
@@ -1218,9 +1283,10 @@ def _attach_uploads_in_existing_chrome(
         upload_state = get_provider_adapter(provider).verify_upload_complete(tab)
         if not (
             upload_state.get("attachment")
-            and int(upload_state.get("attachmentCount") or 0) >= index
+            and int(upload_state.get("attachmentCount") or 0) == index
             and upload_state.get("hasPreview")
             and not upload_state.get("loading")
+            and (provider != "gemini" or _uploaded_pixels_match(upload_state, upload_paths[:index]))
         ):
             raise OrdaKError(
                 code=ErrorCode.UPLOAD_INCOMPLETE,
@@ -1558,7 +1624,7 @@ def _run_gemini_job_in_existing_chrome(
                 output_dir=resolved.browser_output_dir,
                 job_id=job_id,
                 timeout_ms=min(_provider_response_timeout_ms(resolved, job.provider), 90_000),
-                max_images=resolved.max_output_images_per_job,
+                max_images=1 if pro_outcome is not None else resolved.max_output_images_per_job,
             )
             if not extraction.is_acceptable:
                 _raise_structured_error(

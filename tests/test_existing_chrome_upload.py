@@ -63,7 +63,7 @@ def test_upload_local_file_waits_until_loading_clears(monkeypatch, tmp_path: Pat
     assert calls["status_polls"] >= 1
     assert calls["readiness_polls"] >= 4
     assert calls["marked_done"] == 1
-    assert "for (const existing of Array.from(input.files || []))" in "\n".join(scripts)
+    assert "expectedNames.slice(0,-1)" in "\n".join(scripts)
 
 
 def test_upload_local_file_accepts_awaiting_ack_when_dom_readiness_catches_up(

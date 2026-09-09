@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
@@ -9,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.artifacts import slugify_filename
+from app.artifacts import slugify_filename, storage_absolute_path
 from app.config import settings
 from app.database import init_db
 from app.job_manager import JobManager
@@ -186,6 +188,8 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     role=role_items[index] if index < len(role_items) else "unspecified",
                     path=saved,
                     filename=getattr(upload_items[index], "filename", None),
+                    sha256=hashlib.sha256(storage_absolute_path(saved).read_bytes()).hexdigest(),
+                    position=index,
                 )
                 for index, saved in enumerate(uploads)
             ]

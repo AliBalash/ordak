@@ -799,6 +799,8 @@ class JobManager:
 
     def _recover_stale_incomplete_jobs(self) -> None:
         active_statuses = {
+            "queued",
+            "pro_regeneration",
             "running",
             "checking_browser",
             "opening_provider_tab",
@@ -828,7 +830,7 @@ class JobManager:
                 job.finished_at = utcnow()
                 job.error_code = ErrorCode.RESPONSE_TIMEOUT.value
                 job.error_message = (
-                    "ordak restarted while this job was still running. Retry or resume it."
+                    "Ordak restarted before this queued or running job completed. Retry or resume it."
                 )
                 job.recoverable = descriptor.recoverable if descriptor else True
                 job.suggested_action = descriptor.suggested_action if descriptor else None

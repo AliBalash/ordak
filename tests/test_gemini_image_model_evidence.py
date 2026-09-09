@@ -44,18 +44,65 @@ def test_nano_banana_2_is_confirmed_from_the_attribution(monkeypatch) -> None:
     assert any("confirmed by the UI" in line for line in runtime.logs)
 
 
-def test_pro_request_is_refused_when_the_ui_names_another_model(monkeypatch) -> None:
-    fake_state(monkeypatch, active=True, attribution=["Create with Nano Banana 2."])
+def test_gemini_app_flash_mode_is_verified_as_nano_banana_2(monkeypatch) -> None:
+    fake_state(monkeypatch, active=True, attribution=[])
+    monkeypatch.setattr(
+        gw,
+        "_read_gemini_selected_model",
+        lambda tab: {"label": "Open mode picker, currently 3.8 Flash", "source": "popup-button"},
+    )
+
+    evidence = gw._select_gemini_image_model(object(), "nano_banana_2", Runtime())
+
+    assert evidence == {
+        "label": "Open mode picker, currently 3.8 Flash",
+        "source": "mode-picker",
+    }
+
+
+def test_gemini_app_pro_mode_is_verified_as_nano_banana_2(monkeypatch) -> None:
+    fake_state(monkeypatch, active=True, attribution=[])
+    monkeypatch.setattr(
+        gw,
+        "_read_gemini_selected_model",
+        lambda tab: {"label": "Open mode picker, currently 3.1 Pro Extended", "source": "popup-button"},
+    )
+
+    evidence = gw._select_gemini_image_model(object(), "nano_banana_2", Runtime())
+
+    assert evidence["source"] == "mode-picker"
+
+
+def test_flash_lite_is_not_accepted_for_the_nano_banana_2_contract(monkeypatch) -> None:
+    fake_state(monkeypatch, active=True, attribution=[])
+    monkeypatch.setattr(
+        gw,
+        "_read_gemini_selected_model",
+        lambda tab: {"label": "Open mode picker, currently 3.5 Flash-Lite", "source": "popup-button"},
+    )
+
     with pytest.raises(OrdaKError) as excinfo:
-        gw._select_gemini_image_model(object(), "nano_banana_pro", Runtime())
-    assert excinfo.value.code is ErrorCode.MODEL_NOT_AVAILABLE
-    assert "Nano Banana 2" in excinfo.value.message
+        gw._select_gemini_image_model(object(), "nano_banana_2", Runtime())
+    assert excinfo.value.code is ErrorCode.MODEL_SELECTION_FAILED
 
 
-def test_no_named_model_is_an_unverified_selection_not_a_guess(monkeypatch) -> None:
+def test_pro_request_allows_nb2_initial_step_but_does_not_claim_pro(monkeypatch) -> None:
+    fake_state(monkeypatch, active=True, attribution=["Create with Nano Banana 2."])
+    evidence = gw._select_gemini_image_model(object(), "nano_banana_pro", Runtime())
+    assert evidence["label"] == "Create with Nano Banana 2."
+
+
+def test_hidden_named_model_fails_instead_of_using_a_provider_selected_fallback(monkeypatch) -> None:
     fake_state(monkeypatch, active=True, attribution=["Chat with Gemini"])
     with pytest.raises(OrdaKError) as excinfo:
         gw._select_gemini_image_model(object(), "nano_banana_2", Runtime())
+    assert excinfo.value.code is ErrorCode.MODEL_SELECTION_FAILED
+
+
+def test_auto_best_also_fails_when_gemini_hides_its_model_name(monkeypatch) -> None:
+    fake_state(monkeypatch, active=True, attribution=["Chat with Gemini"])
+    with pytest.raises(OrdaKError) as excinfo:
+        gw._select_gemini_image_model(object(), "auto_best", Runtime())
     assert excinfo.value.code is ErrorCode.MODEL_SELECTION_FAILED
 
 

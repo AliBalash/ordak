@@ -45,8 +45,29 @@ def _job() -> GeminiJobRequest:
         provider="gemini",
         mode="image_generate",
         generation=GenerationOptions(model="nano_banana_pro", aspect_ratio="9:16", quality="best"),
+        upload_paths=[Path("/tmp/char.png")],
         references=[("character_sheet", Path("/tmp/char.png"))],
     )
+
+
+def test_provider_receives_the_image_writer_prompt_verbatim_with_references() -> None:
+    """Uploads must never cause the worker to mutate ChatGPT's final art direction."""
+    prompt = gemini_worker._effective_prompt(_job())
+
+    assert prompt == "a portrait still"
+
+
+def test_provider_receives_the_image_writer_prompt_verbatim_with_generation_options() -> None:
+    prompt = gemini_worker._effective_prompt(
+        GeminiJobRequest(
+            question="a landscape, exactly 9:16",
+            provider="gemini",
+            mode="image_generate",
+            generation=GenerationOptions(aspect_ratio="9:16"),
+        )
+    )
+
+    assert prompt == "a landscape, exactly 9:16"
 
 
 def _validation(tmp_path: Path) -> image_validation.ImageValidation:
@@ -69,10 +90,11 @@ def test_receipt_records_the_pro_path_when_it_really_ran(tmp_path: Path) -> None
         pro_outcome=outcome,
         validations=[_validation(tmp_path)],
         workspace_url="https://gemini.google.com/app/abc",
+        artifact_source="download",
     )
     assert receipt.model_verified is True
     assert receipt.pro_regeneration_used is True
-    assert receipt.actual_model_label == "Nano Banana Pro"
+    assert receipt.actual_model_label == "redo with pro"
     assert receipt.reference_roles == ["character_sheet"]
     assert any("sha256=" in note for note in receipt.notes)
 
@@ -84,6 +106,7 @@ def test_receipt_refuses_to_verify_a_label_that_is_a_different_model(tmp_path: P
         pro_outcome=None,
         validations=[_validation(tmp_path)],
         workspace_url=None,
+        artifact_source="download",
     )
     assert receipt.model_verified is False
     assert receipt.pro_regeneration_used is False
@@ -97,6 +120,19 @@ def test_receipt_refuses_to_verify_without_a_label_source(tmp_path: Path) -> Non
         pro_outcome=None,
         validations=[_validation(tmp_path)],
         workspace_url=None,
+        artifact_source="download",
+    )
+    assert receipt.model_verified is False
+
+
+def test_receipt_refuses_to_verify_an_unnamed_provider_default(tmp_path: Path) -> None:
+    receipt = gemini_worker._build_gemini_receipt(
+        _job(),
+        model_evidence={"label": "Create image (provider-selected)", "source": "image-tool-enabled"},
+        pro_outcome=None,
+        validations=[_validation(tmp_path)],
+        workspace_url=None,
+        artifact_source="download",
     )
     assert receipt.model_verified is False
 

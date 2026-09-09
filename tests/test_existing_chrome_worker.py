@@ -166,7 +166,7 @@ class FakeAdapter:
         self.last_max_images = max_images
         return ImageExtractionResult(
             artifacts=list(self.image_paths),
-            source="dom",
+            source="download",
             confidence="high" if self.image_paths else "low",
             technical_notes=[],
         )
@@ -477,7 +477,11 @@ def test_image_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch, 
     install_fake_adapter(monkeypatch, adapter)
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
     upload_path = tmp_path / "sample-image-test.png"
-    upload_path.write_bytes(b"fake-image")
+    write_png(upload_path, 1080, 1920, seed=3)
+    from PIL import Image
+    with Image.open(upload_path) as image:
+        pixels = list(image.convert("RGBA").resize((32,32), Image.Resampling.BILINEAR).tobytes())
+    adapter.upload_state.update(attachmentCount=1, attachmentPixels=[pixels])
 
     answer = run_gemini_job(
         "job-existing-chrome-image",
@@ -492,7 +496,7 @@ def test_image_job_uses_existing_google_chrome(monkeypatch: pytest.MonkeyPatch, 
     )
 
     assert answer == "سلام! من خوبم."
-    assert adapter.inserted == ["Analyze the uploaded image and answer this request:\nاین تصویر را توضیح بده."]
+    assert adapter.inserted == ["این تصویر را توضیح بده."]
 
 
 def test_image_generate_job_collects_output_images(

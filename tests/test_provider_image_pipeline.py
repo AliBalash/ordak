@@ -48,7 +48,7 @@ def test_extract_image_result_falls_back_to_asset_url(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    adapter = ExistingChromeProviderAdapter("gemini")
+    adapter = ExistingChromeProviderAdapter("chatgpt")
     saved = tmp_path / "asset.png"
     saved.write_bytes(b"image")
     strategies: list[str] = []

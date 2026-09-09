@@ -108,7 +108,9 @@ def composer(monkeypatch: pytest.MonkeyPatch):
             "app.automation.existing_chrome.dispatch_mouse_click", lambda *a, **k: None
         )
         monkeypatch.setattr("app.automation.existing_chrome.dispatch_key", lambda *a, **k: None)
-        monkeypatch.setattr(flow_settings.time, "sleep", lambda _s: None)
+        now = [0.0]
+        monkeypatch.setattr(flow_settings.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(flow_settings.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + max(seconds, 0.01)))
         return instance
 
     mock.install = _install  # type: ignore[attr-defined]

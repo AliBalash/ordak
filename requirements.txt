@@ -4,6 +4,7 @@ fastapi
 httpx
 jinja2
 playwright
+Pillow>=10.0,<12.0
 pydantic
 python-multipart
 python-dotenv

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import aiofiles
 from starlette.datastructures import UploadFile
@@ -20,9 +21,14 @@ async def save_image_upload(
     content_type = upload.content_type or ""
     if not content_type.startswith("image/"):
         raise ValueError("Only image uploads are supported in this panel.")
-    target = resolved.browser_upload_dir / f"{job_id}_{slugify_filename(upload.filename)}"
-    async with aiofiles.open(target, "wb") as handle:
-        while chunk := await upload.read(1024 * 1024):
-            await handle.write(chunk)
-    await upload.close()
+    target = resolved.browser_upload_dir / f"{job_id}_{uuid4().hex}_{slugify_filename(upload.filename)}"
+    try:
+        async with aiofiles.open(target, "xb") as handle:
+            while chunk := await upload.read(1024 * 1024):
+                await handle.write(chunk)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
     return storage_relative_path(target, resolved)

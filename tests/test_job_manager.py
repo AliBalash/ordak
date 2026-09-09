@@ -365,3 +365,21 @@ def test_agent_retry_and_resume_continue_the_same_conversation(tmp_path: Path) -
         assert resume_snapshot.run_strategy == "new_tab_same_conversation"
 
     asyncio.run(scenario())
+
+
+def test_start_marks_abandoned_queue_recoverable_instead_of_waiting_forever(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{tmp_path / 'jobs.db'}")
+    init_db()
+    with SessionLocal() as session:
+        session.add(Job(id='abandoned-queue',question='pending',provider='gemini',mode='chat',status='queued',start_new_chat=True))
+        session.commit()
+    async def scenario():
+        manager = JobManager(worker=lambda *a, **k: "unused")
+        await manager.start()
+        try:
+            snapshot = manager.get_job_snapshot('abandoned-queue')
+            assert snapshot.status == 'failed'
+            assert snapshot.recoverable is True
+        finally:
+            await manager.shutdown()
+    asyncio.run(scenario())

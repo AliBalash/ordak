@@ -92,6 +92,7 @@ def _assistant_root_selectors(provider: ProviderName) -> list[str]:
             "main .prose",
         ]
     return [
+        "model-response",
         "[data-response-id]",
         '[data-message-author-role="model"]',
         "main article",
@@ -1136,6 +1137,7 @@ def upload_local_file(
         file_name=file_name,
         mime_type=mime_type,
         provider=provider,
+        cumulative_file_paths=cumulative_file_paths,
     )
 
     deadline = time.monotonic() + timeout_ms / 1000
@@ -1179,6 +1181,7 @@ def _upload_local_file_via_javascript(
     file_name: str,
     mime_type: str,
     provider: ProviderName,
+    cumulative_file_paths: list[Path] | None = None,
 ) -> None:
     payload_name = json.dumps(file_name, ensure_ascii=False)
     payload_mime = json.dumps(mime_type, ensure_ascii=False)
@@ -1214,6 +1217,7 @@ def _upload_local_file_via_javascript(
   const fileName = {payload_name};
   const mimeType = {payload_mime};
   const provider = {payload_provider};
+  const expectedNames = {json.dumps([p.name for p in cumulative_file_paths] if cumulative_file_paths else [])};
   window.__codexUploadStatus = "pending";
   const isVisible = (el) => {{
     if (!el) return false;
@@ -1242,20 +1246,17 @@ def _upload_local_file_via_javascript(
       // ChatGPT accepts one cumulative FileList.  Replacing it with only the
       // newest file silently drops the style anchor before the character
       // anchor is submitted, so retain every already-attached file.
-      for (const existing of Array.from(input.files || [])) {{
-        dataTransfer.items.add(existing);
+      if (provider === "chatgpt") {{
+        const saved = window.__ordakComposerFiles || {{}};
+        const previous = expectedNames.length ? expectedNames.slice(0,-1).map(name => saved[name]) : Array.from(input.files || []);
+        if (previous.some(item => !item)) throw new Error('Previous composer reference was lost');
+        for (const existing of previous) dataTransfer.items.add(existing);
       }}
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
       if (!input.files || input.files.length < 1) continue;
       input.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
       input.dispatchEvent(new Event('change', {{ bubbles: true, composed: true }}));
-      const dropTarget = getDropTarget();
-      if (provider !== "chatgpt" && dropTarget) {{
-        for (const type of ["dragenter", "dragover", "drop"]) {{
-          dropTarget.dispatchEvent(new DragEvent(type, {{ bubbles: true, cancelable: true, dataTransfer }}));
-        }}
-      }}
       return true;
     }}
     return false;
@@ -1329,6 +1330,9 @@ def _upload_local_file_via_javascript(
         bytes[index] = binary.charCodeAt(index);
       }}
       const file = new File([bytes], fileName, {{ type: mimeType || "application/octet-stream" }});
+      if (expectedNames.length === 1) window.__ordakComposerFiles = {{}};
+      window.__ordakComposerFiles = window.__ordakComposerFiles || {{}};
+      window.__ordakComposerFiles[fileName] = file;
       let attached = setFilesOnInput(file);
       if (!attached) {{
         triggerUploadMenu();
@@ -1381,21 +1385,43 @@ def inspect_upload_state(
     *,
     provider: ProviderName = "gemini",
 ) -> dict[str, Any]:
-    readiness_probe = """
+    readiness_probe = r"""
 (() => {
   const isVisible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const provider = __PROVIDER__;
+  const editor = document.querySelector('.ql-editor[role="textbox"], #prompt-textarea');
+  const scope = provider === "gemini"
+    ? editor?.closest('input-container, input-area-v2, input-area, form')
+    : document;
+  if (!scope) return JSON.stringify({attachment:false, attachmentCount:0, attachmentNames:[], loading:false, hasPreview:false});
   const attachmentSelectors = provider === "chatgpt"
     ? ['img[src^="blob:"]', 'form img', '[data-testid*="attachment" i]', '[data-testid*="composer" i] img']
-    : ['gem-media-attachment', '.gem-attachment', 'mat-basic-chip', '[data-test-id*="upload" i]'];
+    : ['gem-media-attachment', '.gem-attachment'];
   const loadingSelectors = provider === "chatgpt"
     ? ['[role="status"]', '.animate-spin', '[data-testid*="uploading" i]']
     : ['.gem-attachment-content.loading', '.gem-attachment-loading-container', 'mat-spinner[aria-label="Loading image"]'];
   const attachments = attachmentSelectors
-    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .filter((el, index, items) => isVisible(el) && items.indexOf(el) === index);
+    .flatMap((selector) => Array.from(scope.querySelectorAll(selector)))
+    .filter((el, index, items) => isVisible(el) && items.indexOf(el) === index)
+    .filter((el, _, items) => !items.some(other => other !== el && other.contains(el)));
+  const attachmentNames = attachments.map(el => {
+    const values = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText,
+      ...Array.from(el.querySelectorAll('[title], [aria-label], img')).flatMap(n => [n.getAttribute('title'), n.getAttribute('aria-label'), n.getAttribute('alt')])].filter(Boolean);
+    const name = values.map(v => String(v).trim()).find(v => /\.(png|jpe?g|webp|gif)$/i.test(v));
+    return name || '';
+  });
+  const attachmentPixels = attachments.map(el => {
+    const image = el.querySelector('img');
+    if (!image?.complete || !image.naturalWidth) return null;
+    try {
+      const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 32;
+      const ctx = canvas.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0,0,32,32);
+      ctx.drawImage(image,0,0,32,32);
+      return Array.from(ctx.getImageData(0,0,32,32).data);
+    } catch (_) { return null; }
+  });
   const loadingBySelector = loadingSelectors
-    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    .flatMap((selector) => Array.from(scope.querySelectorAll(selector)))
     .some((el) => {
       if (!isVisible(el)) return false;
       return /upload|loading|processing/.test(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase());
@@ -1406,7 +1432,7 @@ def inspect_upload_state(
     return className.includes('cursor-wait');
   });
   const loading = !!loadingBySelector || !!loadingByCursor;
-  const hasPreview = !!Array.from(document.querySelectorAll('img')).find((img) => {
+  const hasPreview = !!Array.from(scope.querySelectorAll('img')).find((img) => {
     const src = img.src || '';
     return isVisible(img) && ((src.startsWith('blob:')) || (provider === "chatgpt" && img.naturalWidth >= 48 && img.naturalHeight >= 48));
   });
@@ -1419,6 +1445,8 @@ def inspect_upload_state(
   return JSON.stringify({
     attachment: attachments.length > 0,
     attachmentCount: attachments.length,
+    attachmentNames,
+    attachmentPixels,
     loading,
     hasPreview,
     submitReady: !!sendButton && !sendButton.disabled,
@@ -1901,7 +1929,7 @@ def inspect_generated_image_state(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\\s+\\d+\\s+of\\s+\\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const collectAssistantRoots = () => {{
@@ -2110,7 +2138,9 @@ def download_generated_images_from_controls(
 """
     hover_target_script = """
 (() => {
-  const images = Array.from(document.querySelectorAll('img[alt*="AI generated" i], generated-image img, .generated-images-container img'));
+  const response = Array.from(document.querySelectorAll('model-response')).at(-1);
+  if (!response) return "";
+  const images = Array.from(response.querySelectorAll('img[alt*="AI generated" i], generated-image img, .generated-images-container img'));
   const image = images.filter((candidate) => {
     const rect = candidate.getBoundingClientRect();
     return rect.width >= 160 && rect.height >= 160;
@@ -2139,10 +2169,12 @@ def download_generated_images_from_controls(
     const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 16 && rect.height >= 16;
   }};
-  const controls = Array.from(document.querySelectorAll(
-    '[data-test-id="download-generated-image-button"], [data-test-id="download-generated-image-button"] button, button[aria-label*="Download full-sized image" i], button[aria-label*="Download" i], [aria-label*="Download full-sized image" i]'
+  const response = Array.from(document.querySelectorAll('model-response')).at(-1);
+  if (!response) return "[]";
+  const controls = Array.from(response.querySelectorAll(
+    '[data-test-id="download-generated-image-button"], [data-test-id="download-generated-image-button"] button, button[aria-label*="Download full-sized image" i], [aria-label*="Download full-sized image" i]'
   )).filter(visible);
-  const unique = [...new Set(controls)].slice(-limit);
+  const unique = [...new Set(controls)].filter(control => !controls.some(other => other !== control && control.contains(other))).slice(-limit);
   return JSON.stringify(unique.map((control) => {{
     control.scrollIntoView({{block: 'center', inline: 'center'}});
     const rect = control.getBoundingClientRect();
@@ -2323,7 +2355,7 @@ def export_generated_images(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\\s+\\d+\\s+of\\s+\\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const readAsDataUrl = (blob) => new Promise((resolve, reject) => {{
@@ -2598,7 +2630,7 @@ def wait_for_response_stable(
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
   }};
-  const isUserUpload = (img) => /user uploaded image|open image\s+\d+\s+of\s+\d+:/i.test(
+  const isUserUpload = (img) => /user uploaded image|open image\\s+\\d+\\s+of\\s+\\d+:/i.test(
     `${{img.closest('button')?.getAttribute('aria-label') || ""}} ${{img.closest('[aria-label]')?.getAttribute('aria-label') || ""}}`
   );
   const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").trim();

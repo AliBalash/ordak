@@ -101,6 +101,8 @@ class ReferenceSpec(BaseModel):
     role: str = Field(default="unspecified", max_length=60)
     path: str
     filename: str | None = None
+    sha256: str | None = None
+    position: int | None = None
 
 
 class GenerationReceipt(BaseModel):
