@@ -1221,7 +1221,6 @@ def _attach_uploads_in_existing_chrome(
             and int(upload_state.get("attachmentCount") or 0) >= index
             and upload_state.get("hasPreview")
             and not upload_state.get("loading")
-            and upload_state.get("submitReady")
         ):
             raise OrdaKError(
                 code=ErrorCode.UPLOAD_INCOMPLETE,
@@ -1436,7 +1435,6 @@ def _run_gemini_job_in_existing_chrome(
                 upload_state.get("attachment")
                 and upload_state.get("hasPreview")
                 and not upload_state.get("loading")
-                and upload_state.get("submitReady")
             ):
                 _raise_structured_error(
                     OrdaKError(code=ErrorCode.UPLOAD_INCOMPLETE)

@@ -802,35 +802,6 @@ def _linux_execute_javascript(tab: ChromeTabRef, javascript: str) -> str:
             return _coerce_javascript_result(value)
 
 
-def _linux_set_chatgpt_file_input_files(tab: ChromeTabRef, file_paths: list[Path]) -> None:
-    """Use CDP's trusted file chooser path for ChatGPT's hidden uploader."""
-    info = _linux_find_tab(tab)
-    if info is None or not info.websocket_debugger_url:
-        raise _linux_error("Could not find the requested Google Chrome tab.")
-    with websocket_connect(info.websocket_debugger_url, proxy=None, open_timeout=5, close_timeout=5) as websocket:
-        request_id = 0
-
-        def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            nonlocal request_id
-            request_id += 1
-            websocket.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
-            while True:
-                message = json.loads(websocket.recv())
-                if message.get("id") != request_id:
-                    continue
-                if message.get("error"):
-                    raise RuntimeError(str(message["error"].get("message") or "Chrome DevTools file upload failed."))
-                return message.get("result", {})
-
-        document = call("DOM.getDocument", {"depth": 1})
-        root_id = int(document["root"]["nodeId"])
-        node = call("DOM.querySelector", {"nodeId": root_id, "selector": "#upload-files"})
-        node_id = int(node.get("nodeId") or 0)
-        if not node_id:
-            raise RuntimeError("ChatGPT upload input is not available in the current tab.")
-        call("DOM.setFileInputFiles", {"files": [str(path.resolve()) for path in file_paths], "nodeId": node_id})
-
-
 def _run_osascript(script: str, *args: str) -> str:
     command = ["osascript", "-"] + list(args)
     result = subprocess.run(
@@ -1154,18 +1125,18 @@ def upload_local_file(
     provider: ProviderName = "gemini",
     cumulative_file_paths: list[Path] | None = None,
 ) -> None:
-    if provider == "chatgpt" and platform.system().lower() == "linux" and not _linux_should_use_x11_backend():
-        files = cumulative_file_paths or [file_path]
-        _linux_set_chatgpt_file_input_files(tab, files)
-        execute_javascript(tab, "window.__codexUploadStatus = 'awaiting-ack'; 'ok'")
-    else:
-        _upload_local_file_via_javascript(
-            tab,
-            file_path=file_path,
-            file_name=file_name,
-            mime_type=mime_type,
-            provider=provider,
-        )
+    # Keep ChatGPT on Ordak's selector-driven composer uploader.  It sets the
+    # FileList on the compositor's own ``#upload-files`` input and dispatches
+    # its change path; do not drive the visible menu or simulate pointer clicks.
+    # For the second reference, the existing uploader intentionally preserves
+    # the cumulative FileList so the first image is not replaced.
+    _upload_local_file_via_javascript(
+        tab,
+        file_path=file_path,
+        file_name=file_name,
+        mime_type=mime_type,
+        provider=provider,
+    )
 
     deadline = time.monotonic() + timeout_ms / 1000
     ready_checks = 0
@@ -1184,7 +1155,6 @@ def upload_local_file(
                 upload_state.get("attachment")
                 and upload_state.get("hasPreview")
                 and not upload_state.get("loading")
-                and upload_state.get("submitReady", True)
             ):
                 ready_checks += 1
                 if ready_checks >= 2:
@@ -1261,7 +1231,12 @@ def _upload_local_file_via_javascript(
       .find((el) => isVisible(el)) || null;
   }};
   const setFilesOnInput = (file) => {{
-    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    // ChatGPT's generic composer input owns the upload state.  The photo/media
+    // inputs belong to separate menu actions and accepting a FileList there is
+    // not enough to create a composer attachment in current ChatGPT builds.
+    const inputs = provider === "chatgpt"
+      ? [document.querySelector('#upload-files')].filter(Boolean)
+      : Array.from(document.querySelectorAll('input[type="file"]'));
     for (const input of inputs) {{
       const dataTransfer = new DataTransfer();
       // ChatGPT accepts one cumulative FileList.  Replacing it with only the
@@ -1414,7 +1389,7 @@ def inspect_upload_state(
     ? ['img[src^="blob:"]', 'form img', '[data-testid*="attachment" i]', '[data-testid*="composer" i] img']
     : ['gem-media-attachment', '.gem-attachment', 'mat-basic-chip', '[data-test-id*="upload" i]'];
   const loadingSelectors = provider === "chatgpt"
-    ? ['[role="status"]', '.animate-spin', '[data-testid*="uploading" i]', '[data-testid="send-button"][disabled]']
+    ? ['[role="status"]', '.animate-spin', '[data-testid*="uploading" i]']
     : ['.gem-attachment-content.loading', '.gem-attachment-loading-container', 'mat-spinner[aria-label="Loading image"]'];
   const attachments = attachmentSelectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
@@ -1423,7 +1398,6 @@ def inspect_upload_state(
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
     .some((el) => {
       if (!isVisible(el)) return false;
-      if (provider === "chatgpt" && el.matches('[data-testid="send-button"][disabled]')) return true;
       return /upload|loading|processing/.test(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase());
     });
   const loadingByCursor = provider === "chatgpt" && Array.from(document.querySelectorAll('*')).some((el) => {
@@ -1457,86 +1431,125 @@ def inspect_upload_state(
     return json.loads(execute_javascript(tab, readiness_probe) or "{}")
 
 
-def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
-    """Select and verify ChatGPT's visible reasoning-effort control is High.
+def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
+    """Select ChatGPT reasoning effort: Extra high first, otherwise High.
 
-    The control has changed labels and markup several times.  This deliberately
-    uses visible button/menu semantics and verifies the resulting state instead
-    of assuming a click succeeded.
+    ChatGPT's current composer exposes this as the ``Power`` keyboard slider,
+    not as visible ``High`` menu options.  The maximum slider position is
+    ``Pro``; the immediately preceding position is ``Extra High``.  We inspect
+    its live accessibility announcement, never infer an effort level from an
+    arbitrary last slider position, and use High only when Extra High cannot
+    be found.
     """
-    inspect_script = r"""
+    state_script = r"""
 (() => {
-  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim();
-  const effortSlider = document.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
-  if (effortSlider) {
-    const current = Number(effortSlider.getAttribute("aria-valuenow"));
-    const maximum = Number(effortSlider.getAttribute("aria-valuemax"));
-    return current === maximum ? "high" : "opened";
-  }
-  const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"], [data-testid*="reasoning" i][aria-haspopup="menu"]'))
-    .find(visible);
+  const power = Array.from(document.querySelectorAll('[role="menuitem"]'))
+    .find((el) => el.getAttribute("aria-label") === "Power");
+  const slider = power?.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
+  const announcement = (power?.getAttribute("aria-describedby") || "").split(/\\s+/)
+    .map((id) => document.getElementById(id)?.innerText || "").join(" ");
+  const model = document.querySelector('.d1BZWq_ViewToggleModelLabel')?.innerText || "";
+  const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"]'))
+    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)/i.test(el.innerText || ""));
+  return JSON.stringify({
+    open: !!power,
+    // When the menu is closed ChatGPT puts the current selection in the
+    // composer pill (for example "Extra High") rather than in the slider.
+    label: `${announcement} ${model} ${pill?.innerText || ""}`.trim(),
+    value: slider?.getAttribute("aria-valuenow") || "",
+    maximum: slider?.getAttribute("aria-valuemax") || "",
+    pill: !!pill,
+  });
+})()
+"""
+    open_script = r"""
+(() => {
+  const power = Array.from(document.querySelectorAll('[role="menuitem"]'))
+    .find((el) => el.getAttribute("aria-label") === "Power");
+  if (power) return "open";
+  const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"]'))
+    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)/i.test(el.innerText || ""));
   if (!pill) return "unavailable";
-  const selected = label(pill).toLowerCase();
-  if (selected === "high" || /reasoning effort:\s*high/.test(selected)) return "high";
-  const trigger = pill;
-  if (!trigger) return "unavailable";
   ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
-    trigger.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
+    pill.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
   );
-  return "opened";
+  return "opening";
 })()
 """
-    # A just-created ChatGPT tab often renders the composer before the effort
-    # picker. Wait for that UI state instead of treating transient hydration as
-    # a selector failure.
-    deadline = time.monotonic() + 30
-    state = "unavailable"
-    while time.monotonic() < deadline:
-        state = execute_javascript(tab, inspect_script).strip()
-        if state in {"high", "opened"}:
-            break
-        time.sleep(0.5)
-    if state == "high":
-        return
-    if state != "opened":
-        raise RuntimeError("ChatGPT reasoning-effort control is unavailable after waiting; High effort could not be verified.")
-    select_script = r"""
+    step_script = r"""
 (() => {
-  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const label = (el) => `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
-  const slider = document.querySelector('[data-model-reasoning-effort-slider] [role="slider"]');
-  const sliderControl = slider?.closest('[data-model-reasoning-effort-slider]')?.closest('[role="menuitem"]');
-  if (slider && sliderControl) {
-    const current = Number(slider.getAttribute("aria-valuenow"));
-    const maximum = Number(slider.getAttribute("aria-valuemax"));
-    if (current >= maximum) return "selected";
-    sliderControl.focus();
-    sliderControl.dispatchEvent(new KeyboardEvent("keydown", {
-      key: "ArrowRight", code: "ArrowRight", bubbles: true, cancelable: true,
-    }));
-    return "selected";
-  }
-  const high = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], button, [role="button"]'))
-    .filter(visible)
-    .find((el) => (label(el) === "high" || /reasoning effort:\s*high/.test(label(el)))
-      && !el.matches('.__composer-pill'));
-  if (!high) return "waiting";
-  ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
-    high.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
-  );
-  return "selected";
+  const power = Array.from(document.querySelectorAll('[role="menuitem"]'))
+    .find((el) => el.getAttribute("aria-label") === "Power");
+  if (!power) return "unavailable";
+  power.focus();
+  power.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "__KEY__", code: "__KEY__", bubbles: true, cancelable: true,
+  }));
+  return "stepped";
 })()
 """
+
+    def state() -> dict[str, str | bool]:
+        try:
+            value = json.loads(execute_javascript(tab, state_script) or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def level(snapshot: dict[str, str | bool]) -> str:
+        label = str(snapshot.get("label") or "").lower()
+        if re.search(r"extra[\s-]*high", label):
+            return "extra_high"
+        if re.search(r"(?:^|\s)high(?:$|\s)", label):
+            return "high"
+        return ""
+
+    # A just-created tab hydrates the composer asynchronously.  Open the real
+    # Thinking effort picker exactly once; do not toggle it closed on retries.
+    deadline = time.monotonic() + 30
+    snapshot: dict[str, str | bool] = {}
     while time.monotonic() < deadline:
-        if execute_javascript(tab, select_script).strip() == "selected":
-            # The UI closes the picker and shows the selected effort as a
-            # visible button. Verify that state before any prompt is inserted.
-            time.sleep(0.4)
-            if execute_javascript(tab, inspect_script).strip() == "high":
-                return
-        time.sleep(0.25)
-    raise RuntimeError("ChatGPT reasoning effort could not be set to High.")
+        snapshot = state()
+        if snapshot.get("open"):
+            break
+        opened = execute_javascript(tab, open_script).strip()
+        if opened == "unavailable":
+            time.sleep(0.5)
+            continue
+        time.sleep(0.5)
+    if not snapshot.get("open"):
+        raise RuntimeError("ChatGPT Power effort control is unavailable after waiting.")
+    if level(snapshot) == "extra_high":
+        return
+
+    # First walk to the upper endpoint, then step down.  The live UI announces
+    # each level (for example: "Extra High, 4 of 5"), which is verified after
+    # every keypress.  This handles a remembered lower setting and preserves
+    # High as the explicit fallback when Extra High is unavailable.
+    for _ in range(6):
+        snapshot = state()
+        if level(snapshot) == "extra_high":
+            return
+        maximum = str(snapshot.get("maximum") or "")
+        if maximum and str(snapshot.get("value") or "") == maximum:
+            break
+        if execute_javascript(tab, step_script.replace("__KEY__", "ArrowRight")).strip() != "stepped":
+            break
+        time.sleep(0.35)
+    for _ in range(6):
+        if execute_javascript(tab, step_script.replace("__KEY__", "ArrowLeft")).strip() != "stepped":
+            break
+        time.sleep(0.35)
+        snapshot = state()
+        selected = level(snapshot)
+        if selected in {"extra_high", "high"}:
+            return
+    raise RuntimeError("ChatGPT Power could not be set to Extra High or High.")
+
+
+def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
+    """Compatibility alias for callers from before Extra high was preferred."""
+    ensure_chatgpt_preferred_effort(tab)
 
 
 def wait_for_chatgpt_workspace_ready(
@@ -1592,7 +1605,7 @@ def insert_prompt(
             )
         return
     if provider == "chatgpt":
-        ensure_chatgpt_high_effort(tab)
+        ensure_chatgpt_preferred_effort(tab)
     payload = json.dumps(prompt, ensure_ascii=False)
     script = f"""
 (() => {{

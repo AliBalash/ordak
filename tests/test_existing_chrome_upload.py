@@ -121,6 +121,57 @@ def test_upload_local_file_accepts_awaiting_ack_when_dom_readiness_catches_up(
     assert calls["marked_done"] == 1
 
 
+def test_chatgpt_upload_does_not_treat_an_empty_composer_as_upload_loading(monkeypatch) -> None:
+    """Send is disabled until text exists; that must not invalidate a real file thumbnail."""
+    captured: dict[str, str] = {}
+
+    def fake_execute(_tab: ChromeTabRef, javascript: str) -> str:
+        captured["probe"] = javascript
+        return '{"attachment":true,"attachmentCount":1,"loading":false,"hasPreview":true,"submitReady":false}'
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    from app.automation.existing_chrome import inspect_upload_state
+
+    state = inspect_upload_state(ChromeTabRef(window_id=1, tab_id=2), provider="chatgpt")
+    assert state["attachment"] and state["hasPreview"] and not state["loading"]
+    assert 'send-button"][disabled]' not in captured["probe"]
+
+
+def test_chatgpt_upload_targets_the_composer_input_without_menu_clicks(monkeypatch, tmp_path: Path) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"image")
+    scripts: list[str] = []
+
+    def fake_execute(_tab: ChromeTabRef, javascript: str) -> str:
+        scripts.append(javascript)
+        if 'return "started"' in javascript:
+            return "started"
+        if "window.__codexUploadChunks = []" in javascript or "window.__codexUploadChunks.push" in javascript:
+            return "ok"
+        if 'window.__codexUploadStatus || "pending"' in javascript:
+            return "attached"
+        if "attachment:" in javascript and "hasPreview" in javascript:
+            return '{"attachment":true,"loading":false,"hasPreview":true}'
+        if 'window.__codexUploadStatus = "done"' in javascript:
+            return "ok"
+        raise AssertionError(javascript[:120])
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+    upload_local_file(
+        ChromeTabRef(window_id=1, tab_id=2),
+        file_path=image,
+        file_name=image.name,
+        mime_type="image/png",
+        provider="chatgpt",
+        timeout_ms=5_000,
+    )
+
+    combined = "\n".join(scripts)
+    assert "document.querySelector('#upload-files')" in combined
+    assert "composer-plus-btn')?.click" not in combined
+
+
 def test_wait_for_generated_image_ready_requires_stable_ready_state(monkeypatch) -> None:
     states = iter(
         [
@@ -172,29 +223,40 @@ def test_chatgpt_high_effort_is_verified_before_prompt(monkeypatch) -> None:
 
     def fake_execute(tab, javascript):
         seen.append(javascript)
-        return "high"
+        return '{"open": true, "label": "Extra High, 4 of 5", "value": "3", "maximum": "4"}'
 
     monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
     ensure_chatgpt_high_effort(ChromeTabRef(window_id=1, tab_id=2))
     assert len(seen) == 1
-    assert "reasoning effort" in seen[0]
+    assert "data-model-reasoning-effort-slider" in seen[0]
 
 
-def test_chatgpt_high_effort_uses_the_visible_composer_control(monkeypatch) -> None:
-    from app.automation.existing_chrome import ensure_chatgpt_high_effort
+def test_chatgpt_prefers_extra_high_uses_the_visible_composer_control(monkeypatch) -> None:
+    from app.automation.existing_chrome import ensure_chatgpt_preferred_effort
 
-    replies = iter(["opened", "selected", "high"])
+    states = iter([
+        {"open": False, "label": "", "value": "", "maximum": "", "pill": True},
+        {"open": True, "label": "Pro, 5 of 5", "value": "4", "maximum": "4", "pill": True},
+        {"open": True, "label": "Pro, 5 of 5", "value": "4", "maximum": "4", "pill": True},
+        {"open": True, "label": "Extra High, 4 of 5", "value": "3", "maximum": "4", "pill": True},
+    ])
     seen: list[str] = []
 
     def fake_execute(tab, javascript):
         seen.append(javascript)
-        return next(replies)
+        if "return JSON.stringify({" in javascript:
+            return json.dumps(next(states))
+        if "return \"opening\"" in javascript:
+            return "opening"
+        if "ArrowLeft" in javascript:
+            return "stepped"
+        raise AssertionError(javascript[:100])
 
     monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
     monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
-    ensure_chatgpt_high_effort(ChromeTabRef(window_id=1, tab_id=2))
-    assert "trigger.dispatchEvent" in seen[0]
-    assert "trigger.el" not in seen[0]
+    ensure_chatgpt_preferred_effort(ChromeTabRef(window_id=1, tab_id=2))
+    assert any("thinking effort" in script.lower() for script in seen)
+    assert any("ArrowLeft" in script for script in seen)
 
 
 def test_chatgpt_submit_accepts_busy_state_without_duplicate_retry(monkeypatch) -> None:
