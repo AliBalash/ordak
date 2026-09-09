@@ -83,6 +83,37 @@ def test_a_new_result_is_downloaded_instead_of_regenerated(
     assert downloads == [fresh], "the newly appeared asset is the one to fetch"
 
 
+def test_a_replaced_tile_is_recovered_even_when_the_grid_count_does_not_grow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flow caps project grids, evicting an old tile for a completed render."""
+    _pending(tmp_path)
+    fresh = "https://flow-content.google/video/newly-rendered-asset"
+    # The new asset displaced old1, leaving the same two visible tiles.
+    _media(monkeypatch, [fresh, "https://x/media.getMediaUrlRedirect?name=old2"])
+    downloaded: list[str | None] = []
+
+    def _download(tab, output_dir, runtime, media_url, *, job_id):
+        downloaded.append(media_url)
+        target = Path(output_dir) / "recovered.mp4"
+        target.write_bytes(b"\x00" * 32)
+        return target
+
+    monkeypatch.setattr(flow_worker, "_download_flow_video", _download)
+
+    result = flow_worker._reconcile_pending(TAB, tmp_path, FINGERPRINT, None)
+
+    assert result is not None
+    assert downloaded == [fresh]
+
+
+def test_media_identity_ignores_flow_preview_rendition_suffix() -> None:
+    asset = "https://flow.google.com/asb/same-asset"
+    assert flow_worker._new_result_media(
+        [asset], [asset + "=mm,22,15"]
+    ) == []
+
+
 def test_no_result_and_no_file_stops_for_a_human(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from app.automation import flow_references, flow_settings
 from app.automation.existing_chrome import (
@@ -415,8 +417,11 @@ _NEWEST_TILE_JS = r"""
   const holder = tile.closest('flow-grid-tile-container') || tile;
   const target = holder.getBoundingClientRect().width > 60 ? holder : tile;
   const r = target.getBoundingClientRect();
-  const img = tile.querySelector('img');
-  const thumb = img ? String(img.src || '') : '';
+  // Current Flow mounts a <video> in a recently played/generated grid tile, while older
+  // tiles retain an img.thumbnail.  Both are a result identity; treating only the image as
+  // a thumbnail made the newest, real clip look permanently unready.
+  const media = tile.querySelector('video, img.thumbnail, img');
+  const thumb = media ? String(media.currentSrc || media.src || '') : '';
   // A tile appears the moment a generation is accepted, before the clip exists. Readiness is
   // therefore positive evidence, not the absence of the word "generating" in the page text:
   // a real poster frame, a play affordance, and no progress indicator anywhere in the tile.
@@ -459,6 +464,34 @@ def _count_results(tab: ChromeTabRef) -> int:
     return len(_result_media(tab))
 
 
+def _media_identity(media_url: str) -> str:
+    """Return Flow's durable asset identity, not its short-lived delivery URL.
+
+    The project grid can keep a fixed number of tiles and evict its oldest entry whenever a
+    new render finishes.  It also switches a tile between its thumbnail URL and a preview
+    video URL.  Neither event is a new generation, so comparison has to discard query
+    signatures and Flow's ``=mm,...`` preview rendition suffix before checking membership.
+    """
+    raw = str(media_url or "")
+    # The legacy redirect endpoint has one shared path; its asset identity lives in the
+    # `name` query parameter, so dropping every query string would collapse all old clips.
+    named = re.search(r"[?&]name=([^&#]+)", raw)
+    if named:
+        return f"name:{named.group(1)}"
+    clean = raw.split("?", 1)[0]
+    return clean.split("=mm", 1)[0]
+
+
+def _new_result_media(baseline: list[str], current: list[str]) -> list[str]:
+    """Assets visible now that were not in the pre-submit project snapshot.
+
+    ``current`` keeps Flow's newest-first order, which is also the safe order in which to
+    recover a pending job when the grid is capped and its count did not increase.
+    """
+    known = {_media_identity(url) for url in baseline}
+    return [url for url in current if _media_identity(url) not in known]
+
+
 def _reconcile_pending(
     tab: ChromeTabRef,
     output_dir: Path,
@@ -484,7 +517,10 @@ def _reconcile_pending(
 
     recorded = str(pending.get("fingerprint") or "")
     results_before = int(pending.get("results_before") or 0)
-    results_now = _count_results(tab)
+    current_media = _result_media(tab)
+    results_now = len(current_media)
+    recorded_media = [str(url) for url in (pending.get("results_media") or [])]
+    newly_visible = _new_result_media(recorded_media, current_media)
     if recorded != fingerprint:
         _flow_raise(
             ErrorCode.FLOW_RECONCILIATION_REQUIRED,
@@ -492,26 +528,40 @@ def _reconcile_pending(
             "differs from the current one; a human must decide before spending more credits.",
             f"recorded fingerprint {recorded!r} != current {fingerprint!r}",
         )
-    if results_now > results_before:
+    if newly_visible:
         _log(
             runtime,
-            f"Reconciled: Flow already produced a result for this submission "
-            f"({results_before} -> {results_now} results); downloading instead of regenerating.",
+            "Reconciled: Flow already produced a new asset for this submission "
+            f"({len(newly_visible)} new asset(s), {results_before} -> {results_now} visible tiles); "
+            "downloading instead of regenerating.",
         )
-        # The grid is most-recent-first, so the clip that submission produced is its first
-        # tile; the download is still validated against the requested duration and aspect.
+        # Address the exact newly visible asset instead of blindly clicking the first tile:
+        # another human/browser action may have created a different tile after the job.
         return _download_flow_video(
             tab,
             output_dir,
             runtime,
-            NEWEST_TILE,
+            newly_visible[0],
             job_id=str(pending.get("job_id") or "flow"),
+        )
+    # Older pending markers did not carry a media snapshot.  Preserve their count-based
+    # recovery path, but never use it for a modern marker: a capped grid can retain the same
+    # count while replacing an old clip, which is the case this guard fixes.
+    if not recorded_media and results_now > results_before:
+        _log(
+            runtime,
+            f"Reconciled legacy marker: Flow grew from {results_before} to {results_now} tiles; "
+            "downloading the newest result instead of regenerating.",
+        )
+        return _download_flow_video(
+            tab, output_dir, runtime, NEWEST_TILE, job_id=str(pending.get("job_id") or "flow")
         )
     _flow_raise(
         ErrorCode.FLOW_RECONCILIATION_REQUIRED,
         "Flow was already asked to generate this clip and no result is visible. "
         "Check the Flow workspace before retrying — a blind retry would spend credits twice.",
-        f"results before={results_before}, now={results_now}, fingerprint={fingerprint}",
+        f"results before={results_before}, now={results_now}, newly visible={len(newly_visible)}, "
+        f"fingerprint={fingerprint}",
     )
     return None
 
@@ -744,12 +794,12 @@ def _wait_for_generation(
     runtime: WorkerRuntime | None,
     timeout_ms: int,
 ) -> str:
-    """Wait until the grid holds one more clip than ``baseline`` and return its locator.
+    """Wait until the grid exposes a post-submit asset and return its exact locator.
 
-    The returned value is :data:`NEWEST_TILE`, not a URL: Flow re-signs the grid thumbnails
-    while the page is open, so URL identity cannot answer "which clip is new" (see
-    :data:`NEWEST_TILE`). Position can — the grid is most-recent-first — and the downloaded
-    file is still validated against the requested duration and aspect before it is accepted.
+    The returned value is the exact media URL in the current grid snapshot. Flow may re-sign
+    thumbnails while the page is open, so its normalized asset identity — not tile count or
+    a thumbnail URL — identifies the post-submit clip. The downloaded file is still validated
+    against the requested duration and aspect before it is accepted.
     """
     baseline_count = len(baseline)
     script = _GENERATION_STATE_JS % baseline_count
@@ -759,16 +809,33 @@ def _wait_for_generation(
         _runtime_checkpoint(runtime)
         state = _evaluate(tab, script) or {}
         newest = _newest_tile(tab)
-        count = int(newest.get("count") or 0)
+        current_media = _result_media(tab)
+        new_media = _new_result_media(baseline, current_media)
+        count = int(newest.get("count") or len(current_media))
         summary = (
-            f"results={count} new={max(0, count - baseline_count)} "
+            f"results={count} new={len(new_media)} "
             f"generating={state.get('generating')}"
         )
         if summary != last:
             _log(runtime, f"Flow generation: {summary}")
             last = summary
         _assert_credits_available(tab, runtime)
-        if count > baseline_count and newest.get("found"):
+        if new_media:
+            # A fixed-size Flow grid replaces its oldest tile rather than growing.  The media
+            # snapshot detects that replacement even when the visible count remains unchanged.
+            media_url = new_media[0]
+            newest_media = _media_identity(
+                str(newest.get("thumb") or "")
+            )
+            is_newest = newest_media == _media_identity(media_url)
+            if not is_newest:
+                # The top tile can be a live video element (no thumbnail) on current Flow.
+                # It is still the submitted result when its URL is the first novel asset.
+                first_current = current_media[0] if current_media else ""
+                is_newest = _media_identity(first_current) == _media_identity(media_url)
+            if not newest.get("found") or not is_newest:
+                time.sleep(3.0)
+                continue
             if not newest.get("ready"):
                 # The tile exists but the clip does not yet: keep waiting rather than opening
                 # a half-rendered asset and asking it to export (observed 2026-09-05 —
@@ -800,7 +867,7 @@ def _wait_for_generation(
                     f"last seen: {json.dumps(_newest_tile(tab))[:200]}",
                 )
             _log(runtime, "Flow result confirmed finished; exporting")
-            return NEWEST_TILE
+            return media_url
         # Flow can refuse a generation outright, and the reason matters: an abuse flag is
         # not a content-policy rejection and not a timeout. Both say "no charge", so
         # neither should be retried blindly, and polling on for the full timeout only
@@ -872,11 +939,12 @@ _DOWNLOAD_BUTTON_JS = r"""
 })()
 """
 
-#: The quality the export should choose when Flow offers a choice, best first. Flow only ever
-#: *generates* 360p or 720p, so 1080 can only come from its own upscale on export; when the menu
-#: offers it, it is taken, and every label seen is logged so the real vocabulary is on record
-#: rather than guessed at.
-_DOWNLOAD_QUALITY_ORDER = ("1080", "upscale", "original", "highest", "720", "mp4")
+#: Prefer the render Flow already completed.  Asking for 1080/"upscale" starts a second,
+#: asynchronous Flow job; the old order selected that option first and then waited for a file
+#: that had not begun downloading yet.  An original/720p MP4 is the requested deliverable and
+#: can be handed to Chrome immediately.  Upscaling remains a last-resort option for menus that
+#: expose no direct source export at all.
+_DOWNLOAD_QUALITY_ORDER = ("original", "720", "mp4", "1080", "upscale", "highest")
 
 _DOWNLOAD_OPTION_JS = r"""
 (() => {
@@ -967,6 +1035,55 @@ def _settled_download(output_dir: Path, timeout_s: float) -> Path | None:
         time.sleep(1.5)
 
 
+def _download_signed_flow_media(
+    media_url: str | None,
+    output_dir: Path,
+    job_id: str,
+    runtime: WorkerRuntime | None,
+) -> Path | None:
+    """Fetch a completed Flow asset when Chrome's menu never emits a download event.
+
+    This is intentionally narrow: only the signed, first-party ``flow-content.google/video``
+    URL already exposed by Flow's own project grid is accepted. It is not a generation API and
+    it cannot fetch an arbitrary URL. The response is checked as a video before it is made
+    visible as a completed job artifact.
+    """
+    if not media_url:
+        return None
+    parsed = urlparse(media_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "flow-content.google"
+        or not parsed.path.startswith("/video/")
+    ):
+        return None
+    temporary = output_dir / f".{job_id}.flow-media.part"
+    target = output_dir / f"{job_id}.flow-media.mp4"
+    try:
+        request = Request(media_url, headers={"Accept": "video/*"})
+        with urlopen(request, timeout=90) as response, temporary.open("wb") as handle:
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if not content_type.startswith("video/"):
+                _log(runtime, f"Flow direct-media fallback refused non-video response: {content_type}", "warning")
+                return None
+            while chunk := response.read(1024 * 1024):
+                handle.write(chunk)
+        if temporary.stat().st_size < MIN_VIDEO_BYTES:
+            _log(runtime, "Flow direct-media fallback received a file too small to be a video", "warning")
+            return None
+        temporary.replace(target)
+        _log(runtime, f"Flow video recovered from its signed media asset: {target.name}")
+        return target
+    except OSError as exc:
+        _log(runtime, f"Flow direct-media fallback could not fetch the signed video: {exc}", "warning")
+        return None
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _media_id(media_url: str) -> str:
     """The asset id inside a Flow media URL, used to find that asset's tile."""
     _, _, tail = media_url.partition("name=")
@@ -982,6 +1099,13 @@ def _open_result(tab: ChromeTabRef, media_url: str, runtime: WorkerRuntime | Non
     """
     newest = media_url == NEWEST_TILE
     script = _NEWEST_TILE_JS if newest else _RESULT_TILE_JS % json.dumps(_media_id(media_url))
+    # A retry can begin after Flow has already navigated into this result's scene editor
+    # (for example, when Chrome received the export request but the process restarted before
+    # the file appeared).  There is no grid tile in that view to click again; its enabled
+    # Download control is the positive proof that the result is already open.
+    if "/edit/" in _current_url(tab) and (_evaluate(tab, _DOWNLOAD_BUTTON_JS) or {}).get("found"):
+        _log(runtime, "Flow result is already open in its scene editor; resuming its download")
+        return True
     for attempt in range(6):
         tile = _evaluate(tab, script) or {}
         if tile.get("found"):
@@ -1140,11 +1264,28 @@ def _download_flow_video(
                     f"Flow export quality chosen: {option.get('label')} "
                     f"(preference order {'/'.join(_DOWNLOAD_QUALITY_ORDER)})",
                 )
-            settled = _settled_download(output_dir, 180.0)
+            # A normal direct export begins immediately.  If Chrome acknowledged the menu but
+            # does not produce a download event, use the signed first-party media URL Flow has
+            # already exposed for this exact result instead of waiting until the whole stage
+            # times out (or asking Flow to generate again).
+            settled = _settled_download(output_dir, 20.0)
             if settled is not None:
                 _log(
                     runtime,
                     f"Flow video downloaded: {settled.name} ({settled.stat().st_size} bytes)",
+                )
+                _leave_result_view(tab)
+                return settled
+            recovered = _download_signed_flow_media(media_url, output_dir, job_id, runtime)
+            if recovered is not None:
+                _leave_result_view(tab)
+                return recovered
+            settled = _settled_download(output_dir, 160.0)
+            if settled is not None:
+                _log(
+                    runtime,
+                    f"Flow video downloaded after a delayed browser export: {settled.name} "
+                    f"({settled.stat().st_size} bytes)",
                 )
                 _leave_result_view(tab)
                 return settled
