@@ -191,6 +191,10 @@ def install_fake_adapter(monkeypatch: pytest.MonkeyPatch, adapter: FakeAdapter) 
     monkeypatch.setattr("app.automation.gemini_worker.get_tab_info", lambda tab: ChromeTabInfo(tab.window_id, tab.tab_id, "https://example.com/c/1", "Tab", True))
     monkeypatch.setattr("app.automation.gemini_worker.insert_prompt_existing", lambda tab, prompt, provider="gemini": adapter.inserted.append(prompt))
     monkeypatch.setattr("app.automation.gemini_worker.activate_create_image_mode", lambda tab, provider="gemini": True)
+    monkeypatch.setattr(
+        "app.automation.gemini_worker._ensure_gemini_extended_thinking",
+        lambda tab, runtime: {"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
+    )
     monkeypatch.setattr("app.automation.gemini_worker.upload_local_file", lambda *args, **kwargs: None)
     # Browser hydration is covered directly in existing_chrome tests.  Worker
     # tests use synthetic tab references and should not reach the live CDP
@@ -512,9 +516,14 @@ def test_image_generate_job_collects_output_images(
     monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
     # The model contract is mandatory for Gemini image jobs, and selection is a live-UI
     # concern; this test is about collecting the output, so the confirmed label is stubbed.
+    setting_order: list[str] = []
     monkeypatch.setattr(
         "app.automation.gemini_worker._select_gemini_image_model",
-        lambda tab, requested, runtime: {"label": "Nano Banana 2", "source": "model-control"},
+        lambda tab, requested, runtime: setting_order.append("model") or {"label": "Nano Banana 2", "source": "model-control"},
+    )
+    monkeypatch.setattr(
+        "app.automation.gemini_worker._ensure_gemini_extended_thinking",
+        lambda tab, runtime: setting_order.append("extended_thinking") or {"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
     )
 
     answer = run_gemini_job(
@@ -532,6 +541,7 @@ def test_image_generate_job_collects_output_images(
     assert answer == "Gemini generated image output in the current Chrome tab. Saved images: 1."
     assert runtime.output_images == [output_path]
     assert adapter.last_max_images == local_settings.max_output_images_per_job
+    assert setting_order == ["model", "extended_thinking"]
 
 
 def test_linux_chatgpt_image_generate_refreshes_tab_before_extracting_images(

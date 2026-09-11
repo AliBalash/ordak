@@ -65,6 +65,7 @@ KNOWN_REFERENCE_ROLES = (
     "style_reference",
     "world_keyframe",
     "previous_beat",
+    "qc_previous_candidate",
     "unspecified",
 )
 

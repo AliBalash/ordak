@@ -1573,10 +1573,10 @@ def _run_gemini_job_in_existing_chrome(
             _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
 
         # Extended Thinking is required for every Gemini-backed chat, analysis, and image
-        # generation job. The live mode-picker label is re-read before each submission.
+        # generation job.  Model/tool selection happens first because Gemini may reset the
+        # mode while switching image models; the authoritative read-back is therefore done
+        # at the last possible point before submission below.
         gemini_thinking_evidence: dict[str, str] | None = None
-        if job.provider == "gemini":
-            gemini_thinking_evidence = _ensure_gemini_extended_thinking(tab, runtime)
 
         # Gemini image model selection (§5-7). The model comes from the explicit
         # generation contract on the job — never inferred, never parsed out of the prompt.
@@ -1626,6 +1626,9 @@ def _run_gemini_job_in_existing_chrome(
                 _raise_structured_error(
                     OrdaKError(code=ErrorCode.UPLOAD_INCOMPLETE)
                 )
+
+        if job.provider == "gemini":
+            gemini_thinking_evidence = _ensure_gemini_extended_thinking(tab, runtime)
 
         if job.mode == "image_generate":
             _prepare_and_submit_prompt(
@@ -1683,6 +1686,8 @@ def _run_gemini_job_in_existing_chrome(
                             _attach_uploads_in_existing_chrome(
                                 tab, job.uploads, resolved, job.provider, runtime
                             )
+                        if job.provider == "gemini":
+                            gemini_thinking_evidence = _ensure_gemini_extended_thinking(tab, runtime)
                         _prepare_and_submit_prompt(
                             tab=tab,
                             adapter=adapter,
