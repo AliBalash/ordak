@@ -87,6 +87,7 @@ def test_receipt_records_the_pro_path_when_it_really_ran(tmp_path: Path) -> None
     receipt = gemini_worker._build_gemini_receipt(
         _job(),
         model_evidence={"label": "Nano Banana Pro", "source": "model-control"},
+        thinking_evidence={"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
         pro_outcome=outcome,
         validations=[_validation(tmp_path)],
         workspace_url="https://gemini.google.com/app/abc",
@@ -103,6 +104,7 @@ def test_receipt_refuses_to_verify_a_label_that_is_a_different_model(tmp_path: P
     receipt = gemini_worker._build_gemini_receipt(
         _job(),
         model_evidence={"label": "Nano Banana 2", "source": "model-control"},
+        thinking_evidence={"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
         pro_outcome=None,
         validations=[_validation(tmp_path)],
         workspace_url=None,
@@ -117,6 +119,7 @@ def test_receipt_refuses_to_verify_without_a_label_source(tmp_path: Path) -> Non
     receipt = gemini_worker._build_gemini_receipt(
         _job(),
         model_evidence={"label": "Nano Banana Pro", "source": ""},
+        thinking_evidence={"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
         pro_outcome=None,
         validations=[_validation(tmp_path)],
         workspace_url=None,
@@ -129,6 +132,7 @@ def test_receipt_refuses_to_verify_an_unnamed_provider_default(tmp_path: Path) -
     receipt = gemini_worker._build_gemini_receipt(
         _job(),
         model_evidence={"label": "Create image (provider-selected)", "source": "image-tool-enabled"},
+        thinking_evidence={"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
         pro_outcome=None,
         validations=[_validation(tmp_path)],
         workspace_url=None,

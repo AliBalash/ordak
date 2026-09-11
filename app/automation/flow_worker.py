@@ -130,10 +130,19 @@ def _evaluate(tab: ChromeTabRef, script: str) -> Any:
 
 _NEW_PROJECT_JS = r"""
 (() => {
-  const target = Array.from(document.querySelectorAll('button')).find(
-    (b) => (b.innerText || '').includes('New project')
-  );
-  if (!target) return JSON.stringify({found: false});
+  const visible = element => {
+    if (!element) return false;
+    const box = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  // Verified on Flow's landing page: the first-party control is
+  // ``button.new-project-button``. The text fallback tolerates a future class rename.
+  const target = document.querySelector('button.new-project-button')
+    || Array.from(document.querySelectorAll('button')).find(
+      button => visible(button) && /\bnew\s+project\b/i.test(button.innerText || button.getAttribute('aria-label') || '')
+    );
+  if (!visible(target)) return JSON.stringify({found: false});
   const r = target.getBoundingClientRect();
   return JSON.stringify({
     found: true,
@@ -226,10 +235,12 @@ def _ensure_flow_project(
     runtime: WorkerRuntime | None,
     app_settings: Settings,
 ) -> str:
-    """Make sure the tab is inside a Flow *project*, creating one if needed.
+    """Create a fresh Flow project from the landing page for this job.
 
-    The composer only exists inside a project; the tool's landing page has no settings
-    menu and no reference controls, so generating from it is impossible rather than wrong.
+    Reusing a URL that already points at ``/project/<id>`` can mix a new paid submission
+    with an older project's assets and results. A Flow job therefore must begin at the
+    landing page and click its own ``New project`` control. If Flow redirects the landing
+    request directly into an old project, fail closed instead of silently reusing it.
     """
     url = _current_url(tab)
     # Flow is geo-restricted and answers a blocked location by redirecting the workspace to
@@ -243,18 +254,11 @@ def _ensure_flow_project(
             f"observed url: {url!r}",
         )
     if _is_flow_project_url(url):
-        # The block can arrive a moment after the project URL loads, so the settled URL is
-        # what decides. Checked here, still before any upload or Generate.
-        time.sleep(1.5)
-        settled = _current_url(tab)
-        if _flow_region_blocked(tab, settled):
-            _flow_raise(
-                ErrorCode.FLOW_REGION_BLOCKED,
-                "Google Flow is not available in this country.",
-                f"observed url: {settled!r}",
-            )
-        _log(runtime, f"Flow project ready: {settled}")
-        return settled
+        _flow_raise(
+            ErrorCode.FLOW_UI_CHANGED,
+            "Flow opened an existing project before this job could create a new one.",
+            f"expected landing page {FLOW_BASE_URL!r}, observed project url: {url!r}",
+        )
     if not _is_flow_host(url):
         _flow_raise(
             ErrorCode.FLOW_TAB_LOST,
@@ -269,8 +273,20 @@ def _ensure_flow_project(
                 time.sleep(1.5)
                 url = _current_url(tab)
                 if _is_flow_project_url(url):
-                    _log(runtime, f"Created a new Flow project: {url}")
-                    return url
+                    # As with the landing page, a regional block can replace the new project
+                    # one moment later. Verify the settled URL before touching uploads/settings.
+                    time.sleep(1.5)
+                    settled = _current_url(tab)
+                    if _flow_region_blocked(tab, settled):
+                        _flow_raise(
+                            ErrorCode.FLOW_REGION_BLOCKED,
+                            "Google Flow is not available in this country.",
+                            f"observed url: {settled!r}",
+                        )
+                    if not _is_flow_project_url(settled):
+                        continue
+                    _log(runtime, f"Created a new Flow project: {settled}")
+                    return settled
         time.sleep(1.5 + 0.5 * attempt)
     _flow_raise(
         ErrorCode.FLOW_UI_CHANGED,
@@ -1594,7 +1610,10 @@ def _run_flow_job_inner(
 
     if runtime is not None:
         runtime.update_status("opening_provider_tab")
-    target = getattr(resolved, "flow_url", None) or FLOW_BASE_URL
+    # A configured FLOW_URL may be a legacy /project/<id> URL. It is deliberately
+    # ignored for generation: every paid job starts at the Flow landing page and creates
+    # its own project through the visible New project control.
+    target = FLOW_BASE_URL
     # Binding and opening the project are one operation: if the reference goes stale between
     # them, rebinding is the fix, not failing the job.
     tab = _bind_flow_tab(adapter, target, runtime)

@@ -229,6 +229,112 @@ _MENU_ITEM_SCRIPT = """
 """
 
 
+_GEMINI_EXTENDED_THINKING_STATE_SCRIPT = """
+(() => {
+  const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+  const visible = element => {
+    if (!element) return false;
+    const box = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const centre = element => {
+    const box = element.getBoundingClientRect();
+    return {x: box.x + box.width / 2, y: box.y + box.height / 2};
+  };
+  const picker = document.querySelector('[data-test-id="bard-mode-menu-button"]');
+  const thinking = Array.from(document.querySelectorAll('gem-menu-item[role="menuitem"], [role="menuitem"]'))
+    .find(element => visible(element) && /extended\\s+thinking/i.test(clean(element.innerText || element.getAttribute('aria-label'))));
+  const label = clean(picker?.getAttribute('aria-label') || picker?.innerText);
+  return JSON.stringify({
+    modeLabel: label,
+    extendedThinkingEnabled: /\\bextended\\b/i.test(label),
+    picker: visible(picker) ? centre(picker) : null,
+    menuOpen: picker?.getAttribute('aria-expanded') === 'true',
+    thinkingItem: thinking ? {
+      ...centre(thinking),
+      active: thinking.getAttribute('data-active') === 'true' || thinking.getAttribute('aria-checked') === 'true',
+    } : null,
+  });
+})()
+"""
+
+
+def _read_gemini_extended_thinking_state(tab) -> dict[str, object]:
+    """Read the mode picker's own Extended Thinking state, never page body text."""
+    from app.automation.existing_chrome import execute_javascript
+    import json as js
+
+    try:
+        raw = execute_javascript(tab, _GEMINI_EXTENDED_THINKING_STATE_SCRIPT)
+        state = js.loads(raw) if raw else {}
+    except Exception:
+        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def _ensure_gemini_extended_thinking(tab, runtime) -> dict[str, str]:
+    """Enable Gemini Extended Thinking and positively re-read its mode-picker label.
+
+    Gemini exposes this as a toggle inside the mode picker. It changes the active mode
+    from, for example, ``Flash`` to ``Flash Extended`` without selecting a different
+    base model. A missing toggle or a failed read-back is a hard failure: every Gemini
+    job is required to use Extended Thinking, so silently continuing would violate its
+    generation contract.
+    """
+    from app.automation.existing_chrome import dispatch_key, dispatch_mouse_click
+
+    state = _read_gemini_extended_thinking_state(tab)
+    if state.get("extendedThinkingEnabled"):
+        label = str(state.get("modeLabel") or "").strip()
+        if runtime is not None:
+            runtime.append_log(f"Gemini Extended Thinking already enabled: {label!r}.")
+        return {"label": label, "source": "mode-picker"}
+
+    for attempt in range(3):
+        picker = state.get("picker")
+        if not isinstance(picker, dict):
+            break
+        if not state.get("menuOpen"):
+            dispatch_mouse_click(tab, float(picker["x"]), float(picker["y"]))
+            time.sleep(0.45)
+            state = _read_gemini_extended_thinking_state(tab)
+
+        thinking = state.get("thinkingItem")
+        if isinstance(thinking, dict):
+            if thinking.get("active"):
+                time.sleep(0.35)
+                state = _read_gemini_extended_thinking_state(tab)
+            else:
+                dispatch_mouse_click(tab, float(thinking["x"]), float(thinking["y"]))
+                for _poll in range(8):
+                    time.sleep(0.35)
+                    state = _read_gemini_extended_thinking_state(tab)
+                    if state.get("extendedThinkingEnabled"):
+                        label = str(state.get("modeLabel") or "").strip()
+                        if runtime is not None:
+                            runtime.append_log(f"Gemini Extended Thinking enabled and verified: {label!r}.")
+                        return {"label": label, "source": "mode-picker"}
+
+        if state.get("extendedThinkingEnabled"):
+            label = str(state.get("modeLabel") or "").strip()
+            if runtime is not None:
+                runtime.append_log(f"Gemini Extended Thinking enabled and verified: {label!r}.")
+            return {"label": label, "source": "mode-picker"}
+        try:
+            dispatch_key(tab, key="Escape", code="Escape")
+        except Exception:
+            pass
+        time.sleep(0.35 + 0.15 * attempt)
+        state = _read_gemini_extended_thinking_state(tab)
+
+    raise OrdaKError(
+        code=ErrorCode.MODEL_SELECTION_FAILED,
+        message="Gemini Extended Thinking could not be enabled and positively verified from the mode picker.",
+        technical_details=f"mode-picker state: {state!r}",
+    )
+
+
 def _read_image_tool_state(tab) -> dict[str, object]:
     from app.automation.existing_chrome import execute_javascript
     import json as js
@@ -584,6 +690,7 @@ def _build_gemini_receipt(
     job: AutomationJobRequest,
     *,
     model_evidence: dict[str, str] | None,
+    thinking_evidence: dict[str, str] | None,
     pro_outcome: gemini_pro.ProOutcome | None,
     validations: list[image_validation.ImageValidation],
     workspace_url: str | None,
@@ -610,6 +717,14 @@ def _build_gemini_receipt(
     notes: list[str] = []
     if observed_source:
         notes.append(f"model_label_source={observed_source}")
+    thinking_label = str((thinking_evidence or {}).get("label") or "").strip()
+    if not re.search(r"\bextended\b", thinking_label, re.IGNORECASE):
+        raise OrdaKError(
+            code=ErrorCode.MODEL_SELECTION_FAILED,
+            message="Gemini image receipt cannot be created without verified Extended Thinking evidence.",
+            technical_details=f"thinking_evidence={thinking_evidence!r}",
+        )
+    notes.append(f"extended_thinking_mode={thinking_label}")
     notes.append(f"artifact_source={artifact_source}")
     if pro_outcome is not None:
         notes.extend(pro_outcome.notes)
@@ -1457,6 +1572,12 @@ def _run_gemini_job_in_existing_chrome(
         if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
             _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
 
+        # Extended Thinking is required for every Gemini-backed chat, analysis, and image
+        # generation job. The live mode-picker label is re-read before each submission.
+        gemini_thinking_evidence: dict[str, str] | None = None
+        if job.provider == "gemini":
+            gemini_thinking_evidence = _ensure_gemini_extended_thinking(tab, runtime)
+
         # Gemini image model selection (§5-7). The model comes from the explicit
         # generation contract on the job — never inferred, never parsed out of the prompt.
         if job.provider == "gemini" and job.mode == "image_generate":
@@ -1666,6 +1787,7 @@ def _run_gemini_job_in_existing_chrome(
                         _build_gemini_receipt(
                             job,
                             model_evidence=model_evidence,
+                            thinking_evidence=gemini_thinking_evidence,
                             pro_outcome=pro_outcome,
                             validations=validations,
                             workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),

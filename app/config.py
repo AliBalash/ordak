@@ -194,7 +194,9 @@ class Settings:
         if provider == "chatgpt":
             return self.chatgpt_url
         if provider == "flow":
-            return self.flow_url
+            # Flow generation never reuses a configured project URL. The worker opens the
+            # landing page and creates a fresh project for every paid job.
+            return "https://flow.google.com/"
         return self.gemini_url
 
     def provider_new_chat_url(self, provider: str, mode: str | None = None) -> str:
@@ -203,7 +205,7 @@ class Settings:
                 return self.chatgpt_agent_url or self.chatgpt_url
             return self.chatgpt_project_url or self.chatgpt_url
         if provider == "flow":
-            return self.flow_url
+            return "https://flow.google.com/"
         return self.gemini_url
 
     def provider_response_timeout_ms(self, provider: str) -> int:
