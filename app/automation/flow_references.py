@@ -18,7 +18,7 @@ Live DOM facts, verified 2026-09-04 against an authenticated Flow project view:
 
 Every attachment is verified from the UI afterwards. A reference that cannot be confirmed
 raises ``FLOW_FRAME_UPLOAD_FAILED`` / ``FLOW_UPLOAD_FAILED`` rather than letting the job
-generate with a missing or stale reference (master_prompt §14-16, §19).
+generate with a missing or stale reference.
 """
 from __future__ import annotations
 

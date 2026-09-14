@@ -31,11 +31,11 @@ class ErrorCode(StrEnum):
     AGENT_COMMAND_TIMEOUT = "agent_command_timeout"
     AGENT_EXECUTION_BACKEND_UNAVAILABLE = "agent_execution_backend_unavailable"
     AGENT_RESULT_TOO_LARGE = "agent_result_too_large"
-    # Strict model contract (master_prompt §5, §18)
+    # Strict generation/model contract
     MODEL_NOT_AVAILABLE = "model_not_available"
     MODEL_SELECTION_FAILED = "model_selection_failed"
     MODEL_FEATURE_INCOMPATIBLE = "model_feature_incompatible"
-    # Google Flow video provider (master_prompt §27)
+    # Google Flow video provider
     FLOW_LOGIN_REQUIRED = "flow_login_required"
     FLOW_MANUAL_VERIFICATION_REQUIRED = "flow_manual_verification_required"
     FLOW_UPLOAD_FAILED = "flow_upload_failed"

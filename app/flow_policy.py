@@ -4,15 +4,16 @@ This is the last line of defence before bytes reach the Flow UI. The pipeline ha
 guard (``scripts/flow_reference_policy.py`` in the parent repository) and
 ``tests/test_ordak_flow_policy_parity.py`` there asserts both vocabularies stay identical.
 
-Absolute rules (master_prompt §12-16, §41, §61):
+Absolute upload-boundary rules:
 
   * Flow NEVER receives a style sheet — no world style anchor, no home/environment style
     sheet, no mood board, no book style board, no previous image used as a style reference.
-  * Flow receives exactly one canonical reference sheet per clip:
-        Clip A (question spark) -> character_sheet
-        Clip B (book -> world)  -> book_design_sheet
+  * Current Clip A Ingredients mode receives only ``character_sheet``.
+  * Current Clip B Frames mode receives no canonical sheet. The durable
+    ``book_design_sheet`` role remains allow-listed only for historical Ingredients jobs;
+    new presentation identities are consumed upstream while constructing the first frame.
   * Frame inputs are job content, not style references, and remain allowed:
-        first_frame -> the composed book spread
+        first_frame -> the profile-specific entry frame
         last_frame  -> the world keyframe
 
 There is no provider fallback and no "warn and continue" path: a violation fails the job.

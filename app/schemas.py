@@ -60,6 +60,7 @@ class AgentOptions(BaseModel):
 KNOWN_REFERENCE_ROLES = (
     "character_sheet",
     "book_design_sheet",
+    "entry_identity",
     "first_frame",
     "last_frame",
     "style_reference",
@@ -71,7 +72,7 @@ KNOWN_REFERENCE_ROLES = (
 
 
 class GenerationOptions(BaseModel):
-    """Explicit generation contract for a job (master_prompt §5, §18-21).
+    """Explicit generation contract for a job.
 
     The caller states exactly what it wants; the worker must select it in the live UI,
     verify it, and refuse to generate when verification fails. Nothing is inferred and

@@ -5,7 +5,7 @@ Every Flow setting lives in one Radix menu behind a summary button that reads li
 of ``button[role="tab"]`` elements where the active option carries
 ``aria-selected="true"`` / ``data-state="active"``, plus a model dropdown button.
 
-That gives a genuine read-back for master_prompt §18-21: select, re-read the control's own
+That gives a genuine contract read-back: select, re-read the control's own
 state, compare requested against actual, and refuse to generate on a mismatch. Nothing here
 falls back to ``document.body.innerText``, which also matches the option names listed inside
 a closed menu.

@@ -1,7 +1,7 @@
 """generation contract columns
 
-Adds the explicit per-job generation contract (master_prompt §5, §18-21) and the
-declared reference roles (§12-16, §61) so model/aspect/duration/resolution and each
+Adds the explicit per-job generation contract and declared reference roles so
+model/aspect/duration/resolution and each
 upload's role reach the browser worker instead of being hardcoded.
 """
 
