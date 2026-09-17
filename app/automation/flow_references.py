@@ -388,8 +388,13 @@ def _select_uploaded_asset(
     the picker — which the caller could only report as "Flow did not show the reference".
     It stays as the fallback for the states where a row click merely selects.
 
-    The caller verifies the chip or the filled slot, so a closed picker is reported as done
-    rather than as success: nothing here claims an attachment it has not seen.
+    A row click can merely *select* (the row reports ``active``) while a slow backend
+    still processes the attachment, so the close is verified on a deadline instead of
+    after a fixed number of clicks: an already-active row is never clicked again (a
+    repeated click could toggle the selection off) and the enabled confirmation is
+    pressed until the picker actually closes. The caller verifies the chip or the
+    filled slot, so a closed picker is reported as done rather than as success:
+    nothing here claims an attachment it has not seen.
     """
     script = _PICKER_ROW_JS % json.dumps(filename.lower())
     deadline = time.monotonic() + timeout_s
@@ -403,10 +408,24 @@ def _select_uploaded_asset(
             # The upload is still travelling; the row appears when Flow has stored it.
             time.sleep(1.5)
             continue
+        if attempts >= 3 and row.get("active"):
+            # The row is selected but the picker will not close on its own;
+            # only the explicit confirmation can finish a slow attachment.
+            state = _evaluate(tab, script) or {}
+            confirm = state.get("confirm") if state.get("confirmEnabled") else None
+            if confirm:
+                dispatch_mouse_click(tab, confirm["x"], confirm["y"])
+                for _ in range(8):
+                    time.sleep(0.6)
+                    if not (_evaluate(tab, script) or {}).get("open"):
+                        return
+            time.sleep(1.0)
+            continue
         if attempts >= 3:
             break
         attempts += 1
-        dispatch_mouse_click(tab, row["x"], row["y"])
+        if not row.get("active"):
+            dispatch_mouse_click(tab, row["x"], row["y"])
         for _ in range(8):
             time.sleep(0.6)
             if not (_evaluate(tab, script) or {}).get("open"):
