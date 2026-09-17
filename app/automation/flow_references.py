@@ -485,12 +485,16 @@ def attach_frame(
     _log(runtime, f"Flow {role}: selecting {source.name} in the frame dialog")
     _select_uploaded_asset(tab, source.name)
 
-    for attempt in range(8):
-        time.sleep(0.6 + 0.4 * attempt)
+    # A slow backend can take a while to render the picked asset into the
+    # slot, so the fill is verified on a deadline instead of a fixed number
+    # of quick polls.
+    verify_deadline = time.monotonic() + 120.0
+    while time.monotonic() < verify_deadline:
         refreshed = read_frame_slots(tab)[index]
         if refreshed.get("filled") and refreshed.get("src"):
             _log(runtime, f"Flow {role} verified attached: {source.name}")
             return str(refreshed["src"])
+        time.sleep(2.0)
     close_picker(tab)
     raise OrdaKError(
         code=ErrorCode.FLOW_FRAME_UPLOAD_FAILED,
@@ -601,8 +605,10 @@ def attach_ingredient(
     _log(runtime, f"Flow {role}: uploaded {source.name}, waiting for the picker to list it")
     _select_uploaded_asset(tab, source.name)
 
-    for attempt in range(8):
-        time.sleep(0.6 + 0.4 * attempt)
+    # Same slow-backend patience as the frame slots: the chip render is
+    # verified on a deadline instead of a fixed number of quick polls.
+    verify_deadline = time.monotonic() + 120.0
+    while time.monotonic() < verify_deadline:
         after = read_composer(tab)
         fresh = [
             chip.get("src")
@@ -612,6 +618,7 @@ def attach_ingredient(
         if fresh:
             _log(runtime, f"Flow {role} verified attached: {source.name}")
             return str(fresh[0])
+        time.sleep(2.0)
     close_picker(tab)
     raise OrdaKError(
         code=ErrorCode.FLOW_UPLOAD_FAILED,
