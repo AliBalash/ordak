@@ -45,6 +45,26 @@ def test_missing_extended_thinking_toggle_fails_closed(monkeypatch) -> None:
         gw, "_read_gemini_extended_thinking_state",
         lambda tab: {"extendedThinkingEnabled": False, "modeLabel": "Open mode picker, currently Flash", "picker": None},
     )
+    monkeypatch.setattr(gw.time, "sleep", lambda _seconds: None)
     with pytest.raises(OrdaKError) as excinfo:
         gw._ensure_gemini_extended_thinking(object(), Runtime())
     assert excinfo.value.code is ErrorCode.MODEL_SELECTION_FAILED
+
+
+def test_slow_menu_still_confirms_thinking(monkeypatch) -> None:
+    """A freshly opened tab may need several reads before the menu settles."""
+    states = iter([
+        {"extendedThinkingEnabled": False, "modeLabel": "Open mode picker, currently Flash", "picker": {"x": 1, "y": 2}, "menuOpen": False},
+        {"extendedThinkingEnabled": False, "modeLabel": "Open mode picker, currently Flash", "picker": {"x": 1, "y": 2}, "menuOpen": False},
+        {"extendedThinkingEnabled": False, "modeLabel": "Open mode picker, currently Flash", "picker": {"x": 1, "y": 2}, "menuOpen": True},
+        {"extendedThinkingEnabled": False, "modeLabel": "Open mode picker, currently Flash", "picker": {"x": 5, "y": 6}, "menuOpen": True, "thinkingItem": {"x": 3, "y": 4, "active": False}},
+        {"extendedThinkingEnabled": True, "modeLabel": "Open mode picker, currently Flash Extended", "picker": {"x": 5, "y": 6}, "menuOpen": False},
+    ])
+    monkeypatch.setattr(gw, "_read_gemini_extended_thinking_state", lambda tab: next(states))
+    clicks: list[tuple[float, float]] = []
+    monkeypatch.setattr("app.automation.existing_chrome.dispatch_mouse_click", lambda tab, x, y: clicks.append((x, y)))
+    monkeypatch.setattr(gw.time, "sleep", lambda _seconds: None)
+
+    result = gw._ensure_gemini_extended_thinking(object(), Runtime())
+    assert result["label"].endswith("Flash Extended")
+    assert clicks == [(1.0, 2.0), (3.0, 4.0)]

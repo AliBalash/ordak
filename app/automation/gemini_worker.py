@@ -290,6 +290,20 @@ def _ensure_gemini_extended_thinking(tab, runtime) -> dict[str, str]:
         if runtime is not None:
             runtime.append_log(f"Gemini Extended Thinking already enabled: {label!r}.")
         return {"label": label, "source": "mode-picker"}
+    if not isinstance(state.get("picker"), dict):
+        # A freshly opened tab renders the picker asynchronously; wait for the
+        # selector itself before treating its absence as a UI change.
+        for _ in range(20):
+            time.sleep(0.5)
+            state = _read_gemini_extended_thinking_state(tab)
+            if state.get("extendedThinkingEnabled") or isinstance(state.get("picker"), dict):
+                break
+
+    if state.get("extendedThinkingEnabled"):
+        label = str(state.get("modeLabel") or "").strip()
+        if runtime is not None:
+            runtime.append_log(f"Gemini Extended Thinking already enabled: {label!r}.")
+        return {"label": label, "source": "mode-picker"}
 
     for attempt in range(3):
         picker = state.get("picker")
@@ -297,8 +311,16 @@ def _ensure_gemini_extended_thinking(tab, runtime) -> dict[str, str]:
             break
         if not state.get("menuOpen"):
             dispatch_mouse_click(tab, float(picker["x"]), float(picker["y"]))
-            time.sleep(0.45)
-            state = _read_gemini_extended_thinking_state(tab)
+            # The overlay menu renders asynchronously, especially on a freshly
+            # opened tab: wait for the picker's own open state plus the
+            # thinking entry instead of assuming one fixed sleep is enough.
+            for _ in range(24):
+                time.sleep(0.35)
+                state = _read_gemini_extended_thinking_state(tab)
+                if state.get("extendedThinkingEnabled") or (
+                    state.get("menuOpen") and isinstance(state.get("thinkingItem"), dict)
+                ):
+                    break
 
         thinking = state.get("thinkingItem")
         if isinstance(thinking, dict):
