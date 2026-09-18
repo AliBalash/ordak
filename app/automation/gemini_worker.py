@@ -88,6 +88,10 @@ class AutomationJobRequest:
     provider: Provider = "gemini"
     conversation_id: str | None = None
     start_new_chat: bool = False
+    #: Where a ChatGPT image job must live: the configured project conversation
+    #: (default, historical), a fresh temporary chat per job, or a fresh normal
+    #: (non-temp) chat. Only ChatGPT image jobs use this; anything else ignores it.
+    chatgpt_chat: str = "project"
     target_tab: ChromeTabRef | None = None
     conversation_url: str | None = None
     mode: JobMode = "chat"
@@ -834,6 +838,68 @@ def _verify_chatgpt_project_tab(
     )
 
 
+def _chatgpt_base_chat_url(app_settings: Settings) -> str:
+    return (app_settings.chatgpt_url or "https://chatgpt.com/").rstrip("/") or "https://chatgpt.com"
+
+
+def _chatgpt_temporary_chat_url(app_settings: Settings) -> str:
+    base = _chatgpt_base_chat_url(app_settings)
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}temporary-chat=true"
+
+
+def _verify_chatgpt_temporary_tab(tab: ChromeTabRef, *, app_settings: Settings) -> bool:
+    """Best-effort check that the tab really is a ChatGPT temporary chat."""
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            info = get_tab_info(tab)
+            url = info.url if info is not None else ""
+        except RuntimeError:
+            time.sleep(1.0)
+            continue
+        if "temporary-chat" in url:
+            return True
+        try:
+            body = execute_javascript(
+                tab,
+                "(document.body ? document.body.innerText : '').slice(0, 4000)",
+            ) or ""
+        except RuntimeError:
+            time.sleep(1.0)
+            continue
+        if "temporary chat" in body.lower():
+            return True
+        time.sleep(1.5)
+    return False
+
+
+def _verify_chatgpt_chat_scope(tab: ChromeTabRef, chat_scope: str, resolved: Settings, runtime, adapter) -> tuple:
+    """Enforce the requested ChatGPT chat scope, falling back safely to project chat."""
+    if chat_scope == "temporary":
+        if _verify_chatgpt_temporary_tab(tab, app_settings=resolved):
+            if runtime is not None:
+                runtime.append_log("Temporary ChatGPT chat verified for this image job.")
+            return tab, chat_scope
+        if runtime is not None:
+            runtime.append_log(
+                "Temporary ChatGPT chat could not be verified; falling back to the "
+                "configured project chat instead of failing the run.",
+                level="warning",
+            )
+        opened = adapter.open_tab(target_url=_provider_new_chat_url(resolved, "chatgpt"))
+        tab = opened.ref
+        _remember_tab(runtime, tab)
+        _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
+        return tab, "project"
+    if chat_scope == "fresh":
+        if runtime is not None:
+            runtime.append_log("Fresh normal (non-temp) ChatGPT chat; skipping project-scope check.")
+        return tab, chat_scope
+    _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
+    return tab, chat_scope
+
+
 def _browser_platform_label(app_settings: Settings) -> str:
     platform_name = (app_settings.browser_platform or "").strip().lower()
     if platform_name in {"darwin", "mac", "macos"}:
@@ -1547,6 +1613,16 @@ def _run_gemini_job_in_existing_chrome(
         if job.run_strategy == "new_tab_same_conversation" and job.conversation_url:
             should_open_new_tab = True
             target_url = job.conversation_url
+        # Fresh image generations each get their own temporary chat and image
+        # corrections their own fresh normal chat — never the long-lived project
+        # conversation. Anything else (including Gemini) keeps today's behavior.
+        chat_scope = (
+            str(getattr(job, "chatgpt_chat", None) or "project")
+            if job.provider == "chatgpt" and job.mode == "image_generate"
+            else "project"
+        )
+        if chat_scope not in {"project", "temporary", "fresh"}:
+            chat_scope = "project"
 
         if should_open_new_tab:
             if runtime is not None:
@@ -1555,11 +1631,18 @@ def _run_gemini_job_in_existing_chrome(
                     f"Opening {_provider_name(job.provider)} in a new tab inside the existing Google Chrome window."
                 )
                 _runtime_checkpoint(runtime)
-            opened = adapter.open_tab(target_url=target_url or _provider_new_chat_url(resolved, job.provider))
+            if chat_scope == "temporary":
+                opened = adapter.open_tab(target_url=_chatgpt_temporary_chat_url(resolved))
+            elif chat_scope == "fresh":
+                # A genuinely new normal chat: the project URL would restore the
+                # same long-lived project conversation, defeating the point.
+                opened = adapter.open_tab(target_url=_chatgpt_base_chat_url(resolved))
+            else:
+                opened = adapter.open_tab(target_url=target_url or _provider_new_chat_url(resolved, job.provider))
             tab = opened.ref
             _remember_tab(runtime, tab)
             if job.provider == "chatgpt" and target_url is None:
-                _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
+                tab, chat_scope = _verify_chatgpt_chat_scope(tab, chat_scope, resolved, runtime, adapter)
         else:
             if runtime is not None:
                 runtime.update_status("opening_provider_tab")
@@ -1592,7 +1675,7 @@ def _run_gemini_job_in_existing_chrome(
             recovery_url=job.conversation_url,
         )
         if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
-            _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
+            tab, chat_scope = _verify_chatgpt_chat_scope(tab, chat_scope, resolved, runtime, adapter)
 
         # Extended Thinking is required for every Gemini-backed chat, analysis, and image
         # generation job.  Model/tool selection happens first because Gemini may reset the

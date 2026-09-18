@@ -46,6 +46,13 @@ def _as_form_bool(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _as_chatgpt_chat(value: object) -> str:
+    cleaned = str(value or "project").strip().lower() or "project"
+    if cleaned not in {"project", "temporary", "fresh"}:
+        raise HTTPException(status_code=422, detail="chatgpt_chat must be project, temporary or fresh.")
+    return cleaned
+
+
 def _absolute_url(request: Request, relative_path: str) -> str:
     return f"{str(request.base_url).rstrip('/')}/{relative_path.lstrip('/')}"
 
@@ -145,6 +152,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
             mode = str(form.get("mode", "chat")).strip() or "chat"
             conversation_id = str(form.get("conversation_id", "")).strip() or None
             start_new_chat = _as_form_bool(form.get("start_new_chat"))
+            chatgpt_chat = _as_chatgpt_chat(form.get("chatgpt_chat"))
             wait_for_completion = _as_form_bool(form.get("wait_for_completion")) if "wait_for_completion" in form else True
             try:
                 wait_timeout_seconds = int(str(form.get("wait_timeout_seconds", "300")).strip() or "300")
@@ -201,6 +209,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     mode=mode,
                     conversation_id=conversation_id,
                     start_new_chat=start_new_chat,
+                    chatgpt_chat=chatgpt_chat,
                     uploads=uploads,
                     references=references,
                     generation=generation,
@@ -230,6 +239,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                     mode=payload.mode,
                     conversation_id=payload.conversation_id,
                     start_new_chat=payload.start_new_chat,
+                    chatgpt_chat=payload.chatgpt_chat,
                     uploads=[],
                     agent_options=payload.agent,
                     generation=payload.generation,
@@ -253,6 +263,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
                 mode=payload.mode,
                 conversation_id=payload.conversation_id,
                 start_new_chat=payload.start_new_chat,
+                chatgpt_chat=payload.chatgpt_chat,
                 uploads=[],
                 agent_options=payload.agent,
                 generation=payload.generation,

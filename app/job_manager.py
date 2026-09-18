@@ -129,6 +129,8 @@ class JobSnapshot:
     started_at: datetime | None
     finished_at: datetime | None
     cancel_requested_at: datetime | None
+    #: Where a ChatGPT image job must live: project, temporary or fresh.
+    chatgpt_chat: str = "project"
 
     def to_response(self) -> JobResponse:
         descriptor = get_error_descriptor(self.error_code)
@@ -231,6 +233,7 @@ class JobManager:
         provider: Provider = "gemini",
         conversation_id: str | None = None,
         start_new_chat: bool = False,
+        chatgpt_chat: str = "project",
         uploads: list[str] | None = None,
         retry_of_job_id: str | None = None,
         run_strategy: str | None = None,
@@ -240,6 +243,8 @@ class JobManager:
     ) -> JobCreateResponse:
         uploads = uploads or []
         references = references or []
+        if chatgpt_chat not in {"project", "temporary", "fresh"}:
+            raise ValueError("chatgpt_chat must be project, temporary or fresh.")
         if generation is not None and generation.is_empty():
             generation = None
         if references and len(references) != len(uploads):
@@ -330,6 +335,7 @@ class JobManager:
             "conversation_title": conversation.title,
             "provider": provider,
             "start_new_chat": bool(start_new_chat),
+            "chatgpt_chat": chatgpt_chat,
             "mode": mode,
             "uploads": uploads,
             "output_images": [],
@@ -421,6 +427,7 @@ class JobManager:
                     source.conversation_id if continue_same_conversation else None
                 ),
                 start_new_chat=not continue_same_conversation,
+                chatgpt_chat=source.chatgpt_chat,
                 uploads=[],
                 retry_of_job_id=source.job_id,
                 run_strategy=strategy,
@@ -440,6 +447,7 @@ class JobManager:
             mode=source.mode,
             conversation_id=conversation_id,
             start_new_chat=start_new_chat,
+            chatgpt_chat=source.chatgpt_chat,
             uploads=list(source.uploads),
             retry_of_job_id=source.job_id,
             run_strategy=strategy,
@@ -462,6 +470,7 @@ class JobManager:
                 mode=source.mode,
                 conversation_id=source.conversation_id,
                 start_new_chat=False,
+                chatgpt_chat=source.chatgpt_chat,
                 uploads=[],
                 retry_of_job_id=source.job_id,
                 run_strategy=strategy,
@@ -483,6 +492,7 @@ class JobManager:
             mode=source.mode,
             conversation_id=source.conversation_id,
             start_new_chat=False,
+            chatgpt_chat=source.chatgpt_chat,
             uploads=list(source.uploads),
             retry_of_job_id=source.job_id,
             run_strategy=strategy,
@@ -863,6 +873,7 @@ class JobManager:
                     provider=snapshot.provider,
                     conversation_id=snapshot.conversation_id,
                     start_new_chat=snapshot.start_new_chat,
+                    chatgpt_chat=snapshot.chatgpt_chat,
                     target_tab=target_tab,
                     conversation_url=conversation.external_url if conversation else None,
                     mode=snapshot.mode,
@@ -1251,6 +1262,7 @@ class JobManager:
             "conversation_title": self._make_conversation_title(job.question),
             "provider": "gemini",
             "start_new_chat": True,
+            "chatgpt_chat": "project",
             "mode": "chat",
             "uploads": [],
             "output_images": [],
@@ -1294,6 +1306,9 @@ class JobManager:
             conversation_title=conversation_title,
             provider=job.provider or metadata.get("provider", "gemini"),
             start_new_chat=bool(job.start_new_chat if job.start_new_chat is not None else metadata.get("start_new_chat", False)),
+            chatgpt_chat=str(metadata.get("chatgpt_chat") or "project")
+            if str(metadata.get("chatgpt_chat") or "project") in {"project", "temporary", "fresh"}
+            else "project",
             mode=job.mode or metadata.get("mode", "chat"),
             retry_of_job_id=job.retry_of_job_id,
             run_strategy=job.run_strategy,

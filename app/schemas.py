@@ -155,6 +155,10 @@ class JobCreateRequest(BaseModel):
     start_new_chat: bool = False
     agent: AgentOptions | None = None
     generation: GenerationOptions | None = None
+    #: Where a ChatGPT image job must live: the configured project
+    #: conversation (default, historical), a fresh temporary chat per job, or
+    #: a fresh normal (non-temp) chat. Other providers ignore this field.
+    chatgpt_chat: Literal["project", "temporary", "fresh"] = "project"
 
 
 class ProviderRunRequest(BaseModel):
@@ -166,6 +170,7 @@ class ProviderRunRequest(BaseModel):
     wait_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     agent: AgentOptions | None = None
     generation: GenerationOptions | None = None
+    chatgpt_chat: Literal["project", "temporary", "fresh"] = "project"
 
 
 
