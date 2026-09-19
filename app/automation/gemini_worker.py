@@ -792,16 +792,14 @@ def _verify_chatgpt_project_tab(
     runtime: WorkerRuntime | None,
     project_url_override: str | None = None,
 ) -> None:
-    """Refuse a new project job if Chrome did not stay on its configured project URL."""
+    """Refuse an image job unless its composer is on the exact project landing page."""
     project_url = (project_url_override or "") or (app_settings.chatgpt_project_url or "")
     if not project_url:
         return
     configured = urlparse(project_url)
-    configured_parts = [part for part in configured.path.split("/") if part]
-    # ChatGPT may immediately restore a project conversation as
-    # /g/<project-id>-<workspace>/c/<conversation-id>.  This remains inside
-    # the configured project; only a generic /c/... route is unsafe here.
-    project_slug = configured_parts[1] if len(configured_parts) >= 2 and configured_parts[0] == "g" else ""
+    expected_path = configured.path.rstrip("/")
+    if not expected_path:
+        raise GeminiAutomationError("Configured ChatGPT Project URL has no project path.")
     # A DevTools-created tab initially reports an intermediate or generic
     # ChatGPT route while the SPA is restoring the project workspace.  Do not
     # mistake that transient state for a usable normal chat.  Reassert the
@@ -813,21 +811,23 @@ def _verify_chatgpt_project_tab(
         info = get_tab_info(tab)
         current_url = info.url if info is not None else ""
         current = urlparse(current_url)
-        current_parts = [part for part in current.path.split("/") if part]
-        project_scoped = (
+        # A project conversation (/g/<project>/c/<conversation>) is not an
+        # acceptable starting point.  It can carry stale context and, more
+        # importantly, lets a prior image job silently determine where the
+        # next image is made.  Every image must begin at the exact configured
+        # project landing URL; ChatGPT creates the new project chat from there.
+        project_landing_page = (
             current.scheme == configured.scheme
             and current.netloc == configured.netloc
-            and len(current_parts) >= 2
-            and current_parts[0] == "g"
-            and project_slug
-            and (
-                current_parts[1] == project_slug
-                or current_parts[1].startswith(f"{project_slug}-")
-            )
+            and current.path.rstrip("/") == expected_path
+            and not current.params
+            and not current.query
         )
-        if project_scoped:
+        if project_landing_page:
             if runtime is not None:
-                runtime.append_log("Verified the configured ChatGPT Project URL before creating the new chat.")
+                runtime.append_log(
+                    "Verified the exact configured ChatGPT Project landing URL before creating the new image chat."
+                )
             return
         if reload_attempts < 2:
             reload_attempts += 1
@@ -869,7 +869,7 @@ def _discover_chatgpt_project_url() -> str | None:
         if "chatgpt.com" not in parsed.netloc.lower():
             continue
         parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 2 and parts[0] == "g" and parts[1]:
+        if len(parts) == 3 and parts[0] == "g" and parts[1] and parts[2] == "project":
             return f"{parsed.scheme}://{parsed.netloc}/g/{parts[1]}/project"
     return None
 
@@ -1834,6 +1834,11 @@ def _run_gemini_job_in_existing_chrome(
                     else f"{_provider_name(job.provider)} image mode button was not found, continuing with a generation prompt instead.",
                     level="info" if activated else "warning",
                 )
+            # Image-mode activation must not be able to switch to an old
+            # project conversation. Recheck the exact landing page before an
+            # upload or prompt can enter the composer.
+            if job.provider == "chatgpt" and chat_scope == "project":
+                _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
 
         if job.uploads:
             _runtime_checkpoint(runtime)

@@ -776,3 +776,18 @@ def test_fresh_chat_url_prefers_live_project_tab(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(worker_module, "list_google_chrome_tabs", lambda: [])
     fallback_settings = replace(local_settings, chatgpt_url="https://chatgpt.com/?temporary-chat=true")
     assert worker_module._chatgpt_fresh_chat_url(fallback_settings) == "https://chatgpt.com"
+
+
+def test_project_discovery_rejects_a_project_conversation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the project landing URL is a safe image-job starting point."""
+    from app.automation import gemini_worker as worker_module
+
+    project_conversation = (
+        "https://chatgpt.com/g/g-p-6aad6365c6a4819189a5a35f28e021fc/c/abc123"
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "list_google_chrome_tabs",
+        lambda: [ChromeTabInfo(window_id=0, tab_id=0, url=project_conversation, title="old chat", active=False)],
+    )
+    assert worker_module._discover_chatgpt_project_url() is None

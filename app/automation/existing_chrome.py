@@ -1069,6 +1069,45 @@ def activate_create_image_mode(
     *,
     provider: ProviderName = "gemini",
 ) -> bool:
+    if provider == "chatgpt":
+        # Project sidebars contain historic image-chat titles.  Restricting
+        # this action to the composer prevents a sidebar conversation from
+        # being selected in place of the image tool.
+        script = r"""
+(() => {
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const activateSelectedElement = (element) => {
+    // Exact selector target; never coordinates or a page-wide text match.
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) => {
+      element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+  };
+  const plus = document.querySelector('[data-testid="composer-plus-btn"]');
+  const composer = plus?.closest('.composer-parent') || plus?.closest('form') || null;
+  if (!plus || !composer || !visible(plus)) return "not-found";
+  const createImageItem = Array.from(composer.querySelectorAll('.popover .__menu-item, [role="group"] .__menu-item'))
+    .find((item) => {
+      if (!visible(item)) return false;
+      const label = (item.querySelector('span')?.innerText || item.innerText || "").trim().split(/\n/, 1)[0];
+      return /^create image$/i.test(label);
+    });
+  if (createImageItem) {
+    activateSelectedElement(createImageItem);
+    return "activated";
+  }
+  if (plus.getAttribute("aria-expanded") === "true") return "menu-open";
+  activateSelectedElement(plus);
+  return "menu-opened";
+})()
+"""
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            result = execute_javascript(tab, script).strip()
+            if result == "activated":
+                return True
+            time.sleep(0.8)
+        return False
+
     label_pattern = (
         r"create image|image generation"
         if provider == "gemini"
@@ -1232,11 +1271,12 @@ def _upload_local_file_via_javascript(
   }};
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const getDropTarget = () => {{
+    const composer = document.querySelector('.composer-parent') || document.querySelector('form');
     const selectors = provider === "chatgpt"
-      ? ["form", "#prompt-textarea", '[data-testid="composer"]', 'main']
+      ? ["#prompt-textarea", '[data-testid="composer"]', "form"]
       : ['[xapfileselectordropzone]', '.xap-uploader-dropzone', '[file-drop-zone]', '[data-node-type="input-area"]'];
     return selectors
-      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .flatMap((selector) => Array.from((provider === "chatgpt" && composer ? composer : document).querySelectorAll(selector)))
       .find((el) => isVisible(el)) || null;
   }};
   const setFilesOnInput = (file) => {{
@@ -1313,16 +1353,17 @@ def _upload_local_file_via_javascript(
     return true;
   }};
   const uploadLooksAttached = () => {{
-    const body = document.body?.innerText || "";
+    const composer = document.querySelector('.composer-parent') || document.querySelector('form');
+    const body = composer?.innerText || "";
     const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
     // A synthetic FileList only proves that the hidden input was assigned; it
     // does not prove ChatGPT accepted/uploaded the file.  Require a real UI
     // preview for ChatGPT before declaring the attachment ready.
     if (provider !== "chatgpt" && fileInputs.some((input) => input.files && input.files.length > 0)) return true;
     if (body.includes(fileName)) return true;
-    if (document.querySelector('img[src^="blob:"]')) return true;
-    if (document.querySelector('[data-test-id*="upload" i], [data-testid*="upload" i], [data-test-id*="attachment" i], [data-testid*="attachment" i]')) return true;
-    if (provider === "chatgpt" && document.querySelector('#prompt-textarea img, form img, [data-testid="composer-plus-btn"] + * img')) return true;
+    if (composer?.querySelector('img[src^="blob:"]')) return true;
+    if (composer?.querySelector('[data-test-id*="upload" i], [data-testid*="upload" i], [data-test-id*="attachment" i], [data-testid*="attachment" i]')) return true;
+    if (provider === "chatgpt" && composer?.querySelector('#prompt-textarea img, form img, [data-testid="composer-plus-btn"] + * img')) return true;
     return false;
   }};
   (async () => {{
@@ -1339,12 +1380,12 @@ def _upload_local_file_via_javascript(
       window.__ordakComposerFiles = window.__ordakComposerFiles || {{}};
       window.__ordakComposerFiles[fileName] = file;
       let attached = setFilesOnInput(file);
-      if (!attached) {{
+      if (!attached && provider !== "chatgpt") {{
         triggerUploadMenu();
         await wait(800);
         attached = setFilesOnInput(file);
       }}
-      if (!attached) {{
+      if (!attached && provider !== "chatgpt") {{
         clickUploadFilesItem();
         await wait(800);
         attached = setFilesOnInput(file);
@@ -1397,7 +1438,9 @@ def inspect_upload_state(
   const editor = document.querySelector('.ql-editor[role="textbox"], #prompt-textarea');
   const scope = provider === "gemini"
     ? editor?.closest('input-container, input-area-v2, input-area, form')
-    : document;
+    // A historic ChatGPT thread can contain many images.  A preview counts
+    // only when it belongs to this request's composer.
+    : editor?.closest('.composer-parent, form, [data-testid="composer"]');
   if (!scope) return JSON.stringify({attachment:false, attachmentCount:0, attachmentNames:[], loading:false, hasPreview:false});
   const attachmentSelectors = provider === "chatgpt"
     ? ['img[src^="blob:"]', 'form img', '[data-testid*="attachment" i]', '[data-testid*="composer" i] img']
