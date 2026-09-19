@@ -174,6 +174,33 @@ def test_chatgpt_image_job_accepts_multiple_ordered_references(tmp_path: Path) -
         ])] == [True, True, True]
 
 
+def test_chatgpt_job_accepts_ordered_image_and_font_references(tmp_path: Path) -> None:
+    with create_test_client(tmp_path) as client:
+        response = client.post(
+            "/api/jobs",
+            data={
+                "question": "Create one vertical thumbnail.",
+                "provider": "chatgpt", "mode": "image_generate",
+                "start_new_chat": "true",
+                "role": ["character_sheet", "quicky_story_font"],
+            },
+            files=[
+                ("file", ("character.png", b"fake-image", "image/png")),
+                ("file", ("Quicky Story.ttf", b"\x00\x01\x00\x00font-data", "font/ttf")),
+            ],
+        )
+        assert response.status_code == 200, response.text
+        job_id = response.json()["job_id"]
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = client.get(f"/api/jobs/{job_id}").json()
+            if job["status"] == "completed":
+                break
+            time.sleep(.05)
+        assert [item["role"] for item in job["references"]] == ["character_sheet", "quicky_story_font"]
+        assert Path(job["uploads"][1]).suffix == ".ttf"
+
+
 def test_profile_open_endpoint(tmp_path: Path, monkeypatch) -> None:
     with create_test_client(tmp_path) as client:
         monkeypatch.setattr(client.app.state.job_manager, "launch_profile_browser", lambda: True)

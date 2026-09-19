@@ -18,6 +18,7 @@ from app.automation.existing_chrome import (
     ChromeTabInfo,
     ChromeTabRef,
     activate_create_image_mode,
+    ensure_chatgpt_extra_high_effort,
     execute_javascript,
     get_tab_info,
     list_google_chrome_tabs,
@@ -957,23 +958,19 @@ def _verify_chatgpt_temporary_tab(tab: ChromeTabRef, *, app_settings: Settings) 
 
 
 def _verify_chatgpt_chat_scope(tab: ChromeTabRef, chat_scope: str, resolved: Settings, runtime, adapter) -> tuple:
-    """Enforce the requested ChatGPT chat scope, falling back safely to project chat."""
+    """Enforce the requested ChatGPT scope without silently changing it."""
     if chat_scope == "temporary":
         if _verify_chatgpt_temporary_tab(tab, app_settings=resolved):
             if runtime is not None:
-                runtime.append_log("Temporary ChatGPT chat verified for this image job.")
+                runtime.append_log("Temporary ChatGPT chat verified for this text job.")
             return tab, chat_scope
         if runtime is not None:
             runtime.append_log(
-                "Temporary ChatGPT chat could not be verified; falling back to the "
-                "configured project chat instead of failing the run.",
-                level="warning",
+                "Temporary ChatGPT chat could not be verified; refusing to send text "
+                "outside the requested Temporary Chat scope.",
+                level="error",
             )
-        opened = adapter.open_tab(target_url=_provider_new_chat_url(resolved, "chatgpt"))
-        tab = opened.ref
-        _remember_tab(runtime, tab)
-        _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
-        return tab, "project"
+        raise GeminiAutomationError("ChatGPT Temporary Chat could not be verified.")
     if chat_scope == "fresh":
         project_url = (resolved.chatgpt_project_url or "").strip() or _discover_chatgpt_project_url() or ""
         if project_url:
@@ -1589,10 +1586,11 @@ def _attach_uploads_in_existing_chrome(
             cumulative_file_paths=upload_paths[:index],
         )
         upload_state = get_provider_adapter(provider).verify_upload_complete(tab)
+        requires_preview = mime_type.startswith("image/")
         if not (
             upload_state.get("attachment")
             and int(upload_state.get("attachmentCount") or 0) == index
-            and upload_state.get("hasPreview")
+            and (upload_state.get("hasPreview") or not requires_preview)
             and not upload_state.get("loading")
             and (provider != "gemini" or _uploaded_pixels_match(upload_state, upload_paths[:index]))
         ):
@@ -1718,12 +1716,11 @@ def _run_gemini_job_in_existing_chrome(
         if job.run_strategy == "new_tab_same_conversation" and job.conversation_url:
             should_open_new_tab = True
             target_url = job.conversation_url
-        # Fresh image generations each get their own temporary chat and image
-        # corrections their own fresh normal chat — never the long-lived project
-        # conversation. Anything else (including Gemini) keeps today's behavior.
+        # The requested scope applies to every ChatGPT job. Text must be
+        # Temporary Chat; project-scoped image jobs carry ``project`` explicitly.
         chat_scope = (
             str(getattr(job, "chatgpt_chat", None) or "project")
-            if job.provider == "chatgpt" and job.mode == "image_generate"
+            if job.provider == "chatgpt"
             else "project"
         )
         if chat_scope not in {"project", "temporary", "fresh"}:
@@ -1791,6 +1788,25 @@ def _run_gemini_job_in_existing_chrome(
         # at the last possible point before submission below.
         gemini_thinking_evidence: dict[str, str] | None = None
 
+        # ChatGPT has a remembered Power setting per composer. Set it by the
+        # control's selector before every text or image prompt, then require
+        # read-back confirmation of Extra High. Never let a remembered Pro
+        # setting spend a generation.
+        if job.provider == "chatgpt":
+            try:
+                effort = ensure_chatgpt_extra_high_effort(tab)
+            except RuntimeError as exc:
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.MODEL_SELECTION_FAILED,
+                        message=f"ChatGPT Extra High could not be selected: {exc}",
+                    )
+                )
+            if runtime is not None:
+                runtime.append_log(
+                    f"ChatGPT reasoning effort verified by selector read-back: {effort.replace('_', ' ').title()}."
+                )
+
         # Gemini image model selection (§5-7). The model comes from the explicit
         # generation contract on the job — never inferred, never parsed out of the prompt.
         if job.provider == "gemini" and job.mode == "image_generate":
@@ -1831,9 +1847,14 @@ def _run_gemini_job_in_existing_chrome(
                     )
                 )
             upload_state = adapter.verify_upload_complete(tab)
+            requires_preview = all(
+                (mimetypes.guess_type(path.name)[0] or "application/octet-stream").startswith("image/")
+                for path in job.uploads
+            )
             if not (
                 upload_state.get("attachment")
-                and upload_state.get("hasPreview")
+                and int(upload_state.get("attachmentCount") or 0) == len(job.uploads)
+                and (upload_state.get("hasPreview") or not requires_preview)
                 and not upload_state.get("loading")
             ):
                 _raise_structured_error(

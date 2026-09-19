@@ -121,6 +121,31 @@ def test_upload_local_file_accepts_awaiting_ack_when_dom_readiness_catches_up(
     assert calls["marked_done"] == 1
 
 
+def test_chatgpt_font_attachment_does_not_require_an_image_preview(monkeypatch, tmp_path: Path) -> None:
+    font = tmp_path / "Quicky Story.ttf"
+    font.write_bytes(b"\x00\x01\x00\x00font")
+    calls = {"ready": 0}
+
+    def fake_execute(_tab: ChromeTabRef, javascript: str) -> str:
+        if 'return "started"' in javascript or "window.__codexUploadChunks" in javascript:
+            return "started" if 'return "started"' in javascript else "ok"
+        if 'window.__codexUploadStatus || "pending"' in javascript:
+            return "attached"
+        if "attachment:" in javascript and "hasPreview" in javascript:
+            calls["ready"] += 1
+            return json.dumps({"attachment": True, "loading": False, "hasPreview": False})
+        if 'window.__codexUploadStatus = "done"' in javascript:
+            return "ok"
+        raise AssertionError(javascript[:100])
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+    upload_local_file(ChromeTabRef(window_id=1, tab_id=2), file_path=font,
+                      file_name=font.name, mime_type="font/ttf", timeout_ms=5_000,
+                      provider="chatgpt")
+    assert calls["ready"] >= 2
+
+
 def test_chatgpt_upload_does_not_treat_an_empty_composer_as_upload_loading(monkeypatch) -> None:
     """Send is disabled until text exists; that must not invalidate a real file thumbnail."""
     captured: dict[str, str] = {}
@@ -256,6 +281,33 @@ def test_chatgpt_prefers_extra_high_uses_the_visible_composer_control(monkeypatc
     monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
     ensure_chatgpt_preferred_effort(ChromeTabRef(window_id=1, tab_id=2))
     assert any("thinking effort" in script.lower() for script in seen)
+    assert any("ArrowLeft" in script for script in seen)
+
+
+def test_chatgpt_current_pro_effort_is_adjusted_to_extra_high(monkeypatch) -> None:
+    from app.automation.existing_chrome import ensure_chatgpt_preferred_effort
+
+    seen: list[str] = []
+    states = iter([
+        {"open": False, "label": "6 Pro", "value": "", "maximum": "", "pill": True},
+        {"open": True, "label": "Pro, 5 of 5", "value": "4", "maximum": "4", "pill": True},
+        {"open": True, "label": "Pro, 5 of 5", "value": "4", "maximum": "4", "pill": True},
+        {"open": True, "label": "Extra High, 4 of 5", "value": "3", "maximum": "4", "pill": True},
+    ])
+
+    def fake_execute(tab, javascript):
+        seen.append(javascript)
+        if "return JSON.stringify({" in javascript:
+            return json.dumps(next(states))
+        if "return \"opening\"" in javascript:
+            return "opening"
+        if "ArrowLeft" in javascript:
+            return "stepped"
+        raise AssertionError(javascript[:100])
+
+    monkeypatch.setattr("app.automation.existing_chrome.execute_javascript", fake_execute)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+    assert ensure_chatgpt_preferred_effort(ChromeTabRef(window_id=1, tab_id=2)) == "extra_high"
     assert any("ArrowLeft" in script for script in seen)
 
 

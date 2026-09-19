@@ -37,7 +37,7 @@ from app.schemas import (
     RetryJobRequest,
     StorageDiagnosticsResponse,
 )
-from app.uploads import save_image_upload
+from app.uploads import save_reference_upload
 
 
 def _as_form_bool(value: object) -> bool:
@@ -167,14 +167,19 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
             if wait_timeout_seconds < 1 or wait_timeout_seconds > 3600:
                 raise HTTPException(status_code=422, detail="wait_timeout_seconds must be between 1 and 3600.")
             pending_job_id = str(uuid.uuid4())
-            upload_items = [item for item in form.getlist("image") if getattr(item, "filename", None)]
+            # ``image`` is retained for compatibility with older clients; new
+            # clients use ``file`` because a reference may be the approved font.
+            upload_items = [
+                item for field in ("file", "image") for item in form.getlist(field)
+                if getattr(item, "filename", None)
+            ]
             role_items = [str(value).strip() for value in form.getlist("role")]
             if role_items and len(role_items) != len(upload_items):
                 raise HTTPException(
                     status_code=422,
                     detail=(
                         f"Received {len(role_items)} role field(s) for {len(upload_items)} upload(s); "
-                        "send exactly one role per image, in the same order."
+                            "send exactly one role per reference, in the same order."
                     ),
                 )
             generation = _generation_from_form(form)
@@ -187,7 +192,7 @@ def create_app(job_manager: JobManager | None = None) -> FastAPI:
             )
             for upload in upload_items:
                 try:
-                    saved_upload = await save_image_upload(upload, pending_job_id, settings)
+                    saved_upload = await save_reference_upload(upload, pending_job_id, settings)
                 except ValueError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
                 uploads.append(saved_upload)

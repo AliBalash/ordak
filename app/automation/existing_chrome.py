@@ -1126,6 +1126,8 @@ def upload_local_file(
     provider: ProviderName = "gemini",
     cumulative_file_paths: list[Path] | None = None,
 ) -> None:
+    requires_preview = mime_type.startswith("image/")
+    desired_count = len(cumulative_file_paths or [file_path])
     # Keep ChatGPT on Ordak's selector-driven composer uploader.  It sets the
     # FileList on the compositor's own ``#upload-files`` input and dispatches
     # its change path; do not drive the visible menu or simulate pointer clicks.
@@ -1153,9 +1155,12 @@ def upload_local_file(
             raise RuntimeError(state.removeprefix("error:").strip() or "Image upload failed.")
         if state in {"attached", "awaiting-ack", "done"}:
             upload_state = inspect_upload_state(tab, provider=provider)
+            reported_count = upload_state.get("attachmentCount")
+            count_ready = reported_count is None or int(reported_count or 0) >= desired_count
             if (
                 upload_state.get("attachment")
-                and upload_state.get("hasPreview")
+                and count_ready
+                and (upload_state.get("hasPreview") or not requires_preview)
                 and not upload_state.get("loading")
             ):
                 ready_checks += 1
@@ -1171,7 +1176,7 @@ def upload_local_file(
             else:
                 ready_checks = 0
         time.sleep(1)
-    raise TimeoutError("Timed out while waiting for image upload in the current Chrome tab.")
+    raise TimeoutError("Timed out while waiting for the reference upload in the current Chrome tab.")
 
 
 def _upload_local_file_via_javascript(
@@ -1459,15 +1464,15 @@ def inspect_upload_state(
     return json.loads(execute_javascript(tab, readiness_probe) or "{}")
 
 
-def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
-    """Select ChatGPT reasoning effort: Extra high first, otherwise High.
+def ensure_chatgpt_extra_high_effort(tab: ChromeTabRef) -> str:
+    """Select and verify ChatGPT ``Extra High`` reasoning effort.
 
     ChatGPT's current composer exposes this as the ``Power`` keyboard slider,
     not as visible ``High`` menu options.  The maximum slider position is
     ``Pro``; the immediately preceding position is ``Extra High``.  We inspect
-    its live accessibility announcement, never infer an effort level from an
-    arbitrary last slider position, and use High only when Extra High cannot
-    be found.
+    its live accessibility announcement and drive the actual slider by its DOM
+    selector and keyboard events.  A requested Extra High job must never keep
+    a remembered Pro setting or silently fall back to a lower effort.
     """
     state_script = r"""
 (() => {
@@ -1478,7 +1483,7 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
     .map((id) => document.getElementById(id)?.innerText || "").join(" ");
   const model = document.querySelector('.d1BZWq_ViewToggleModelLabel')?.innerText || "";
   const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"]'))
-    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)/i.test(el.innerText || ""));
+    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)|(?:^|\s)pro(?:$|\s)/i.test(el.innerText || ""));
   return JSON.stringify({
     open: !!power,
     // When the menu is closed ChatGPT puts the current selection in the
@@ -1496,11 +1501,13 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
     .find((el) => el.getAttribute("aria-label") === "Power");
   if (power) return "open";
   const pill = Array.from(document.querySelectorAll('.__composer-pill[aria-haspopup="menu"]'))
-    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)/i.test(el.innerText || ""));
+    .find((el) => /thinking effort|extra[\s-]*high|(?:^|\s)high(?:$|\s)|(?:^|\s)pro(?:$|\s)/i.test(el.innerText || ""));
   if (!pill) return "unavailable";
-  ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
-    pill.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
-  );
+  // Selector-first activation: do not use a coordinate or synthetic mouse click.
+  pill.focus();
+  ["keydown", "keyup"].forEach((type) => pill.dispatchEvent(new KeyboardEvent(type, {
+    key: "Enter", code: "Enter", bubbles: true, cancelable: true,
+  })));
   return "opening";
 })()
 """
@@ -1526,6 +1533,8 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
 
     def level(snapshot: dict[str, str | bool]) -> str:
         label = str(snapshot.get("label") or "").lower()
+        if re.search(r"(?:^|\s)pro(?:$|\s)", label):
+            return "pro"
         if re.search(r"extra[\s-]*high", label):
             return "extra_high"
         if re.search(r"(?:^|\s)high(?:$|\s)", label):
@@ -1538,6 +1547,10 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
     snapshot: dict[str, str | bool] = {}
     while time.monotonic() < deadline:
         snapshot = state()
+        # A closed-menu pill is the authoritative persisted setting. Only Extra
+        # High is accepted; Pro is deliberately adjusted down before submission.
+        if level(snapshot) == "extra_high":
+            return "extra_high"
         if snapshot.get("open"):
             break
         opened = execute_javascript(tab, open_script).strip()
@@ -1548,16 +1561,15 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
     if not snapshot.get("open"):
         raise RuntimeError("ChatGPT Power effort control is unavailable after waiting.")
     if level(snapshot) == "extra_high":
-        return
+        return "extra_high"
 
-    # First walk to the upper endpoint, then step down.  The live UI announces
+    # First walk to the upper endpoint, then step down. The live UI announces
     # each level (for example: "Extra High, 4 of 5"), which is verified after
-    # every keypress.  This handles a remembered lower setting and preserves
-    # High as the explicit fallback when Extra High is unavailable.
+    # every keypress. Extra High is mandatory; High is not a silent fallback.
     for _ in range(6):
         snapshot = state()
         if level(snapshot) == "extra_high":
-            return
+            return "extra_high"
         maximum = str(snapshot.get("maximum") or "")
         if maximum and str(snapshot.get("value") or "") == maximum:
             break
@@ -1569,15 +1581,19 @@ def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> None:
             break
         time.sleep(0.35)
         snapshot = state()
-        selected = level(snapshot)
-        if selected in {"extra_high", "high"}:
-            return
-    raise RuntimeError("ChatGPT Power could not be set to Extra High or High.")
+        if level(snapshot) == "extra_high":
+            return "extra_high"
+    raise RuntimeError("ChatGPT Power could not be set and verified as Extra High.")
 
 
 def ensure_chatgpt_high_effort(tab: ChromeTabRef) -> None:
-    """Compatibility alias for callers from before Extra high was preferred."""
-    ensure_chatgpt_preferred_effort(tab)
+    """Compatibility alias for callers from before Extra High was required."""
+    ensure_chatgpt_extra_high_effort(tab)
+
+
+def ensure_chatgpt_preferred_effort(tab: ChromeTabRef) -> str:
+    """Compatibility alias for the enforced Extra High policy."""
+    return ensure_chatgpt_extra_high_effort(tab)
 
 
 def wait_for_chatgpt_workspace_ready(
