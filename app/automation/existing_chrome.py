@@ -2247,6 +2247,243 @@ def download_generated_images_from_controls(
     return []
 
 
+_CHATGPT_FULLSCREEN_HEADER_SELECTOR = '[data-testid="fullscreen-shell-header"]'
+_CHATGPT_FULLSCREEN_CLOSE_LABEL = "Close fullscreen view"
+_CHATGPT_FULLSCREEN_SAVE_LABEL = "Save"
+
+
+def _chatgpt_fullscreen_open(tab: ChromeTabRef) -> bool:
+    """Click the latest generated image to open ChatGPT's fullscreen viewer.
+
+    Inline ChatGPT image turns expose no download anchor (only Edit/Share), so
+    the viewer — with its explicit Save control and per-variant rail — is the
+    only first-party download path. Returns True once the header is visible.
+    """
+    target_script = """
+(() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width >= 120 && rect.height >= 120
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const images = Array.from(document.querySelectorAll('img[alt^="Generated image"]'))
+    .filter(visible);
+  const image = images.at(-1);
+  if (!image) return "[]";
+  image.scrollIntoView({block: 'center', inline: 'center'});
+  const rect = image.getBoundingClientRect();
+  return JSON.stringify({x: rect.left + rect.width / 2, y: rect.top + rect.height / 2});
+})()
+"""
+    try:
+        raw = execute_javascript(tab, target_script)
+    except RuntimeError:
+        return False
+    try:
+        point = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(point, dict):
+        return False
+    x, y = point.get("x"), point.get("y")
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return False
+    try:
+        dispatch_mouse_click(tab, float(x), float(y))
+    except RuntimeError:
+        return False
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            present = execute_javascript(
+                tab,
+                f"String(!!document.querySelector({json.dumps(_CHATGPT_FULLSCREEN_HEADER_SELECTOR)}))",
+            ).strip()
+        except RuntimeError:
+            time.sleep(0.5)
+            continue
+        if present == "true":
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _chatgpt_fullscreen_close(tab: ChromeTabRef) -> None:
+    """Best-effort close of the fullscreen viewer; never raises."""
+    script = f"""
+(() => {{
+  const header = document.querySelector({json.dumps(_CHATGPT_FULLSCREEN_HEADER_SELECTOR)});
+  const scope = header?.parentElement || document;
+  const close = Array.from(scope.querySelectorAll('button[aria-label]'))
+    .find((el) => (el.getAttribute('aria-label') || '') === {json.dumps(_CHATGPT_FULLSCREEN_CLOSE_LABEL)});
+  if (!close) return "[]";
+  close.scrollIntoView({{block: 'nearest'}});
+  const rect = close.getBoundingClientRect();
+  return JSON.stringify({{x: rect.left + rect.width / 2, y: rect.top + rect.height / 2}});
+}})()
+"""
+    try:
+        raw = execute_javascript(tab, script)
+        point = json.loads(raw or "null")
+        if isinstance(point, dict) and isinstance(point.get("x"), (int, float)):
+            dispatch_mouse_click(tab, float(point["x"]), float(point["y"]))
+            time.sleep(1.0)
+            return
+    except (RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        dispatch_key(tab, key="Escape", code="Escape")
+    except RuntimeError:
+        pass
+    time.sleep(1.0)
+
+
+def download_chatgpt_images_via_fullscreen(
+    tab: ChromeTabRef,
+    *,
+    output_dir: Path,
+    job_id: str,
+    max_images: int,
+    timeout_ms: int,
+) -> list[Path]:
+    """Download ChatGPT generated images through the fullscreen Save control.
+
+    Each same-turn variant is selected via its stable ``button[data-rail-index]``
+    entry, then saved with a trusted CDP click on ``button[aria-label="Save"]``
+    inside a job-scoped ``download_to`` directory. Only files that actually land
+    on disk with image magic bytes are accepted, so the caller can record
+    ``artifact_source=download`` provenance. Returns [] when the viewer or its
+    Save control is unavailable — the caller keeps its asset_url/DOM fallbacks.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    download_dir = output_dir / f"{job_id}_chatgpt_fullscreen"
+    try:
+        if not _chatgpt_fullscreen_open(tab):
+            return []
+        rail_script = """
+(() => {
+  const header = document.querySelector('[data-testid="fullscreen-shell-header"]');
+  const scope = header?.parentElement || document;
+  const rails = Array.from(scope.querySelectorAll('button[data-rail-index]'))
+    .map((el) => ({index: el.getAttribute('data-rail-index'), label: el.getAttribute('aria-label') || ''}));
+  return JSON.stringify(rails);
+})()
+"""
+        try:
+            rails = json.loads(execute_javascript(tab, rail_script) or "[]")
+        except (RuntimeError, TypeError, ValueError):
+            rails = []
+        rail_count = len(rails) if isinstance(rails, list) and rails else 1
+        wanted = max(1, min(int(max_images), rail_count))
+        accepted: list[Path] = []
+        with download_to(tab, download_dir):
+            for position in range(wanted):
+                # Select the variant first when a rail exists; a missing rail
+                # simply means the viewer shows a single image.
+                if rail_count > 1:
+                    select_script = f"""
+(() => {{
+  const header = document.querySelector('[data-testid="fullscreen-shell-header"]');
+  const scope = header?.parentElement || document;
+  const target = scope.querySelector('button[data-rail-index="{position}"]');
+  if (!target) return "[]";
+  target.scrollIntoView({{block: 'nearest'}});
+  const rect = target.getBoundingClientRect();
+  return JSON.stringify({{x: rect.left + rect.width / 2, y: rect.top + rect.height / 2}});
+}})()
+"""
+                    try:
+                        raw = execute_javascript(tab, select_script)
+                        point = json.loads(raw or "null")
+                    except (RuntimeError, TypeError, ValueError):
+                        point = None
+                    if isinstance(point, dict) and isinstance(point.get("x"), (int, float)):
+                        try:
+                            dispatch_mouse_click(tab, float(point["x"]), float(point["y"]))
+                        except RuntimeError:
+                            continue
+                        time.sleep(1.0)
+                save_script = f"""
+(() => {{
+  const header = document.querySelector({json.dumps(_CHATGPT_FULLSCREEN_HEADER_SELECTOR)});
+  const scope = header?.parentElement || document;
+  const save = Array.from(scope.querySelectorAll('button[aria-label]'))
+    .find((el) => (el.getAttribute('aria-label') || '') === {json.dumps(_CHATGPT_FULLSCREEN_SAVE_LABEL)});
+  if (!save) return "[]";
+  const rect = save.getBoundingClientRect();
+  const style = getComputedStyle(save);
+  if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return "[]";
+  save.scrollIntoView({{block: 'nearest'}});
+  const fresh = save.getBoundingClientRect();
+  return JSON.stringify({{x: fresh.left + fresh.width / 2, y: fresh.top + fresh.height / 2}});
+}})()
+"""
+                try:
+                    raw = execute_javascript(tab, save_script)
+                    point = json.loads(raw or "null")
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+                if not isinstance(point, dict) or not isinstance(point.get("x"), (int, float)):
+                    continue
+                before = {path.name for path in download_dir.iterdir() if path.is_file()}
+                try:
+                    dispatch_mouse_click(tab, float(point["x"]), float(point["y"]))
+                except RuntimeError:
+                    continue
+                deadline = time.monotonic() + max(10.0, min(30.0, timeout_ms / 1000 / max(1, wanted)))
+                saved: Path | None = None
+                while time.monotonic() < deadline:
+                    partials = list(download_dir.glob("*.crdownload"))
+                    newcomers = [
+                        path for path in download_dir.iterdir()
+                        if path.is_file() and path.name not in before
+                        and not path.name.endswith((".crdownload", ".part"))
+                    ]
+                    for candidate in sorted(newcomers, key=lambda p: p.stat().st_mtime):
+                        if partials:
+                            break
+                        try:
+                            size_before = candidate.stat().st_size
+                        except OSError:
+                            continue
+                        if size_before < 1024:
+                            continue
+                        time.sleep(0.5)
+                        try:
+                            if not candidate.exists() or candidate.stat().st_size != size_before:
+                                continue
+                            payload = candidate.read_bytes()
+                        except OSError:
+                            continue
+                        if _looks_like_image_bytes(payload):
+                            suffix = candidate.suffix or ".png"
+                            if suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                                suffix = ".png"
+                            destination = output_dir / slugify_filename(f"{job_id}_output_{len(accepted) + 1}{suffix}")
+                            try:
+                                destination.write_bytes(payload)
+                            except OSError:
+                                continue
+                            saved = destination
+                            break
+                    if saved is not None:
+                        break
+                    time.sleep(0.5)
+                if saved is not None:
+                    accepted.append(saved)
+                if len(accepted) >= wanted:
+                    break
+        return accepted
+    except (OSError, RuntimeError, ValueError):
+        return []
+    finally:
+        try:
+            _chatgpt_fullscreen_close(tab)
+        except Exception:
+            pass
+
+
 def capture_visible_generated_images(
     tab: ChromeTabRef,
     *,
@@ -3000,6 +3237,145 @@ def dispatch_mouse_click(tab: ChromeTabRef, x: float, y: float) -> None:
             },
         ],
     )
+
+
+#: Marker identifying the in-page pointer-activation script (also used to route
+#: test doubles, which must not mistake it for a coordinate-locating script).
+POINTER_ACTIVATION_MARKER = "ordak-pointer-activation"
+
+
+_POINTER_ACTIVATION_JS = """
+(/* ordak-pointer-activation */
+() => {
+  const selectors = %(selectors)s;
+  const needle = %(needle)s;
+  const exact = %(exact)s;
+  const scopeSelector = %(scope)s;
+  const atX = %(at_x)s;
+  const atY = %(at_y)s;
+  const clean = s => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const vis = el => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const fire = (el, type, Ctor, init) => {
+    try { el.dispatchEvent(new Ctor(type, init)); return true; }
+    catch (_error) { return false; }
+  };
+  const activate = (el) => {
+    try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (_error) {}
+    const rect = el.getBoundingClientRect();
+    const point = {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+    // Radix/Angular menus listen for pointer events, which a plain
+    // HTMLElement.click() never fires — so the full press sequence is sent.
+    const base = {bubbles: true, cancelable: true, composed: true,
+      clientX: point.x, clientY: point.y, button: 0};
+    fire(el, 'pointerover', PointerEvent, {...base, pointerType: 'mouse', isPrimary: true});
+    fire(el, 'pointerenter', PointerEvent, {...base, pointerType: 'mouse', isPrimary: true});
+    fire(el, 'mouseover', MouseEvent, {...base});
+    fire(el, 'pointerdown', PointerEvent, {...base, pointerType: 'mouse', isPrimary: true, buttons: 1});
+    fire(el, 'mousedown', MouseEvent, {...base, buttons: 1});
+    try { el.focus({preventScroll: true}); } catch (_error) {}
+    fire(el, 'pointerup', PointerEvent, {...base, pointerType: 'mouse', isPrimary: true});
+    fire(el, 'mouseup', MouseEvent, {...base});
+    fire(el, 'click', MouseEvent, {...base, detail: 1});
+    fire(el, 'pointerout', PointerEvent, {...base, pointerType: 'mouse', isPrimary: true});
+    return point;
+  };
+  let el = null;
+  if (atX !== null && atY !== null) {
+    el = document.elementFromPoint(atX, atY);
+    if (el && !vis(el)) el = null;
+    if (el && (el.disabled || el.getAttribute('aria-disabled') === 'true')) el = null;
+  } else {
+    const scopes = scopeSelector
+      ? Array.from(document.querySelectorAll(scopeSelector)).filter(vis)
+      : [document];
+    outer: for (const scope of scopes) {
+      const nodes = Array.from(scope.querySelectorAll(selectors));
+      for (const node of nodes) {
+        const text = clean((node.getAttribute('aria-label') || '') + ' ' + (node.innerText || ''));
+        if (!text) continue;
+        const hit = exact
+          ? text.split(' ').includes(needle) || text === needle
+          : text.includes(needle);
+        if (!hit || !vis(node) || node.disabled
+            || node.getAttribute('aria-disabled') === 'true') continue;
+        el = node;
+        break outer;
+      }
+    }
+  }
+  if (!el) return JSON.stringify({found: false});
+  const point = activate(el);
+  return JSON.stringify({found: true, x: point.x, y: point.y,
+    text: clean(el.innerText).slice(0, 80)});
+})()
+"""
+
+
+def activate_element_by_selector(
+    tab: ChromeTabRef,
+    selectors: str,
+    needle: str,
+    *,
+    exact: bool = False,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Activate a control in-page via selector, without coordinate clicks.
+
+    Locates the element by ``selectors`` plus visible text and fires a full
+    pointer press sequence on it, so Radix/Angular menus that ignore synthetic
+    ``.click()`` still respond. Returns ``{"found": bool, ...}``; the caller
+    must verify the outcome from the control's own state and fall back to a
+    trusted CDP click when the page ignored the activation.
+    """
+    script = _POINTER_ACTIVATION_JS % {
+        "selectors": json.dumps(selectors),
+        "needle": json.dumps(str(needle or "").lower()),
+        "exact": "true" if exact else "false",
+        "scope": json.dumps(scope),
+        "at_x": "null",
+        "at_y": "null",
+    }
+    try:
+        raw = execute_javascript(tab, script)
+    except RuntimeError:
+        return {"found": False}
+    try:
+        payload = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return {"found": False}
+    return payload if isinstance(payload, dict) else {"found": False}
+
+
+def activate_element_at_point(tab: ChromeTabRef, x: float, y: float) -> dict[str, Any]:
+    """In-page pointer activation for an element known only by coordinates.
+
+    Used when no selector can address the target (e.g. a result tile matched by
+    its media id): the element under the point is activated in-page first, and
+    the caller verifies the navigation before any CDP click.
+    """
+    script = _POINTER_ACTIVATION_JS % {
+        "selectors": json.dumps("*"),
+        "needle": json.dumps(""),
+        "exact": "false",
+        "scope": json.dumps(None),
+        "at_x": json.dumps(float(x)),
+        "at_y": json.dumps(float(y)),
+    }
+    try:
+        raw = execute_javascript(tab, script)
+    except RuntimeError:
+        return {"found": False}
+    try:
+        payload = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return {"found": False}
+    return payload if isinstance(payload, dict) else {"found": False}
 
 
 def dispatch_mouse_move(tab: ChromeTabRef, x: float, y: float) -> None:

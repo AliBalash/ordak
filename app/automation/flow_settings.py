@@ -28,6 +28,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.automation.existing_chrome import (
+    ChromeTabRef,
+    dispatch_mouse_click,
+    activate_element_by_selector,
+    activate_element_at_point,
+)
 from app.errors import ErrorCode, OrdaKError
 
 #: Internal model id -> exact visible label in the Flow model dropdown.
@@ -671,6 +677,54 @@ def apply_settings(
     return applied
 
 
+def select_by_text(
+    tab: ChromeTabRef,
+    selectors: str,
+    needle: str,
+    *,
+    exact: bool = False,
+    scope: str | None = None,
+    verify: callable,
+    fallback_coords: tuple[float, float] | None = None,
+) -> Any:
+    """Selector-first activation with CDP click fallback and verification.
+
+    1. Locate the element by selectors + visible text.
+    2. Fire in-page pointer events (activate_element_by_selector).
+    3. Call ``verify()`` to read the control's own state; if it matches,
+       return the verified value immediately.
+    4. If activation was ignored, fall back to a trusted CDP click at the
+       returned coordinates (or ``fallback_coords`` if provided).
+    5. Re-verify; on failure raise FLOW_UI_CHANGED.
+    """
+    # Step 1-2: in-page pointer activation
+    result = activate_element_by_selector(tab, selectors, needle, exact=exact, scope=scope)
+    if result.get("found"):
+        verified = verify()
+        if verified:
+            return verified
+    # Step 3: fallback to CDP click at the returned coords or provided fallback
+    click_x = result.get("x") if result.get("found") else (fallback_coords[0] if fallback_coords else None)
+    click_y = result.get("y") if result.get("found") else (fallback_coords[1] if fallback_coords else None)
+    if click_x is None or click_y is None:
+        raise OrdaKError(
+            code=ErrorCode.FLOW_UI_CHANGED,
+            message=f"Could not locate or activate Flow control for {needle!r}.",
+            technical_details=f"selector={selectors!r}, scope={scope!r}, exact={exact}",
+        )
+    dispatch_mouse_click(tab, click_x, click_y)
+    time.sleep(0.5)
+    # Step 5: final verification
+    verified = verify()
+    if not verified:
+        raise OrdaKError(
+            code=ErrorCode.FLOW_UI_CHANGED,
+            message=f"Flow {needle!r} was clicked but the control did not change state.",
+            technical_details=f"selector={selectors!r}, coords=({click_x}, {click_y})",
+        )
+    return verified
+
+
 __all__ = [
     "AppliedSettings",
     "FLOW_MODEL_LABELS",
@@ -687,4 +741,5 @@ __all__ = [
     "read_model_options",
     "select_model",
     "select_reference_mode",
+    "select_by_text",
 ]

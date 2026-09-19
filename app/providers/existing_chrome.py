@@ -11,6 +11,7 @@ from app.automation.existing_chrome import (
     best_effort_stop,
     detect_busy_state,
     detect_login_or_verification,
+    download_chatgpt_images_via_fullscreen,
     download_generated_images_from_controls,
     inspect_generated_image_state,
     export_generated_images,
@@ -302,6 +303,37 @@ class ExistingChromeProviderAdapter:
                 confidence="high",
                 technical_notes=notes,
             )
+
+        if self.provider == "chatgpt":
+            # Inline ChatGPT turns expose no download anchor (only Edit/Share).
+            # The fullscreen viewer is the first-party download path: each
+            # variant is selected via button[data-rail-index] and saved with a
+            # trusted click on button[aria-label="Save"] into a job-scoped
+            # directory, so a file found there is provably this job's download.
+            try:
+                fullscreen_paths = download_chatgpt_images_via_fullscreen(
+                    tab,
+                    output_dir=output_dir,
+                    job_id=job_id,
+                    max_images=max_images,
+                    timeout_ms=timeout_ms,
+                )
+            except Exception as exc:
+                notes.append(f"chatgpt fullscreen Save download unavailable: {exc}")
+                fullscreen_paths = []
+            if fullscreen_paths:
+                notes.append(
+                    "chatgpt fullscreen viewer: clicked the generated image and saved "
+                    "each variant with the Save control (button[aria-label=\"Save\"] "
+                    "after button[data-rail-index] selection)"
+                )
+                return ImageExtractionResult(
+                    artifacts=fullscreen_paths,
+                    source="download",
+                    confidence="high",
+                    technical_notes=notes,
+                )
+            notes.append("chatgpt fullscreen Save download: no verified downloaded image was available")
 
         notes.append("provider download control: no downloadable same-turn asset controls were usable")
         asset_paths = self._export_generated_images(

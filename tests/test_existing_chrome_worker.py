@@ -669,3 +669,110 @@ def test_linux_job_returns_structured_error_when_remote_debugging_launch_fails(
             "chrome_not_open",
         )
     ]
+
+
+def test_chatgpt_image_job_attaches_download_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Regression: a ChatGPT image must carry verified download provenance.
+
+    The pipeline refuses any ChatGPT artifact whose receipt lacks
+    ``artifact_source=download`` (run 040 failed exactly here), so the worker
+    has to attach a ChatGPT receipt for every completed image job.
+    """
+    from app.automation import gemini_worker as worker_module
+
+    runtime = RuntimeSpy()
+    receipts: list[object] = []
+    runtime.attach_generation_receipt = receipts.append  # type: ignore[attr-defined]
+    adapter = FakeAdapter()
+    output_path = write_png(tmp_path / "chatgpt-output.png")
+    adapter.result = "__GENERATED_IMAGES__:1"
+    adapter.image_paths = [output_path]
+    local_settings = generic_worker_settings()
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+
+    answer = run_gemini_job(
+        "job-chatgpt-image-receipt",
+        GeminiJobRequest(
+            question="یک بافت حکاکی بساز.",
+            provider="chatgpt",
+            mode="image_generate",
+            start_new_chat=True,
+            chatgpt_chat="temporary",
+        ),
+        runtime=runtime,
+        app_settings=local_settings,
+    )
+
+    assert answer == "ChatGPT generated image output in the current Chrome tab. Saved images: 1."
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    payload = receipt.model_dump() if hasattr(receipt, "model_dump") else dict(receipt)
+    assert payload["provider"] == "chatgpt"
+    assert payload["model_verified"] is False
+    assert "artifact_source=download" in list(payload["notes"] or [])
+
+
+def test_chatgpt_image_job_rejects_non_download_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ChatGPT image without a real browser download must fail closed."""
+    runtime = RuntimeSpy()
+    adapter = FakeAdapter()
+    output_path = write_png(tmp_path / "chatgpt-asset.png")
+    adapter.result = "__GENERATED_IMAGES__:1"
+    adapter.image_paths = [output_path]
+
+    def _asset_url_result(tab, *, output_dir, job_id, timeout_ms, max_images):
+        return ImageExtractionResult(
+            artifacts=[output_path],
+            source="asset_url",
+            confidence="high",
+            technical_notes=["same-turn asset URL discovery"],
+        )
+
+    adapter.extract_image_result = _asset_url_result  # type: ignore[method-assign]
+    local_settings = generic_worker_settings()
+    install_fake_adapter(monkeypatch, adapter)
+    monkeypatch.setattr("app.automation.gemini_worker.is_google_chrome_running", lambda: True)
+
+    with pytest.raises(GeminiAutomationError, match="not a downloaded file"):
+        run_gemini_job(
+            "job-chatgpt-image-no-provenance",
+            GeminiJobRequest(
+                question="یک بافت حکاکی بساز.",
+                provider="chatgpt",
+                mode="image_generate",
+                start_new_chat=True,
+                chatgpt_chat="temporary",
+            ),
+            runtime=runtime,
+            app_settings=local_settings,
+        )
+
+    assert runtime.errors and runtime.errors[-1][2] == "result_not_extractable"
+
+
+def test_fresh_chat_url_prefers_live_project_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh (non-temp) image chat must open inside the project workspace."""
+    from app.automation import gemini_worker as worker_module
+
+    project_url = "https://chatgpt.com/g/g-p-6aad6365c6a4819189a5a35f28e021fc/project"
+    monkeypatch.setattr(
+        worker_module,
+        "list_google_chrome_tabs",
+        lambda: [ChromeTabInfo(window_id=0, tab_id=0, url=project_url, title="ChatGPT - ordak", active=False)],
+    )
+    local_settings = replace(generic_worker_settings(), chatgpt_project_url=None)
+    assert worker_module._chatgpt_fresh_chat_url(local_settings) == project_url
+
+    configured = replace(local_settings, chatgpt_project_url=project_url)
+    assert worker_module._chatgpt_fresh_chat_url(configured) == project_url
+
+    monkeypatch.setattr(worker_module, "list_google_chrome_tabs", lambda: [])
+    fallback_settings = replace(local_settings, chatgpt_url="https://chatgpt.com/?temporary-chat=true")
+    assert worker_module._chatgpt_fresh_chat_url(fallback_settings) == "https://chatgpt.com"

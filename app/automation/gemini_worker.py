@@ -20,6 +20,7 @@ from app.automation.existing_chrome import (
     activate_create_image_mode,
     execute_javascript,
     get_tab_info,
+    list_google_chrome_tabs,
     wait_for_chatgpt_workspace_ready,
     insert_prompt as insert_prompt_existing,
     is_google_chrome_running,
@@ -788,9 +789,10 @@ def _verify_chatgpt_project_tab(
     *,
     app_settings: Settings,
     runtime: WorkerRuntime | None,
+    project_url_override: str | None = None,
 ) -> None:
     """Refuse a new project job if Chrome did not stay on its configured project URL."""
-    project_url = app_settings.chatgpt_project_url or ""
+    project_url = (project_url_override or "") or (app_settings.chatgpt_project_url or "")
     if not project_url:
         return
     configured = urlparse(project_url)
@@ -848,6 +850,86 @@ def _chatgpt_temporary_chat_url(app_settings: Settings) -> str:
     return f"{base}{separator}temporary-chat=true"
 
 
+def _discover_chatgpt_project_url() -> str | None:
+    """Best-effort discovery of the live ChatGPT Project URL from open tabs.
+
+    The operator keeps the project workspace open (e.g. the second tab,
+    ``.../g/<project-id>/project``). When no project URL is configured, a
+    non-temporary image chat must still start inside that project instead of a
+    generic home page. Returns None when no project tab is visible.
+    """
+    try:
+        tabs = list_google_chrome_tabs()
+    except Exception:
+        return None
+    for tab in tabs:
+        url = str(getattr(tab, "url", "") or "")
+        parsed = urlparse(url)
+        if "chatgpt.com" not in parsed.netloc.lower():
+            continue
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "g" and parts[1]:
+            return f"{parsed.scheme}://{parsed.netloc}/g/{parts[1]}/project"
+    return None
+
+
+def _chatgpt_fresh_chat_url(app_settings: Settings) -> str:
+    """Where a fresh normal (non-temp) ChatGPT image chat must open.
+
+    Preference order: the configured project URL, the live project tab
+    discovered in the browser, then the generic home page with any
+    ``temporary-chat`` flag stripped so the chat is genuinely non-temporary.
+    """
+    configured = (app_settings.chatgpt_project_url or "").strip()
+    if configured:
+        return configured
+    discovered = _discover_chatgpt_project_url()
+    if discovered:
+        return discovered
+    base = _chatgpt_base_chat_url(app_settings)
+    parsed = urlparse(base)
+    if "temporary-chat" not in base:
+        return base or "https://chatgpt.com"
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}".rstrip("/") or "https://chatgpt.com"
+
+
+def _build_chatgpt_receipt(
+    job: AutomationJobRequest,
+    *,
+    workspace_url: str | None,
+    artifact_source: str,
+    chat_scope: str,
+    artifact_paths: list,
+) -> GenerationReceipt:
+    """Receipt for a ChatGPT image job: provenance without model claims.
+
+    ChatGPT's web UI names no image model, so ``model_verified`` stays False by
+    design — the receipt only proves *how* the bytes arrived (a real browser
+    download) plus the chat scope, workspace URL, reference roles and per-file
+    hashes the pipeline audits.
+    """
+    notes: list[str] = [f"artifact_source={artifact_source}", f"chat_scope={chat_scope}"]
+    for record_path in artifact_paths:
+        try:
+            digest = image_validation.sha256_file(record_path)
+            notes.append(f"image={Path(record_path).name} sha256={digest}")
+        except OSError:
+            continue
+    return GenerationReceipt(
+        provider="chatgpt",
+        requested_model=None,
+        actual_model_label=None,
+        model_verified=False,
+        pro_regeneration_used=False,
+        requested_quality=(job.generation.quality if job.generation else None),
+        requested_aspect_ratio=(job.generation.aspect_ratio if job.generation else None),
+        actual_aspect_ratio=(job.generation.aspect_ratio if job.generation else None),
+        workspace_url=workspace_url,
+        reference_roles=[role for role, _ in (job.references or [])],
+        notes=notes,
+    )
+
+
 def _verify_chatgpt_temporary_tab(tab: ChromeTabRef, *, app_settings: Settings) -> bool:
     """Best-effort check that the tab really is a ChatGPT temporary chat."""
     deadline = time.monotonic() + 20
@@ -893,6 +975,29 @@ def _verify_chatgpt_chat_scope(tab: ChromeTabRef, chat_scope: str, resolved: Set
         _verify_chatgpt_project_tab(tab, app_settings=resolved, runtime=runtime)
         return tab, "project"
     if chat_scope == "fresh":
+        project_url = (resolved.chatgpt_project_url or "").strip() or _discover_chatgpt_project_url() or ""
+        if project_url:
+            try:
+                _verify_chatgpt_project_tab(
+                    tab,
+                    app_settings=resolved,
+                    runtime=runtime,
+                    project_url_override=project_url,
+                )
+            except GeminiAutomationError:
+                # A fresh chat must never fall back to a temporary chat
+                # silently; keep the tab but mark the scope honestly so the
+                # receipt records where the image was actually made.
+                if runtime is not None:
+                    runtime.append_log(
+                        "Fresh ChatGPT chat is outside the project workspace; "
+                        "continuing in a normal chat instead of failing the run.",
+                        level="warning",
+                    )
+            else:
+                if runtime is not None:
+                    runtime.append_log("Fresh normal ChatGPT chat verified inside the project workspace.")
+            return tab, chat_scope
         if runtime is not None:
             runtime.append_log("Fresh normal (non-temp) ChatGPT chat; skipping project-scope check.")
         return tab, chat_scope
@@ -1634,9 +1739,12 @@ def _run_gemini_job_in_existing_chrome(
             if chat_scope == "temporary":
                 opened = adapter.open_tab(target_url=_chatgpt_temporary_chat_url(resolved))
             elif chat_scope == "fresh":
-                # A genuinely new normal chat: the project URL would restore the
-                # same long-lived project conversation, defeating the point.
-                opened = adapter.open_tab(target_url=_chatgpt_base_chat_url(resolved))
+                # A fresh correction needs a genuinely new *normal* chat. When a
+                # project workspace is known (configured or discovered from the
+                # live project tab), the new tab opens inside that project; the
+                # project URL in a new tab starts a new conversation there, it
+                # does not restore one long-lived thread.
+                opened = adapter.open_tab(target_url=_chatgpt_fresh_chat_url(resolved))
             else:
                 opened = adapter.open_tab(target_url=target_url or _provider_new_chat_url(resolved, job.provider))
             tab = opened.ref
@@ -1872,6 +1980,18 @@ def _run_gemini_job_in_existing_chrome(
                         technical_details=f"artifact_source={extraction.source}",
                     )
                 )
+            if job.provider == "chatgpt" and extraction.source != "download":
+                # ChatGPT's fullscreen Save path above is the verified download
+                # route. Anything else (asset URL, DOM pixels) has no first-party
+                # download provenance, so fail closed instead of recording an
+                # image the pipeline cannot audit.
+                _raise_structured_error(
+                    OrdaKError(
+                        code=ErrorCode.RESULT_NOT_EXTRACTABLE,
+                        message="ChatGPT image output was rejected because it was not a downloaded file.",
+                        technical_details=f"artifact_source={extraction.source}",
+                    )
+                )
             validations: list[image_validation.ImageValidation] = []
             if job.provider == "gemini":
                 try:
@@ -1892,18 +2012,29 @@ def _run_gemini_job_in_existing_chrome(
                 for output_path in extraction.artifacts:
                     runtime.attach_output_image(output_path)
                 attach_receipt = getattr(runtime, "attach_generation_receipt", None)
-                if job.provider == "gemini" and attach_receipt is not None:
-                    attach_receipt(
-                        _build_gemini_receipt(
-                            job,
-                            model_evidence=model_evidence,
-                            thinking_evidence=gemini_thinking_evidence,
-                            pro_outcome=pro_outcome,
-                            validations=validations,
-                            workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),
-                            artifact_source=extraction.source,
+                if attach_receipt is not None:
+                    if job.provider == "gemini":
+                        attach_receipt(
+                            _build_gemini_receipt(
+                                job,
+                                model_evidence=model_evidence,
+                                thinking_evidence=gemini_thinking_evidence,
+                                pro_outcome=pro_outcome,
+                                validations=validations,
+                                workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),
+                                artifact_source=extraction.source,
+                            )
                         )
-                    )
+                    elif job.provider == "chatgpt":
+                        attach_receipt(
+                            _build_chatgpt_receipt(
+                                job,
+                                workspace_url=(get_tab_info(tab).url if get_tab_info(tab) else None),
+                                artifact_source=extraction.source,
+                                chat_scope=chat_scope,
+                                artifact_paths=list(extraction.artifacts),
+                            )
+                        )
             answer = (
                 f"{_provider_name(job.provider)} generated image output in the current Chrome tab. "
                 f"Saved images: {len(extraction.artifacts)}."
