@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import uuid
@@ -26,6 +27,7 @@ from app.automation.existing_chrome import (
     get_tab_info,
     is_google_chrome_running,
     list_google_chrome_tabs,
+    recover_chatgpt_login,
 )
 from app.automation.gemini_worker import (
     AutomationJobRequest,
@@ -61,6 +63,9 @@ from app.schemas import (
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _loads_list(raw_value: str | None) -> list[Any]:
@@ -202,6 +207,7 @@ class JobManager:
         self.profile_lock = threading.Lock()
         self.subscribers: dict[str, set[WebSocket]] = defaultdict(set)
         self.dispatcher_task: asyncio.Task[None] | None = None
+        self.login_recovery_task: asyncio.Task[None] | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.active_job_id: str | None = None
         self.active_controls: dict[str, JobControl] = {}
@@ -213,16 +219,62 @@ class JobManager:
         self._recover_stale_incomplete_jobs()
         self.loop = asyncio.get_running_loop()
         self.dispatcher_task = asyncio.create_task(self._consume_queue())
+        if self.settings.chatgpt_auto_login_enabled and self.settings.chatgpt_login_email:
+            self.login_recovery_task = asyncio.create_task(self._monitor_chatgpt_login())
 
     async def shutdown(self) -> None:
-        if self.dispatcher_task is None:
+        for task_name in ("dispatcher_task", "login_recovery_task"):
+            task = getattr(self, task_name)
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            setattr(self, task_name, None)
+
+    async def _monitor_chatgpt_login(self) -> None:
+        """Restore a visibly expired ChatGPT session even while the job queue is idle.
+
+        The worker performs the same check immediately before every ChatGPT prompt. This
+        idle monitor is deliberately conservative: it never races a queued/running browser
+        job and it never attempts passwords, MFA, passkeys, or CAPTCHA challenges.
+        """
+        interval = max(5, self.settings.chatgpt_login_monitor_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            if self.active_job_id is not None or self.browser_lock.locked():
+                continue
+            try:
+                await asyncio.to_thread(self._recover_chatgpt_login_if_expired)
+            except Exception as exc:  # Monitoring must never take the API down.
+                logger.warning("ChatGPT login monitor check failed: %s", exc)
+
+    def _recover_chatgpt_login_if_expired(self) -> None:
+        if self.active_job_id is not None or self.browser_lock.locked():
             return
-        self.dispatcher_task.cancel()
-        try:
-            await self.dispatcher_task
-        except asyncio.CancelledError:
-            pass
-        self.dispatcher_task = None
+        adapter = get_provider_adapter("chatgpt")
+        diagnostics = adapter.collect_diagnostics()
+        if diagnostics.login_state != "login_required" or diagnostics.active_tab is None:
+            return
+        with self.browser_lock:
+            # Recheck after acquiring the lock: a newly submitted job wins and handles its
+            # own recovery in the normal worker path.
+            if self.active_job_id is not None:
+                return
+            diagnostics = adapter.collect_diagnostics()
+            if diagnostics.login_state != "login_required" or diagnostics.active_tab is None:
+                return
+            result = recover_chatgpt_login(
+                diagnostics.active_tab.ref,
+                email=self.settings.chatgpt_login_email,
+                workspace_name=self.settings.chatgpt_workspace_name,
+                timeout_ms=self.settings.chatgpt_login_recovery_timeout_ms,
+                action_logger=lambda message: logger.info("ChatGPT login monitor: %s", message),
+            )
+            if result == "manual_verification_required":
+                logger.warning("ChatGPT login monitor paused for manual account verification.")
 
     async def create_job(
         self,

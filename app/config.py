@@ -143,6 +143,7 @@ class Settings:
     chatgpt_login_email: str | None
     chatgpt_workspace_name: str | None
     chatgpt_login_recovery_timeout_ms: int
+    chatgpt_login_monitor_seconds: int
     agent_enabled: bool
     agent_allowed_workspace_roots: tuple[Path, ...]
     agent_default_max_steps: int
@@ -335,6 +336,9 @@ def load_settings() -> Settings:
         chatgpt_workspace_name=_as_optional_str(os.getenv("CHATGPT_WORKSPACE_NAME")),
         chatgpt_login_recovery_timeout_ms=_as_int(
             os.getenv("CHATGPT_LOGIN_RECOVERY_TIMEOUT_MS"), 90_000
+        ),
+        chatgpt_login_monitor_seconds=_as_int(
+            os.getenv("CHATGPT_LOGIN_MONITOR_SECONDS"), 15
         ),
         agent_enabled=_as_bool(os.getenv("AGENT_ENABLED"), True),
         agent_allowed_workspace_roots=_resolve_csv_paths(
