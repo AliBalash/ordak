@@ -139,6 +139,10 @@ class Settings:
     chatgpt_stable_response_seconds: int
     chatgpt_stall_refresh_seconds: int
     chatgpt_max_stall_refreshes: int
+    chatgpt_auto_login_enabled: bool
+    chatgpt_login_email: str | None
+    chatgpt_workspace_name: str | None
+    chatgpt_login_recovery_timeout_ms: int
     agent_enabled: bool
     agent_allowed_workspace_roots: tuple[Path, ...]
     agent_default_max_steps: int
@@ -323,6 +327,14 @@ def load_settings() -> Settings:
         ),
         chatgpt_max_stall_refreshes=_as_int(
             os.getenv("CHATGPT_MAX_STALL_REFRESHES"), 2
+        ),
+        chatgpt_auto_login_enabled=_as_bool(
+            os.getenv("CHATGPT_AUTO_LOGIN_ENABLED"), False
+        ),
+        chatgpt_login_email=_as_optional_str(os.getenv("CHATGPT_LOGIN_EMAIL")),
+        chatgpt_workspace_name=_as_optional_str(os.getenv("CHATGPT_WORKSPACE_NAME")),
+        chatgpt_login_recovery_timeout_ms=_as_int(
+            os.getenv("CHATGPT_LOGIN_RECOVERY_TIMEOUT_MS"), 90_000
         ),
         agent_enabled=_as_bool(os.getenv("AGENT_ENABLED"), True),
         agent_allowed_workspace_roots=_resolve_csv_paths(

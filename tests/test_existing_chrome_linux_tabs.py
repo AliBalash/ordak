@@ -10,6 +10,7 @@ from app.automation.existing_chrome import (
     _linux_execute_javascript,
     get_tab_info,
     read_latest_response_baseline,
+    recover_chatgpt_login,
     submit_prompt,
     wait_for_response_stable,
 )
@@ -54,6 +55,98 @@ def test_get_tab_info_does_not_fallback_to_zero_ids_for_linux_devtools(monkeypat
     )
 
     assert result is None
+
+
+def test_chatgpt_login_recovery_uses_configured_email_and_no_password_automation(
+    monkeypatch,
+) -> None:
+    states = iter(["login_required", "login_required", None])
+    scripts: list[str] = []
+    logs: list[str] = []
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.detect_login_or_verification",
+        lambda *args, **kwargs: next(states),
+    )
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.execute_javascript",
+        lambda tab, script: scripts.append(script) or '{"action":"open_login"}',
+    )
+    monkeypatch.setattr("app.automation.existing_chrome.get_tab_info", lambda tab: None)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+
+    state = recover_chatgpt_login(
+        ChromeTabRef(window_id=0, tab_id=0),
+        email="account@example.com",
+        workspace_name="Dodo",
+        action_logger=logs.append,
+    )
+
+    assert state is None
+    assert len(scripts) == 1
+    assert "account@example.com" in scripts[0]
+    assert "Dodo" in scripts[0]
+    assert 'input[type="password"]' in scripts[0]
+    assert "Entered the configured ChatGPT account email." not in logs
+    assert any("sign-in recovery" in message for message in logs)
+
+
+def test_chatgpt_login_recovery_pauses_for_security_challenge(monkeypatch) -> None:
+    states = iter(["login_required", "login_required"])
+    logs: list[str] = []
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.detect_login_or_verification",
+        lambda *args, **kwargs: next(states),
+    )
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.execute_javascript",
+        lambda *args, **kwargs: '{"action":"manual"}',
+    )
+    monkeypatch.setattr("app.automation.existing_chrome.get_tab_info", lambda tab: None)
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+
+    state = recover_chatgpt_login(
+        ChromeTabRef(window_id=0, tab_id=0),
+        email="account@example.com",
+        workspace_name="Dodo",
+        action_logger=logs.append,
+    )
+
+    assert state == "manual_verification_required"
+    assert any("pausing safely" in message for message in logs)
+
+
+def test_chatgpt_login_recovery_finishes_pending_workspace_selection(monkeypatch) -> None:
+    workspace = ChromeTabInfo(
+        window_id=0,
+        tab_id=0,
+        url="https://auth.openai.com/workspace",
+        title="Choose a workspace",
+    )
+    completed = ChromeTabInfo(
+        window_id=0,
+        tab_id=0,
+        url="https://chatgpt.com/",
+        title="ChatGPT",
+    )
+    tabs = iter([workspace, workspace, completed])
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.detect_login_or_verification",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("app.automation.existing_chrome.get_tab_info", lambda tab: next(tabs))
+    monkeypatch.setattr(
+        "app.automation.existing_chrome.execute_javascript",
+        lambda *args, **kwargs: '{"action":"select_workspace"}',
+    )
+    monkeypatch.setattr("app.automation.existing_chrome.time.sleep", lambda _: None)
+
+    state = recover_chatgpt_login(
+        ChromeTabRef(window_id=0, tab_id=0),
+        email="account@example.com",
+        workspace_name="Dodo",
+    )
+
+    assert state is None
 
 
 def test_rebind_tab_prefers_first_linux_devtools_match_when_no_tab_is_marked_active(

@@ -22,6 +22,7 @@ from app.automation.existing_chrome import (
     execute_javascript,
     get_tab_info,
     list_google_chrome_tabs,
+    recover_chatgpt_login,
     wait_for_chatgpt_workspace_ready,
     insert_prompt as insert_prompt_existing,
     is_google_chrome_running,
@@ -1139,7 +1140,7 @@ def _prepare_and_submit_prompt(
             )
             _runtime_checkpoint(runtime)
         adapter.find_prompt_input(tab, timeout_ms=min(app_settings.browser_timeout_ms, 60_000))
-        _map_login_error(provider, adapter.detect_login_state(tab))
+        _ensure_provider_login(tab, adapter, provider, app_settings, runtime)
         if provider == "chatgpt":
             wait_for_chatgpt_workspace_ready(
                 tab,
@@ -1178,6 +1179,7 @@ def _find_prompt_input_with_recovery(
     timeout_ms: int,
     runtime: WorkerRuntime | None,
     recovery_url: str | None,
+    app_settings: Settings,
 ) -> None:
     last_error: RuntimeError | TimeoutError | None = None
     for attempt in range(2):
@@ -1205,7 +1207,7 @@ def _find_prompt_input_with_recovery(
             except RuntimeError:
                 pass
             time.sleep(4)
-            _map_login_error(provider, adapter.detect_login_state(tab))
+            _ensure_provider_login(tab, adapter, provider, app_settings, runtime)
     if last_error is not None:
         raise last_error
 
@@ -1326,7 +1328,7 @@ def send_prompt_and_wait_for_text(
                     tab,
                     timeout_ms=min(app_settings.browser_timeout_ms, 60_000),
                 )
-                _map_login_error(provider, adapter.detect_login_state(tab))
+                _ensure_provider_login(tab, adapter, provider, app_settings, runtime)
             except (RuntimeError, TimeoutError):
                 continue
 
@@ -1462,7 +1464,7 @@ def _run_agent_job_in_existing_chrome(
                 "Checking whether ChatGPT is already authenticated in the current Google Chrome session."
             )
             _runtime_checkpoint(runtime)
-        _map_login_error(job.provider, adapter.detect_login_state(tab))
+        _ensure_provider_login(tab, adapter, job.provider, resolved, runtime)
         _find_prompt_input_with_recovery(
             tab=tab,
             adapter=adapter,
@@ -1470,6 +1472,7 @@ def _run_agent_job_in_existing_chrome(
             timeout_ms=min(resolved.browser_timeout_ms, 60_000),
             runtime=runtime,
             recovery_url=job.conversation_url,
+            app_settings=resolved,
         )
         _remember_tab(runtime, tab)
 
@@ -1651,6 +1654,34 @@ def _map_login_error(provider: Provider, login_state: str) -> None:
         raise ManualVerificationRequired()
 
 
+def _ensure_provider_login(
+    tab: ChromeTabRef,
+    adapter,
+    provider: Provider,
+    app_settings: Settings,
+    runtime: WorkerRuntime | None,
+) -> None:
+    """Recover an expired ChatGPT session before mapping a login state to a pause."""
+    login_state = adapter.detect_login_state(tab)
+    if (
+        provider == "chatgpt"
+        and login_state == "login_required"
+        and app_settings.chatgpt_auto_login_enabled
+    ):
+        login_state = recover_chatgpt_login(
+            tab,
+            email=app_settings.chatgpt_login_email,
+            workspace_name=app_settings.chatgpt_workspace_name,
+            timeout_ms=app_settings.chatgpt_login_recovery_timeout_ms,
+            action_logger=(
+                (lambda message: runtime.append_log(message))
+                if runtime is not None
+                else None
+            ),
+        )
+    _map_login_error(provider, login_state or "")
+
+
 def run_gemini_job(
     job_id: str,
     job: AutomationJobRequest,
@@ -1770,7 +1801,7 @@ def _run_gemini_job_in_existing_chrome(
                 f"Checking whether {_provider_name(job.provider)} is already authenticated in the current Google Chrome session."
             )
             _runtime_checkpoint(runtime)
-        _map_login_error(job.provider, adapter.detect_login_state(tab))
+        _ensure_provider_login(tab, adapter, job.provider, resolved, runtime)
         _find_prompt_input_with_recovery(
             tab=tab,
             adapter=adapter,
@@ -1778,6 +1809,7 @@ def _run_gemini_job_in_existing_chrome(
             timeout_ms=min(resolved.browser_timeout_ms, 60_000),
             runtime=runtime,
             recovery_url=job.conversation_url,
+            app_settings=resolved,
         )
         if job.provider == "chatgpt" and should_open_new_tab and target_url is None:
             tab, chat_scope = _verify_chatgpt_chat_scope(tab, chat_scope, resolved, runtime, adapter)

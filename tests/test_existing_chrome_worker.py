@@ -196,6 +196,9 @@ def install_fake_adapter(monkeypatch: pytest.MonkeyPatch, adapter: FakeAdapter) 
         lambda tab, runtime: {"label": "Open mode picker, currently Flash Extended", "source": "mode-picker"},
     )
     monkeypatch.setattr("app.automation.gemini_worker.upload_local_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.automation.gemini_worker.ensure_chatgpt_extra_high_effort", lambda *args, **kwargs: "extra_high")
+    monkeypatch.setattr("app.automation.gemini_worker._verify_chatgpt_temporary_tab", lambda *args, **kwargs: True)
+    monkeypatch.setattr("app.automation.gemini_worker._verify_chatgpt_project_tab", lambda *args, **kwargs: None)
     # Browser hydration is covered directly in existing_chrome tests.  Worker
     # tests use synthetic tab references and should not reach the live CDP
     # transport while exercising their recovery logic.

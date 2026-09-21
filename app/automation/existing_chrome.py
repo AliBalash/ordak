@@ -1063,6 +1063,152 @@ def detect_login_or_verification(
     return state or None
 
 
+def recover_chatgpt_login(
+    tab: ChromeTabRef,
+    *,
+    email: str | None,
+    workspace_name: str | None,
+    timeout_ms: int = 90_000,
+    action_logger: Callable[[str], None] | None = None,
+) -> str | None:
+    """Recover an expired ChatGPT session using only the configured account identity.
+
+    This intentionally automates neither passwords nor security challenges.  A password,
+    MFA, passkey, or CAPTCHA is a durable boundary: the caller receives
+    ``manual_verification_required`` and pauses instead of guessing or retrying it.
+    """
+    initial_state = detect_login_or_verification(tab, provider="chatgpt")
+    initial_info = get_tab_info(tab)
+    on_workspace_picker = bool(
+        initial_info is not None
+        and urlparse(initial_info.url).netloc.casefold() == "auth.openai.com"
+        and urlparse(initial_info.url).path.rstrip("/") == "/workspace"
+    )
+    if initial_state != "login_required" and not on_workspace_picker:
+        return initial_state
+    if not email:
+        return "login_required"
+
+    original_info = initial_info
+    original_url = original_info.url if original_info is not None else ""
+    normalized_workspace = (workspace_name or "").strip()
+    configured_email = email.strip()
+    if not configured_email:
+        return "login_required"
+
+    def log(message: str) -> None:
+        if action_logger is not None:
+            action_logger(message)
+
+    log("ChatGPT session expired; starting the configured sign-in recovery.")
+    payload = json.dumps(
+        {"email": configured_email, "workspace": normalized_workspace},
+        ensure_ascii=False,
+    )
+    step_script = f"""
+(() => {{
+  const config = {payload};
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+    && getComputedStyle(el).visibility !== "hidden";
+  const text = (el) => `${{el.innerText || el.value || el.getAttribute("aria-label") || ""}}`
+    .replace(/\\s+/g, " ").trim();
+  const normalized = (value) => `${{value || ""}}`.replace(/\\s+/g, " ").trim().toLocaleLowerCase();
+  const body = normalized(document.body?.innerText || "");
+  const manual = !!document.querySelector('input[type="password"], input[autocomplete="one-time-code"], iframe[src*="captcha" i]')
+    || /enter (your )?password|password required|verification code|one.time code|two.factor|two factor|verify (it'?s )?you|security key|passkey|captcha|prove you are human|unusual activity/.test(body);
+  if (manual) return JSON.stringify({{action: "manual"}});
+  const click = (el) => {{
+    el.scrollIntoView({{block: "center", inline: "center"}});
+    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) =>
+      el.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}})));
+  }};
+  const controls = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]')).filter(visible);
+  const exactControl = (needles) => controls.find((el) => needles.includes(normalized(text(el))));
+  const workspaceContext = /choose|select|switch/.test(body) && /workspace/.test(body);
+  if (config.workspace && workspaceContext) {{
+    const requested = normalized(config.workspace);
+    const workspace = Array.from(document.querySelectorAll('button, a, [role="button"], [role="option"], li')).filter(visible)
+      .find((el) => {{
+        const candidate = normalized(text(el));
+        return candidate === requested
+          || candidate.startsWith(`${{requested}} `)
+          || candidate.startsWith(`${{requested}}'`)
+          || candidate.startsWith(`${{requested}}’`);
+      }});
+    if (workspace) {{ click(workspace); return JSON.stringify({{action: "select_workspace"}}); }}
+    return JSON.stringify({{action: "workspace_waiting"}});
+  }}
+  const emailInput = Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"]')).find(visible);
+  if (emailInput) {{
+    if (normalized(emailInput.value) !== normalized(config.email)) {{
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (setter) setter.call(emailInput, config.email); else emailInput.value = config.email;
+      emailInput.dispatchEvent(new Event("input", {{bubbles: true}}));
+      emailInput.dispatchEvent(new Event("change", {{bubbles: true}}));
+      emailInput.focus();
+      return JSON.stringify({{action: "enter_email"}});
+    }}
+    const next = exactControl(["continue", "next", "continue with email"]);
+    if (next) {{ click(next); return JSON.stringify({{action: "submit_email"}}); }}
+    return JSON.stringify({{action: "email_waiting"}});
+  }}
+  const login = exactControl(["log in", "sign in"]);
+  if (login) {{ click(login); return JSON.stringify({{action: "open_login"}}); }}
+  return JSON.stringify({{action: "waiting"}});
+}})()
+"""
+    action_messages = {
+        "open_login": "Opened the ChatGPT sign-in form.",
+        "enter_email": "Entered the configured ChatGPT account email.",
+        "submit_email": "Submitted the configured ChatGPT account email.",
+        "select_workspace": "Selected the configured ChatGPT workspace.",
+        "workspace_waiting": "Waiting for the configured ChatGPT workspace to appear.",
+    }
+    last_action = ""
+    deadline = time.monotonic() + max(timeout_ms, 1_000) / 1000
+    while time.monotonic() < deadline:
+        state = detect_login_or_verification(tab, provider="chatgpt")
+        if state == "manual_verification_required":
+            log("ChatGPT requires password, MFA, passkey, or CAPTCHA verification; pausing safely.")
+            return state
+        current_info = get_tab_info(tab)
+        on_workspace_picker = bool(
+            current_info is not None
+            and urlparse(current_info.url).netloc.casefold() == "auth.openai.com"
+            and urlparse(current_info.url).path.rstrip("/") == "/workspace"
+        )
+        if state != "login_required" and not on_workspace_picker:
+            # Login redirects often discard the original project URL. Restore it only after
+            # authentication, so the following job remains in its explicitly configured scope.
+            if (
+                original_url.startswith("https://chatgpt.com/")
+                and "/g/" in original_url
+                and current_info is not None
+                and current_info.url != original_url
+            ):
+                execute_javascript(tab, f"window.location.replace({original_url!r}); 'restore_project'")
+                log("Authentication finished; returning to the configured ChatGPT project.")
+                time.sleep(1)
+            else:
+                log("ChatGPT sign-in recovery completed.")
+                return None
+        try:
+            raw = execute_javascript(tab, step_script)
+            result = json.loads(raw or "{}")
+        except (RuntimeError, json.JSONDecodeError):
+            result = {"action": "waiting"}
+        action = str(result.get("action") or "waiting")
+        if action == "manual":
+            log("ChatGPT requires password, MFA, passkey, or CAPTCHA verification; pausing safely.")
+            return "manual_verification_required"
+        if action != last_action and action in action_messages:
+            log(action_messages[action])
+            last_action = action
+        time.sleep(0.75)
+    log("ChatGPT automatic sign-in did not complete before its safe timeout.")
+    return detect_login_or_verification(tab, provider="chatgpt") or "login_required"
+
+
 def activate_create_image_mode(
     tab: ChromeTabRef,
     timeout_ms: int = 20_000,
