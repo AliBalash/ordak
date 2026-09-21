@@ -148,7 +148,11 @@ class GenerationReceipt(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=20_000)
+    # Editorial Motion Director turns may include a compact prior JSON response
+    # for a bounded correction.  Keep this in sync with its documented client
+    # ceiling (YT_MOTION_MAX_PROMPT_CHARS, capped at 60k) so a valid request is
+    # never converted into an uncaught server-side validation error.
+    question: str = Field(min_length=1, max_length=60_000)
     provider: Provider = "gemini"
     mode: JobMode = "chat"
     conversation_id: str | None = None
@@ -162,7 +166,7 @@ class JobCreateRequest(BaseModel):
 
 
 class ProviderRunRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=20_000)
+    question: str = Field(min_length=1, max_length=60_000)
     mode: JobMode = "chat"
     conversation_id: str | None = None
     start_new_chat: bool = False
